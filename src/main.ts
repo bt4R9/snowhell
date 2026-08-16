@@ -23,43 +23,51 @@ const loop = new FrameScheduler({
 });
 loop.start();
 
-// отладочный доступ из консоли
-const features = await import('./world/features');
-const { terrainHeight, railHeights } = await import('./world/terrain');
-const w = window as unknown as Record<string, unknown>;
-w.__game = game;
-w.__loop = loop;
-w.__features = features;
-w.__terrainHeight = terrainHeight;
-w.__railHeights = railHeights;
-// снаряды Ока: нужны для замеров точности обстрела из консоли
-w.__bombs = (await import('./world/lava')).bombList;
-// воронки: тем же экземпляром модуля пользуются игрок, след и рельеф — без
-// этого замерить расхождение из консоли нельзя (динамический import создаёт
-// ВТОРОЙ экземпляр со своим состоянием)
-w.__craters = await import('./fx/craters');
-w.__laser = await import('./fx/laser');
-// временный режим обкатки: только рез, без обстрела (см. eyeDebug)
-const { eyeDebug } = await import('./world/eye');
-const { demoDebug } = await import('./demo');
-w.__startAt = (z: number): number => {
-  demoDebug.startZ = z;
-  return demoDebug.startZ;
-};
-w.__fastVolcano = (v?: boolean): boolean => {
-  demoDebug.fastVolcano = v !== false;
-  return demoDebug.fastVolcano;
-};
-w.__onlyLaser = (v?: boolean): boolean => {
-  eyeDebug.onlyLaser = v !== false;
-  return eyeDebug.onlyLaser;
-};
-w.__seed = worldSeed();
-w.__three = await import('three');
-// прокрутить симуляцию вручную (для тестов, работает и при скрытой вкладке)
-w.__step = (seconds: number) => {
-  const dt = 1 / 60;
-  const steps = Math.round(seconds / dt);
-  for (let i = 0; i < steps; i++) game.update(dt);
-  game.render(dt, 0);
-};
+// ★ ОТЛАДКА НЕ ЕДЕТ В ПРОД. Хуки грузились через await import() ПОСЛЕ
+// loop.start(): игра уже крутилась, а модули в этот момент ещё шли по сети, и
+// каждый прилетевший вычислялся в главном потоке — на локальном сервере это
+// незаметно, а с CDN давало рывки в первые секунды игры. Плюс они тянули в
+// сборку отдельные чанки, нужные только консоли.
+// import.meta.env.DEV — константа времени сборки, весь блок вырезается целиком.
+if (import.meta.env.DEV) {
+  // отладочный доступ из консоли
+  const features = await import('./world/features');
+  const { terrainHeight, railHeights } = await import('./world/terrain');
+  const w = window as unknown as Record<string, unknown>;
+  w.__game = game;
+  w.__loop = loop;
+  w.__features = features;
+  w.__terrainHeight = terrainHeight;
+  w.__railHeights = railHeights;
+  // снаряды Ока: нужны для замеров точности обстрела из консоли
+  w.__bombs = (await import('./world/lava')).bombList;
+  // воронки: тем же экземпляром модуля пользуются игрок, след и рельеф — без
+  // этого замерить расхождение из консоли нельзя (динамический import создаёт
+  // ВТОРОЙ экземпляр со своим состоянием)
+  w.__craters = await import('./fx/craters');
+  w.__laser = await import('./fx/laser');
+  // временный режим обкатки: только рез, без обстрела (см. eyeDebug)
+  const { eyeDebug } = await import('./world/eye');
+  const { demoDebug } = await import('./demo');
+  w.__startAt = (z: number): number => {
+    demoDebug.startZ = z;
+    return demoDebug.startZ;
+  };
+  w.__fastVolcano = (v?: boolean): boolean => {
+    demoDebug.fastVolcano = v !== false;
+    return demoDebug.fastVolcano;
+  };
+  w.__onlyLaser = (v?: boolean): boolean => {
+    eyeDebug.onlyLaser = v !== false;
+    return eyeDebug.onlyLaser;
+  };
+  w.__seed = worldSeed();
+  w.__three = await import('three');
+  // прокрутить симуляцию вручную (для тестов, работает и при скрытой вкладке)
+  w.__step = (seconds: number) => {
+    const dt = 1 / 60;
+    const steps = Math.round(seconds / dt);
+    for (let i = 0; i < steps; i++) game.update(dt);
+    game.render(dt, 0);
+  };
+}
