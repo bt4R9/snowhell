@@ -2647,11 +2647,18 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
     this.updateArches(pz, AHEAD, BACK);
     const k0 = Math.floor((pz - BACK) / CRAG_STEP);
     const k1 = Math.ceil((pz + AHEAD) / CRAG_STEP);
+    // ★ ПО ОДНОЙ СКАЛЕ ЗА КАДР. Чанки давно строятся по бюджету времени, а
+    // скалы и арки — нет: сколько их попало в окно, столько и собиралось
+    // подряд. Обычно это одна штука и 7 мс, но на въезде в гряду их набегает
+    // сразу несколько, и кадр встаёт на треть секунды (замер живой игры: один
+    // кадр из 581 занял 338 мс при медиане 16.7). Появление скалы за пару
+    // кадров до нужного места незаметно — она и так проявляется из дымки.
     for (let k = k0; k <= k1; k++) {
       if (this.cragBuilt.has(k)) continue;
       const c = cragInRow(k);
       if (!c) continue;
       this.cragBuilt.set(k, this.buildCrag(c));
+      break;
     }
     for (const [k, obj] of this.cragBuilt) {
       if (k >= k0 && k <= k1) continue;
@@ -2672,6 +2679,7 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
       const a = archInRow(k);
       if (!a) continue;
       this.archBuilt.set(k, this.buildArch(a));
+      break; // и по одной арке — та же причина
     }
     for (const [k, obj] of this.archBuilt) {
       if (k >= k0 && k <= k1) continue;
