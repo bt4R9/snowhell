@@ -435,9 +435,9 @@ export function lakesOf(
       let bestY = Infinity;
       let bu = c.u;
       let bz = c.z;
-      for (let a2 = 0; a2 < 12; a2++) {
-        const an = (a2 / 12) * Math.PI * 2;
-        for (let t = 0; t <= R; t += R / 5) {
+      for (let a2 = 0; a2 < 8; a2++) {
+        const an = (a2 / 8) * Math.PI * 2;
+        for (let t = 0; t <= R; t += R / 3) {
           const pu = c.u + Math.cos(an) * t;
           const pz = c.z + Math.sin(an) * t;
           const g = ground(toWorldX(pu, pz), pz);
@@ -468,7 +468,7 @@ export function lakesOf(
       const dx = Math.cos(an);
       const dz = Math.sin(an);
       let ridge = -Infinity;
-      for (let t = 6; t <= BASIN_R; t += 4) {
+      for (let t = 6; t <= BASIN_R; t += 7) {
         const pu = cu + dx * t;
         const pz = cz + dz * t;
         const g = ground(toWorldX(pu, pz), pz);
@@ -520,7 +520,7 @@ export function lakesOf(
     for (let a2 = 0; a2 < 16; a2++) {
       const an = (a2 / 16) * Math.PI * 2;
       let rr = BASIN_R;
-      for (let t = 4; t <= BASIN_R; t += 3) {
+      for (let t = 4; t <= BASIN_R; t += 5) {
         const pu = cu + Math.cos(an) * t;
         const pz = cz + Math.sin(an) * t;
         if (ground(toWorldX(pu, pz), pz) > level) {
@@ -562,7 +562,16 @@ export function lakesOf(
     out.push({ u: ch.u, z: ch.z, y: lvl, r: ch.r * 0.85, depth: lvl - gb });
   }
   lakeCache.set(v.k, out);
-  if (lakeCache.size > 512) lakeCache.clear();
+  // ★ КЭШ НЕ СБРАСЫВАЕТСЯ ЦЕЛИКОМ. clear() на переполнении означал, что в один
+  // кадр разом теряются ВСЕ соседние участки и каждый пересчитывается заново —
+  // а один участок стоит сотни миллисекунд. Выкидываем только самое старое.
+  if (lakeCache.size > 512) {
+    let drop = 256;
+    for (const key of lakeCache.keys()) {
+      if (drop-- <= 0) break;
+      lakeCache.delete(key);
+    }
+  }
   return out;
 }
 
