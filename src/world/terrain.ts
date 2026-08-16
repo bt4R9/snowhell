@@ -1481,9 +1481,12 @@ export class Terrain {
   setCraters(arr: Float32Array): void {
     if (!this.matUniforms) return;
     const u = this.matUniforms.uCrater.value as THREE.Vector4[];
+    let live = 0;
     for (let i = 0; i < CRATERS; i++) {
       u[i].set(arr[i * 4], arr[i * 4 + 1], Math.max(0.5, arr[i * 4 + 2]), arr[i * 4 + 3]);
+      if (arr[i * 4 + 3] > 0.002) live++;
     }
+    this.matUniforms.uCrN.value = live;
   }
 
   /** звенья реза: [ax, az, bx, bz] и [возраст, живучесть] */
@@ -1491,10 +1494,13 @@ export class Terrain {
     if (!this.matUniforms) return;
     const ua = this.matUniforms.uLaserA.value as THREE.Vector4[];
     const ub = this.matUniforms.uLaserB.value as THREE.Vector4[];
+    let live = 0;
     for (let i = 0; i < MARKS; i++) {
       ua[i].set(a[i * 4], a[i * 4 + 1], a[i * 4 + 2], a[i * 4 + 3]);
       ub[i].set(b[i * 4], b[i * 4 + 1], 0, 0);
+      if (b[i * 4 + 1] > 0.002) live++;
     }
+    this.matUniforms.uMarks.value = live;
   }
 
   setSpot(x: number, z: number, r: number, s: number): void {
@@ -1547,6 +1553,13 @@ export class Terrain {
         value: Array.from({ length: CRATERS }, () => new THREE.Vector4(0, 0, 1, 0)),
       };
       // рез луча: цепочка звеньев «где был — где стал»
+      // ★ СКОЛЬКО СЛЕДОВ ЖИВО. Циклы по воронкам и звеньям луча крутились
+      // всегда — на каждом пикселе рельефа и на каждой его вершине, даже когда
+      // ни одного следа нет. Для лазера это 24 проверки капсулы, и работает он
+      // хорошо если пятую часть времени. Счётчик даёт один когерентный переход
+      // по юниформу: нет следов — тела цикла нет вовсе.
+      sh.uniforms.uMarks = { value: 0 };
+      sh.uniforms.uCrN = { value: 0 };
       sh.uniforms.uLaserA = {
         value: Array.from({ length: MARKS }, () => new THREE.Vector4(0, 0, 0, 0)),
       };
@@ -1576,6 +1589,8 @@ varying vec3 vWPos;
 uniform vec4 uCrater[CRATERS_N];
 uniform vec4 uLaserA[MARKS_N];
 uniform vec4 uLaserB[MARKS_N];
+uniform float uMarks;
+uniform float uCrN;
 ${LASER_GLSL}`
         )
         .replace(
@@ -1591,7 +1606,7 @@ ${LASER_GLSL}`
   vec3 cwp = (modelMatrix * vec4(position, 1.0)).xyz;
   vec2 s = vec2(objectNormal.x, objectNormal.z) / max(0.15, objectNormal.y);
   bool touched = false;
-  for (int ci = 0; ci < CRATERS_N; ci++) {
+  if (uCrN > 0.5) for (int ci = 0; ci < CRATERS_N; ci++) {
     float cw = uCrater[ci].w;
     if (cw <= 0.002) continue;
     float cr = uCrater[ci].z;
@@ -1605,7 +1620,7 @@ ${LASER_GLSL}`
   // ★ У БОРОЗДЫ ТОЖЕ ЕСТЬ СТЕНКИ. Тот же довод, что и у воронки: без наклона
   // нормалей рез читается полосой краски. Уклон аналитический:
   // dip = D·f·(1 − d/R)² ⇒ ∇dip = −2·D·f·(1 − d/R)/R · (единичный вектор от оси).
-  for (int li = 0; li < MARKS_N; li++) {
+  if (uMarks > 0.5) for (int li = 0; li < MARKS_N; li++) {
     float f = uLaserB[li].y;
     if (f <= 0.002) continue;
     vec3 ls = lasAt(uLaserA[li], cwp.xz);
@@ -1628,7 +1643,7 @@ vWPos = (modelMatrix * vec4(position, 1.0)).xyz;
 // это бесплатно и работает на всех чанках сразу, потому что смещение считается
 // от МИРОВОЙ точки, а значит на стыках сходится само.
 // Чаша неглубокая: рельеф под доской остаётся прежним, и расхождения не видно.
-for (int ci = 0; ci < CRATERS_N; ci++) {
+if (uCrN > 0.5) for (int ci = 0; ci < CRATERS_N; ci++) {
   float cw = uCrater[ci].w;
   if (cw <= 0.002) continue;
   float cr = uCrater[ci].z;
@@ -1643,7 +1658,7 @@ for (int ci = 0; ci < CRATERS_N; ci++) {
 // борозда от луча: берём максимум по звеньям, иначе на их стыках вылезает
 // двойная яма — ступенька поперёк реза
 float lasDip = 0.0;
-for (int li = 0; li < MARKS_N; li++) {
+if (uMarks > 0.5) for (int li = 0; li < MARKS_N; li++) {
   float f = uLaserB[li].y;
   if (f <= 0.002) continue;
   vec3 ls = lasAt(uLaserA[li], vWPos.xz);
@@ -1664,6 +1679,8 @@ vWPos.y -= lasDip;`
 #define LAS_COOL ${COOL.toFixed(3)}
 uniform vec4 uLaserA[MARKS_N];
 uniform vec4 uLaserB[MARKS_N];
+uniform float uMarks;
+uniform float uCrN;
 uniform vec3 uGlowCol;
 uniform vec3 uHazCol;
 uniform float uTime;
@@ -1815,7 +1832,7 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
     }
   }
   // воронки от снарядов
-  for (int ci = 0; ci < CRATERS_N; ci++) {
+  if (uCrN > 0.5) for (int ci = 0; ci < CRATERS_N; ci++) {
     float cw = uCrater[ci].w;
     if (cw <= 0.002) continue;
     float cr = uCrater[ci].z;
@@ -1840,7 +1857,7 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
   // конца бело-жёлтый расплав, у дальнего — тёмный базальт. Игрок по этому
   // градиенту и читает, где полосу можно пересечь.
   float lw = 0.0, lm = 0.0, lk = 0.0;
-  for (int li = 0; li < MARKS_N; li++) {
+  if (uMarks > 0.5) for (int li = 0; li < MARKS_N; li++) {
     float f = uLaserB[li].y;
     if (f <= 0.002) continue;
     vec3 ls = lasAt(uLaserA[li], vWPos.xz);
