@@ -333,6 +333,15 @@ export function terrainHeight(x: number, z: number): number {
 setTerrainSampler((u, z) => terrainAtValley(u, z));
 setCrackSampler((x, z) => crackHeatAt(x, z, crackTime));
 
+/**
+ * ★ toNonIndexed() НА УЖЕ РАЗВЁРНУТОЙ ГЕОМЕТРИИ — ЭТО ЛИШНЯЯ КОПИЯ И ПРЕДУПРЕЖДЕНИЕ
+ * В КОНСОЛИ (271 штука на старте). mergeGeometries и часть примитивов отдают
+ * геометрию уже без индекса, и повторный вызов просто дублирует буферы.
+ */
+function flatten(g: THREE.BufferGeometry): THREE.BufferGeometry {
+  return g.index ? g.toNonIndexed() : g;
+}
+
 // Силуэт скал — генератору препятствий: физика обязана мерить ровно тот
 // контур, который нарисован (см. setCragProfiles). Считаем радиальный профиль
 // прямо по вершинам: максимум радиуса в каждом угловом секторе.
@@ -924,7 +933,7 @@ function buildPine(variant: number): THREE.BufferGeometry {
 /** Свести куски дерева в одну геометрию, покрасив каждый в свой цвет */
 function finishTree(parts: THREE.BufferGeometry[], cols: THREE.Color[]): THREE.BufferGeometry {
   const colored = parts.map((geo, i) => {
-    const g = geo.toNonIndexed();
+    const g = flatten(geo);
     const c = cols[i];
     const n = g.attributes.position.count;
     const arr = new Float32Array(n * 3);
@@ -950,7 +959,7 @@ function buildRockGeometry(variant: number): THREE.BufferGeometry {
         : variant === 2
           ? new THREE.DodecahedronGeometry(0.78, 0)
           : new THREE.IcosahedronGeometry(0.8, 0);
-  const geo = base.toNonIndexed();
+  const geo = flatten(base);
   // рвём правильность: сдвигаем вершины шумом — получаются угловатые глыбы
   const pos = geo.attributes.position;
   for (let i = 0; i < pos.count; i++) {
@@ -986,7 +995,7 @@ function buildCragGeometry(variant: number): THREE.BufferGeometry {
   for (let i = 0; i < lumps; i++) {
     const a = hash2(variant * 91 + i * 17, i * 37 + 3);
     const b = hash2(variant * 53 + i * 29, i * 13 + 7);
-    const g = new THREE.IcosahedronGeometry(0.55 + a * 0.4, i === 0 ? 2 : 1).toNonIndexed();
+    const g = flatten(new THREE.IcosahedronGeometry(0.55 + a * 0.4, i === 0 ? 2 : 1));
     const pos = g.attributes.position;
     const ph = variant * 13.7 + i * 5.3;
     for (let k = 0; k < pos.count; k++) {
@@ -1010,7 +1019,7 @@ function buildCragGeometry(variant: number): THREE.BufferGeometry {
     g.translate((a - 0.5) * 0.75, i * 0.42 + b * 0.2, (b - 0.5) * 0.7);
     parts.push(g);
   }
-  const geo = mergeGeometries(parts).toNonIndexed();
+  const geo = flatten(mergeGeometries(parts));
   // НОРМИРУЕМ В ЕДИНИЧНЫЙ РОСТ. Глыбы складываются, их высоты суммируются:
   // без нормировки «скала масштаба 5» вырастала в восемнадцать метров и
   // стояла чёрной башней поперёк кадра. Теперь scale — честная высота в
@@ -1106,7 +1115,7 @@ function buildFlagGeometry(): THREE.BufferGeometry {
   pole.translate(0, 0.7, 0);
   const pennant = new THREE.BoxGeometry(0.45, 0.3, 0.05);
   pennant.translate(0.22, 1.15, 0);
-  return mergeGeometries([pole, pennant]).toNonIndexed();
+  return flatten(mergeGeometries([pole, pennant]));
 }
 
 function buildRoofGeometry(): THREE.BufferGeometry {
@@ -2144,7 +2153,7 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
       return false;
     }
     if (j.stage === 2) {
-      const flat = j.geo!.toNonIndexed();
+      const flat = flatten(j.geo!);
       j.geo!.dispose();
       j.geo = null;
       flat.computeVertexNormals();
@@ -2226,7 +2235,7 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
       pos.setY(i, terrainAtValley(u, v));
       pos.setX(i, toWorldX(u, v) - wx0); // изгиб долины запечён в геометрию
     }
-    const flat = geo.toNonIndexed();
+    const flat = flatten(geo);
     geo.dispose();
     flat.computeVertexNormals();
 

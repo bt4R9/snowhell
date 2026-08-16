@@ -153,7 +153,9 @@ export function buildArchGeometry(variant: number): THREE.BufferGeometry {
     }
   }
 
-  const merged = mergeGeometries(parts).toNonIndexed();
+  // mergeGeometries уже отдаёт геометрию без индекса — повторный вызов только
+  // дублирует буферы и сыплет предупреждениями в консоль
+  const merged = mergeGeometries(parts);
   for (const p of parts) p.dispose();
   const flat = merged;
 
