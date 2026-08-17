@@ -1232,6 +1232,38 @@ export class Pools {
     return { kernel, sprite: cloud.sprite };
   }
 
+  /**
+   * ★ ПРОГРЕВ ШЕЙДЕРОВ: временные меши на всех материалах лавы (зеркало,
+   * лента, струя) у заданной точки — чтобы compileAsync собрал их конвейеры до
+   * игры, а не при первом озере на пути. Вызывающий сам снимает группу.
+   */
+  warmGroup(x: number, z: number, y: number): THREE.Group {
+    const g = new THREE.Group();
+    const sh = makeShore(1, 1);
+    const u = toValleyU(x, z);
+    g.add(new THREE.Mesh(buildDisk(u, z, 3, y, sh), this.material));
+    const pts = [
+      { u, z, w: 2, bed: y - 0.4, y },
+      { u: u + 1, z: z + 4, w: 2, bed: y - 0.8, y: y - 0.4 },
+      { u: u + 2, z: z + 8, w: 2, bed: y - 1.2, y: y - 0.8 },
+    ];
+    const flow: Flow = { pts, bbox: flowBBox(pts) };
+    g.add(new THREE.Mesh(buildRibbon(flow), this.material));
+    const pit: Pit = { u: u + 3, z: z + 14, R: 3, L: y - 6, depth: 6, shore: sh };
+    g.add(new THREE.Mesh(buildFall(flow, pit), this.fallMaterial));
+    return g;
+  }
+
+  /** ★ ПРОГРЕВ COMPUTE: один прогон ядер частиц с фиктивной чашей */
+  warmCompute(x: number, z: number, y: number): void {
+    (this.uPools.array as THREE.Vector4[])[0].set(x, z, 3, y);
+    (this.uErupt.array as number[])[0] = 1;
+    this.uNPools.value = 1;
+    this.uDt.value = 0.016;
+    void this.renderer.compute(this.bubbleKernel);
+    void this.renderer.compute(this.steamKernel);
+  }
+
   /** доска коснулась расплава: пустить кольцо */
   splash(x: number, z: number, strength: number): void {
     const w = this.uWaves.array as THREE.Vector4[];

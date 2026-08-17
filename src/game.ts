@@ -299,6 +299,57 @@ export class Game {
    * загрузку, и рывки в игре просто некому создавать.
    */
   private warmed = false;
+  /** ★ прогрев завершён — до этого титул пишет LOADING и не пускает в игру */
+  warmDone = false;
+
+  /**
+   * ★ ПРОГРЕВ ВСЕХ КОНВЕЙЕРОВ ПОД ТИТУЛЬНЫМ ЭКРАНОМ. WebGPU собирает пайплайны
+   * асинхронно, и всё, чего нет в первой сцене (лава, глыбы, снаряды, луч,
+   * пыль, извержения), компилировалось при первом появлении — рывок посреди
+   * заезда. Здесь на пару кадров в сцену ставятся временные меши на каждом
+   * материале, каждый спрайт и инстанс делается видимым, башня строится, а
+   * compute-ядра прогоняются по разу; затем `compileAsync` по ВСЕЙ сцене с
+   * теми же светом и туманом, что в игре (иначе ключ пайплайна другой), и всё
+   * возвращается как было. Игрок в это время читает управление.
+   */
+  private async warmUp(): Promise<void> {
+    const cam = this.followCam.camera;
+    const px = this.player.pos.x, py = this.player.pos.y, pz = this.player.pos.z;
+    const t0 = performance.now();
+    // 1) лава: временные меши на всех её материалах
+    const lavaWarm = this.lava.warmGroup(px, pz + 20, py);
+    this.scene.add(lavaWarm);
+    // 2) башня и око: строятся принудительно (cine ≥ 0), луч/ореолы появляются
+    const cine0 = this.eye.cine;
+    this.eye.cine = 1;
+    this.eye.update(px, py, pz, this.worldTime, 1 / 60, terrainHeight, (this.scene.fog as THREE.Fog).color);
+    // 3) всё невидимое и пустое — видимым на время компиляции
+    const restore: Array<() => void> = [];
+    this.scene.traverse((o) => {
+      const any = o as unknown as { visible: boolean; count?: number; isSprite?: boolean; isInstancedMesh?: boolean };
+      if (!any.visible) {
+        any.visible = true;
+        restore.push(() => { any.visible = false; });
+      }
+      if ((any.isSprite || any.isInstancedMesh) && any.count === 0) {
+        any.count = 1;
+        restore.push(() => { any.count = 0; });
+      }
+    });
+    try {
+      await this.renderer.compileAsync(this.scene, cam);
+    } catch (e) {
+      console.warn('warmUp: compileAsync failed', e);
+    }
+    // 4) compute-ядра — по одному прогону
+    this.lava.warmCompute(px, pz + 20, py);
+    for (const r of restore) r();
+    this.scene.remove(lavaWarm);
+    lavaWarm.traverse((o) => { if ((o as THREE.Mesh).geometry) (o as THREE.Mesh).geometry.dispose(); });
+    this.eye.cine = cine0;
+    this.warmDone = true;
+    if (import.meta.env.DEV) console.info(`warmUp: ${(performance.now() - t0).toFixed(0)} ms`);
+  }
 
   render(dt: number, alpha: number): void {
     const player = this.player;
@@ -307,9 +358,7 @@ export class Game {
     this.terrain.update(player.pos.x, player.pos.z);
     if (!this.warmed) {
       this.warmed = true;
-      // ★ WebGPU: конвейеры собираются асинхронно, синхронного compile нет.
-      // Первый кадр может рисоваться без части объектов — это лучше рывка.
-      void this.renderer.compileAsync(this.scene, this.followCam.camera);
+      void this.warmUp();
     }
     // ★ ВО ВСТАВКЕ ПОГОДУ ВЕДЁТ РЕЖИССЁР. Палитра, туман и свет считаются по
     // положению игрока, а он на завязке стоит — значит небо само не потемнеет.
@@ -388,8 +437,12 @@ export class Game {
     {
       // ★ ПОДТВЕРЖДЕНИЕ ЧИТАЕМ РОВНО ОДИН РАЗ ЗА КАДР. Второй takeConfirm()
       // ниже съедал бы флаг у режиссёра: нажатие пропадало через раз.
-      const ok = this.input.takeConfirm();
+      // ★ пока идёт прогрев, подтверждение не проходит: титул пишет LOADING
+      const ok = this.input.takeConfirm() && this.warmDone;
       const scr = this.demo.update(dt, ok, player.pos.z, this.totalScore);
+      if (scr && !this.warmDone) {
+        scr.lines = scr.lines.map((l) => (l === 'PRESS SPACE TO CONTINUE' ? 'LOADING...' : l));
+      }
       if (this.demo.wantWarp) {
         this.player.warpTo(this.demo.wantWarp);
         this.demo.wantWarp = 0;
