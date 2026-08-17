@@ -1,4 +1,5 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { bandProfile } from './slice';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { noise2, hash2 } from './noise';
 
@@ -51,7 +52,8 @@ function holeR(sh: Shape, ca: number, sa: number): number {
  * лопасти, средние сколы и мелкая щербина.
  */
 function rockLump(seed: number, detail: number): THREE.BufferGeometry {
-  const g = new THREE.IcosahedronGeometry(1, detail).toNonIndexed();
+  // икосаэдр и так без индекса — toNonIndexed() лишь сыпал предупреждениями
+  const g = new THREE.IcosahedronGeometry(1, detail);
   const pos = g.attributes.position;
   const ph = seed * 7.31 + 1.7;
   for (let k = 0; k < pos.count; k++) {
@@ -224,16 +226,26 @@ export const ARCH_BINS = 20;
 
 export interface LegProfile {
   cx: number;        // центр ноги по X в единичной арке
-  prof: number[];    // радиус по секторам (в единицах пролёта)
+  prof: number[];    // радиус по секторам (в единицах пролёта) в поясе у земли
+  g0: number;        // уровень земли в единичной арке
+  /** ★ ПОСЛОЙНО: layers[l] — профиль слоя высот [y0 + l·dy, +dy). Ноги не
+   * цилиндры: у подошвы раструб, выше — уже; доска на склоне встречает ногу
+   * на разной высоте модели, и один пояс давал стену из воздуха. */
+  y0: number;
+  dy: number;
+  layers: number[][];
 }
+
+const LEG_DY = 0.04;
+const LEG_LAYERS = 14;
 
 export function archLegProfiles(geo: THREE.BufferGeometry): LegProfile[] {
   const p = geo.attributes.position;
   const g0 = (geo.userData.groundY as number) ?? 0;
 
   const side = (want: number): LegProfile => {
-    // треугольники ноги в поясе касания
-    const tris: number[][] = [];
+    const y0 = g0 - 0.02;
+    // центр ноги — по поясу у земли, общий для всех слоёв
     let minX = 1e9;
     let maxX = -1e9;
     for (let i = 0; i < p.count; i += 3) {
@@ -241,16 +253,31 @@ export function archLegProfiles(geo: THREE.BufferGeometry): LegProfile[] {
       if (ym < g0 - 0.01 || ym > g0 + 0.09) continue;
       const xm = (p.getX(i) + p.getX(i + 1) + p.getX(i + 2)) / 3;
       if (Math.sign(xm) !== want) continue;
-      const t: number[] = [];
       for (let k = 0; k < 3; k++) {
         const x = p.getX(i + k);
-        t.push(x, p.getZ(i + k));
         if (x < minX) minX = x;
         if (x > maxX) maxX = x;
       }
+    }
+    const cx = minX < maxX ? (minX + maxX) / 2 : want * 0.36;
+    // ★ слой по СРЕЗАМ (slice.ts): нога низкополигональна, её треугольники
+    // выше любого слоя, и отбор по центроидам оставлял слои пустыми
+    const bandS = (lo: number, hi: number): number[] =>
+      bandProfile(geo, lo, hi, ARCH_BINS, cx, 0, (xm) => Math.sign(xm) === want);
+    const band = (lo: number, hi: number): number[] => {
+    // треугольники ноги в поясе касания
+    const tris: number[][] = [];
+    for (let i = 0; i < p.count; i += 3) {
+      const ym = (p.getY(i) + p.getY(i + 1) + p.getY(i + 2)) / 3;
+      if (ym < lo || ym > hi) continue;
+      const xm = (p.getX(i) + p.getX(i + 1) + p.getX(i + 2)) / 3;
+      if (Math.sign(xm) !== want) continue;
+      const t: number[] = [];
+      for (let k = 0; k < 3; k++) {
+        t.push(p.getX(i + k), p.getZ(i + k));
+      }
       tris.push(t);
     }
-    const cx = tris.length ? (minX + maxX) / 2 : want * 0.36;
     const prof = new Array(ARCH_BINS).fill(0);
     for (let k = 0; k < ARCH_BINS; k++) {
       const th = ((k + 0.5) / ARCH_BINS) * Math.PI * 2 - Math.PI;
@@ -286,7 +313,16 @@ export function archLegProfiles(geo: THREE.BufferGeometry): LegProfile[] {
       }
       if (holes === 0) break;
     }
-    return { cx, prof };
+    return prof;
+    };
+    const prof = band(g0 - 0.01, g0 + 0.09);
+    const layers: number[][] = [];
+    for (let l = 0; l < LEG_LAYERS; l++) {
+      const lay = bandS(y0 + l * LEG_DY, y0 + (l + 1) * LEG_DY);
+      // пустой слой (треугольников в нём нет) — берём соседний снизу
+      layers.push(lay.some((v) => v > 0) ? lay : (layers[l - 1] ?? prof));
+    }
+    return { cx, prof, g0, y0, dy: LEG_DY, layers };
   };
 
   return [side(-1), side(1)];

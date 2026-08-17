@@ -1,9 +1,19 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { lambert, basic, UniformMap } from '../core/mat';
+import {
+  Fn, If, Loop, float, int, uint, vec2, vec3, vec4, uniform, uniformArray, attribute,
+  output, diffuseColor, normalView, positionLocal, positionGeometry, positionWorld, positionView,
+  modelWorldMatrix,
+  smoothstep, abs, floor, fract, sin, dot, mix, length, max, min, clamp, pow, normalize, atan, select,
+} from 'three/tsl';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { hash2, noise2 } from './noise';
+import { recipe, actAt } from './recipe';
 import { PALETTE } from './palette';
 import { buildArchGeometry, archLegProfiles } from './arch';
-import { lavaCrustAt, lavaBowl, steamMarkAt, hazardHeatAt, setCrackSampler } from './lava';
+import { steamMarkAt, hazardHeatAt, hazardListsFor } from './lava';
+import { poolCarve, setPoolTerrainSampler } from './pools';
+import { ChunkShader } from './chunkshade';
 import {
   CHUNK,
   obstaclesInChunk,
@@ -23,6 +33,9 @@ import {
   cragInRow,
   setCragProfiles,
   CRAG_BINS,
+  CRAG_LAYERS,
+  CRAG_LAYER_Y0,
+  CRAG_LAYER_H,
   CRAG_STEP,
   ARCH_STEP,
   archInRow,
@@ -48,6 +61,7 @@ import {
   railsInChunkWorld,
   surfaceKindAt,
   setTerrainSampler,
+  setVillagePads,
   SURF_PACKED,
   SURF_POWDER,
   SURF_ICE,
@@ -61,13 +75,16 @@ import {
 // лёгкая волна из синусов даёт ритм «быстро ↔ очень быстро».
 // Высота — точный интеграл профиля, чтобы градиент для физики был честным.
 
+// S0/S1 — БАЗА, поверх которой сид меняет характер горы (см. recipe.ts):
+// один мир пологий и быстрый, другой — крутой с сильной волной.
 const S0 = 0.58;
 const S1 = 0.12, F1 = 0.009, P1 = 1.7;
 const S2 = 0.05, F2 = 0.023, P2 = 4.2;
 
 /** Текущий уклон спуска в точке z (для дебага и будущего дизайна биомов) */
 export function slopeAt(z: number): number {
-  return S0 + S1 * Math.sin(z * F1 + P1) + S2 * Math.sin(z * F2 + P2);
+  const R = recipe();
+  return R.slope + R.slopeWave * Math.sin(z * F1 + P1) + S2 * Math.sin(z * F2 + P2);
 }
 
 /**
@@ -86,7 +103,8 @@ function descentSlopeAt(v: number): number {
   // Крутизна тоже разгоняется: старт — пологий вкат, дальше настоящий склон.
   // Множитель входит ПОД интеграл, поэтому высота остаётся честной первообразной
   // уклона и градиент для физики совпадает с картинкой.
-  return (S0 + S1 * Math.sin(v * F1 + P1) + S2 * Math.sin(v * F2 + P2)) *
+  const R = recipe();
+  return (R.slope + R.slopeWave * Math.sin(v * F1 + P1) + S2 * Math.sin(v * F2 + P2)) *
     Math.sqrt(1 + sl * sl) * WARMUP.slope(v) * volcanoEase(v);
 }
 
@@ -113,8 +131,68 @@ function baseDescent(v: number): number {
  */
 export function rockyAt(x: number, z: number): number {
   const n = noise2(x * 0.0042 - 33.1, z * 0.0026 + 17.7) * 0.5 + 0.5;
-  const d = Math.max(0, Math.min(1, (n - 0.6) / 0.16));
+  // Двигаем ПОРОГ, а не высоту скал: иначе в «каменном» акте вырастает не
+  // площадь выходов породы, а их амплитуда — и склон превращается в пилу.
+  const dens = Math.min(2.2, recipe().rocky * actAt(z).rocky);
+  const thr = 0.6 - (dens - 1) * 0.11;
+  const d = Math.max(0, Math.min(1, (n - thr) / 0.16));
   return d * d * (3 - 2 * d);
+}
+
+/**
+ * Излом скального поля — БЕЗ множителя rocky, чтобы его можно было пробовать
+ * в соседних точках (см. flatBottom).
+ */
+function rockRelief(x: number, z: number): number {
+  // ★ ВТОРАЯ ОКТАВА БЫЛА КОРОЧЕ, ЧЕМ ДОСКА МОЖЕТ ПРОГЛОТИТЬ. Было 0.16 (ячейка
+  // 6 м) при ±2.2 м — это кривизна 0.34 против 0.014 у крупных форм горы, то
+  // есть весь «шёлк» на дне ложбин делала она. Растянута до 14 м и приглушена;
+  // излом на глаз остался (перепад 6 м на 14), а плоское дно стало возможным.
+  return (
+    noise2(x * 0.075 + 31.2, z * 0.06 - 14.5) * 4.5 +
+    noise2(x * 0.07 - 6.3, z * 0.066 + 22.8) * 1.5
+  );
+}
+
+/** полуширина будущего плоского дна, м (дно выходит примерно вдвое шире) */
+const FLAT_R = 2.5;
+/** ниже этой кривизны ложбина и так пологая — не трогаем */
+const FLAT_MIN = 0.05;
+
+/**
+ * ★ У ВПАДИНЫ ОБЯЗАНО БЫТЬ ПЛОСКОЕ ДНО. Замер: 53% ложбин на склоне имели дно
+ * уже 4 м, у глубоких (от 4 м) — 59%, медиана 3 м. В такой шёлк доска входит
+ * кантом, повернуть в нём нечем, и райдера мотает. Виновником оказались НЕ
+ * рёбра и не рябь (их отключение не меняло ширину дна вовсе), а скальные поля:
+ * излом с ячейкой 13 и 6 м даёт кривизну 0.2–0.35 против 0.014 у крупных форм.
+ *
+ * Операция — морфологическое замыкание, но дешёвое: три пробы вдоль оси дают
+ * кривизну curv и наклон g, из них считается расстояние до дна ложбины, и дно
+ * приподнимается на curv по колоколу (1−t²)². Ширина колокола L = R·√2 выбрана
+ * так, что в самом низу вторая производная обращается в НОЛЬ — дно получается
+ * плоским, а по краям колокол сходит с нулевой производной, то есть без
+ * излома. Излом здесь был бы хуже исходной ямы: доска ловит его мгновенно.
+ *
+ * Работает по обеим осям и берёт больший подъём: жёлоб вдоль спуска чинится
+ * поперечной пробой, поперечный — продольной.
+ */
+function flatBottom(f: (x: number, z: number) => number, x: number, z: number): number {
+  const v0 = f(x, z);
+  const L = FLAT_R * Math.SQRT2;
+  let lift = 0;
+  for (let axis = 0; axis < 2; axis++) {
+    const a = axis === 0 ? f(x - FLAT_R, z) : f(x, z - FLAT_R);
+    const b = axis === 0 ? f(x + FLAT_R, z) : f(x, z + FLAT_R);
+    const curv = (a + b) / 2 - v0;
+    if (curv <= FLAT_MIN) continue; // выпуклость или почти прямая
+    // вершина параболы: смещение от текущей точки до дна ложбины
+    const t = ((b - a) / 2) * (FLAT_R / (2 * curv)) / L;
+    if (t <= -1 || t >= 1) continue; // дно дальше колокола — мы уже на стенке
+    const w = 1 - t * t;
+    const add = curv * w * w;
+    if (add > lift) lift = add;
+  }
+  return v0 + lift;
 }
 
 /**
@@ -180,8 +258,14 @@ function terrainBase(x: number, z: number): number {
   // Шум частый поперёк и очень медленный вдоль спуска, поэтому рёбра тянутся
   // вниз по склону и НЕ гасят уклон: они меняют форму вбок, а не крутизну.
   const ribs = WARMUP.ribs(z);
-  h += noise2(x * 0.014 + 44.1, z * 0.0016 - 7.8) * 7.5 * wild * ribs;
-  h += noise2(x * 0.028 - 19.6, z * 0.0035 + 2.4) * 3.2 * wild * ribs;
+  // ★★ В ЖЁЛОБЕ РЁБРА ГАСЯТСЯ. Дно кулуара по проекту плоское на 22 м, но
+  // профиль жёлоба складывается с рёбрами (амплитуда 7.5 и 3.2 м на масштабе
+  // 36–71 м) — они кладут дно набок, и от ровной полосы остаётся 6–7 м
+  // (замер по обоим биомам: медиана 6.5 и 7.5, у 63% уже десяти метров).
+  // Рёбра — это форма СКЛОНА, внутри жёлоба им делать нечего.
+  const gullyFlat = 1 - gullyInside(x, z) * 0.85;
+  h += noise2(x * 0.014 + 44.1, z * 0.0016 - 7.8) * 7.5 * wild * ribs * gullyFlat;
+  h += noise2(x * 0.028 - 19.6, z * 0.0035 + 2.4) * 3.2 * wild * ribs * gullyFlat;
   // дно кулуара тоже укатано — по нему едешь, а не трясёшься
   const gully = gullyInside(x, z);
   // Множитель биома: застывшая лава куда более заструженная, чем снег.
@@ -190,7 +274,7 @@ function terrainBase(x: number, z: number): number {
   // ищет: гладкость здесь и есть награда, как укатанность трассы в Альпах.
   const smoothed = 1 - 0.72 * piste.t * volcanoWeight(z);
   const r =
-    roughnessAt(x, z) * wild * (1 - gully * 0.7) * WARMUP.bumps(z) *
+    roughnessAt(x, z) * wild * (1 - gully * 0.95) * WARMUP.bumps(z) *
     biomeRoughMul(z) * smoothed;
   h += noise2(x * 0.012 + 3.7, z * 0.012) * 5.0 * (0.3 + 0.7 * r) * (0.35 + 0.65 * wild);
   h += noise2(x * 0.05, z * 0.05 + 9.1) * 2.0 * r;
@@ -199,7 +283,6 @@ function terrainBase(x: number, z: number): number {
   // блоками подряд — провалы выходили вдвое глубже задуманного, и выбраться из
   // них было нечем. Ровно один раз.
   const vwBowl = volcanoWeight(z);
-  if (vwBowl > 0.001) h += lavaBowl(x, z) * vwBowl;
 
   // ★ ШЛАКОВАЯ ФАКТУРА. Общего множителя ряби оказалось мало: он масштабирует
   // только часть слагаемых, и замер по 45 линиям дал всего +27% против Альп
@@ -259,10 +342,10 @@ function terrainBase(x: number, z: number): number {
   // Скальные выходы: редкие поля, где снег не держится и наружу лезет
   // изломанная порода. Дают крутые грани, на которых работает скальная
   // раскраска, — без них вся гора одинаково снежная.
-  const rocky = rockyAt(x, z) * wild * WARMUP.rocky(z);
+  // и порода в жёлобе не вылезает: её излом — та же кособочащая добавка
+  const rocky = rockyAt(x, z) * wild * WARMUP.rocky(z) * (1 - gully * 0.9);
   if (rocky > 0) {
-    h += noise2(x * 0.075 + 31.2, z * 0.06 - 14.5) * 5.5 * rocky;
-    h += noise2(x * 0.16 - 6.3, z * 0.15 + 22.8) * 2.2 * rocky;
+    h += flatBottom(rockRelief, x, z) * rocky;
   }
   // Скала растёт ИЗ горы: под ней рельеф вспучивается холмом (см. cragLift).
   h += cragLift(x, z);
@@ -274,6 +357,10 @@ function terrainBase(x: number, z: number): number {
   h -= 1.1 * piste.t;
   h += piste.bank * piste.t;
   h += kickerHeight(x, z);
+  // ★ ЧАШИ ЛАВЫ ВЫРЕЗАЮТСЯ ПОСЛЕДНИМИ И ПОВЕРХ ВСЕГО. Дно ниже зеркала, вал
+  // выше — это явная форма, а не добавка к шуму: внутри чаши рельеф именно
+  // такой, каким его видит меш расплава и физика (см. pools.ts).
+  if (vwBowl > 0.001) h += poolCarve(x, z, h);
   return h;
 }
 
@@ -314,7 +401,23 @@ function villageHeights(v: Village): { road: number[]; pads: number[] } {
       sum += terrainBase(h.x + dx, h.z + dz);
       n++;
     }
-    return sum / n;
+    const own = sum / n;
+    if (!h.sunk) return own;
+    // ★ ВКОПАННЫЙ ДОМ: КРЫША ПРОДОЛЖАЕТ СКЛОН. Ставим коробку так, чтобы
+    // НАГОРНЫЙ карниз оказался вровень с землёй над домом — тогда на крышу
+    // въезжаешь с горы, не заметив стыка, а вниз с конька улетаешь как с
+    // трамплина. Считаем по terrainBase (без деревенского выполаживания),
+    // иначе высота дома зависела бы от самой себя.
+    const R = houseRoof(h);
+    const up = terrainBase(h.x, h.z - R.hd - 2.5);
+    // ★ НЕ MIN, А ИМЕННО ЭТА ОТМЕТКА. Сначала здесь стоял min(own, ...) — и на
+    // склоне 0.6 он почти всегда выбирал own, то есть дом оставался стоять как
+    // стоял, только без выравнивания земли: снег накрывал его с головой, и
+    // игрок проезжал по сугробу, не задев ни стены, ни крыши (замер: 220 кадров
+    // сквозь дом, ни одного касания). Ставим карниз на 0.4 м ниже нагорной
+    // земли и лишь ограничиваем разумным коридором вокруг собственной отметки.
+    const want = up - R.eave - 0.4;
+    return Math.max(own - 6, Math.min(own + 1.5, want));
   });
   const res = { road, pads };
   villageHeightCache.set(v.key, res);
@@ -331,7 +434,12 @@ export function terrainHeight(x: number, z: number): number {
 // Отдаём высоту генератору препятствий: ему нужна крутизна, чтобы не сажать
 // лес на скальные стены, а импортировать terrain.ts оттуда нельзя — цикл.
 setTerrainSampler((u, z) => terrainAtValley(u, z));
-setCrackSampler((x, z) => crackHeatAt(x, z, crackTime));
+// ★ ОДНА ВЫСОТА ПЛОЩАДКИ НА ВСЕХ. По крышам ездят, поэтому физика обязана
+// мерить ровно ту отметку, на которой дом нарисован. У вкопанного дома она уже
+// НЕ равна рельефу под ним, и вывести её из земли нельзя — отдаём напрямую.
+setVillagePads((v, i) => villageHeights(v).pads[i]);
+// чашам лавы нужен рельеф ДО их собственного выреза (см. pools.ts)
+setPoolTerrainSampler((u, z) => terrainAtValley(u, z));
 
 /**
  * ★ toNonIndexed() НА УЖЕ РАЗВЁРНУТОЙ ГЕОМЕТРИИ — ЭТО ЛИШНЯЯ КОПИЯ И ПРЕДУПРЕЖДЕНИЕ
@@ -419,9 +527,21 @@ setCragProfiles(
     // метров над этой линией, и от неё до 0.66 камня уже нет — но хитбокс там
     // был. Отсюда и невидимые стены при проезде рядом. У арок пояс с самого
     // начала мерился правильно: [g0−0.01, g0+0.09].
-    const prof = radialProfile(g, 0.34, 0.45, CRAG_BINS);
+    // ★ ПОСЛОЙНО: доска на склоне/холме встречает глыбу на разной высоте
+    // модели, и слой берётся тот, где она стоит (см. cragRadiusToward).
+    const layers: number[][] = [];
+    const posA = g.attributes.position;
+    let maxY = 0;
+    for (let i = 0; i < posA.count; i++) maxY = Math.max(maxY, posA.getY(i));
+    for (let l = 0; l < CRAG_LAYERS; l++) {
+      const y0 = CRAG_LAYER_Y0 + l * CRAG_LAYER_H;
+      // ★ по СРЕЗАМ (slice.ts): точный контур на любой высоте
+      const lay = bandProfile(g, y0, y0 + CRAG_LAYER_H, CRAG_BINS);
+      // пустой слой внутри модели — берём нижний сосед; выше макушки — камня нет
+      layers.push(lay.some((v) => v > 0) || y0 > maxY ? lay : (layers[l - 1] ?? lay));
+    }
     g.dispose();
-    return prof;
+    return layers;
   })
 );
 
@@ -456,6 +576,8 @@ export function terrainAtValley(u: number, z: number): number {
   }
   for (let i = 0; i < v.houses.length; i++) {
     const h = v.houses[i];
+    // вкопанный дом не выравнивает землю под собой — он врезан в неё как есть
+    if (h.sunk) continue;
     const d2 = (h.x - x) * (h.x - x) + (h.z - z) * (h.z - z);
     if (d2 > 13 * 13) continue;
     const w = 1 - smooth01((Math.sqrt(d2) - h.padR) / 6);
@@ -476,6 +598,12 @@ export function terrainAtValley(u: number, z: number): number {
   let out = lvl;
   for (let i = 0; i < v.houses.length; i++) {
     const h = v.houses[i];
+    // ★ НАМЁТ ОСТАВЛЕН И ВКОПАННЫМ. Посадку дома считает terrainBase, а игрок
+    // едет по terrainHeight — а там сверху лежат профиль улицы и площадки
+    // соседей, и земля у нагорной стены оказывалась на метр-другой ниже
+    // расчётной (замер: карниз торчал над склоном на 0.99 м по медиане и до
+    // 6.75 на краю). Намёт доводит землю до карниза по факту, а не по расчёту:
+    // у вкопанного дома ему остаётся дотянуть считанные сантиметры.
     const dx = x - h.x;
     const dz = z - h.z;
     if (dz > 0 || dx * dx + dz * dz > 18 * 18) continue; // намёт лежит выше по склону
@@ -1236,9 +1364,27 @@ export function terrainColorAt(
     const ash = sstep(0.46, 0.54, patch); // жёсткая кромка пепельного поля
     const ropy = far ? 0.5 : noise2(u * 0.55, z * 0.06 + 11.3) * 0.5 + 0.5;
     const grit = far ? 0.5 : noise2(u * 1.15 - 4.2, z * 1.15) * 0.5 + 0.5;
-    let vr = 0.075 + (0.34 - 0.075) * ash;
-    let vg = 0.063 + (0.31 - 0.063) * ash;
-    let vb = 0.070 + (0.30 - 0.070) * ash;
+    // ★★ ПЕПЕЛ ТЁМНЫЙ И ХОЛОДНЫЙ. Было 0.34/0.31/0.30 — светло-серый, который
+    // под любым тёплым светом становится песком: биом читался пустыней, а не
+    // вулканом. Вулкан — это ЧЁРНОЕ И КРАСНОЕ: пепел уводим втрое темнее и
+    // слегка в синеву, чтобы тёплый свет его подкрашивал, а не перекрашивал.
+    // Красное в кадре имеет право давать только сама лава и прокал у неё.
+    // пепел тёмный: земля вулкана должна быть ПЕПЛОМ, а не бурым грунтом
+    // ★★ У ПОРОДЫ ЕСТЬ ЦВЕТ. Мы гнали пепел всё темнее (0.13 к концу) в
+    // попытке уйти от «пустыни» — а уходить надо было не в темноту, а в
+    // светлую мглу: на референсе камень вулкана это тёплый пыльно-бурый, и
+    // читается он контрастом с бледным коралловым воздухом. При альбедо у нуля
+    // читать нечем, и картинку начинают рисовать аддитивные подмешки зарева —
+    // они-то и давали охру вблизи и чёрную даль.
+    // ★ ПОРОДА КРАСНО-БУРАЯ, А НЕ ПЕСОЧНАЯ. С отношением каналов 1:0.72:0.66
+    // камень читался таном — то есть песком, ровно тем, от чего уходим.
+    // У вулканического камня зелёный и синий провалены сильнее.
+    // ★ ЧЁРНОЕ, А НЕ БУРОЕ («опять пустыня, должно быть чёрным»): порода почти
+    // нейтральный тёмно-серый базальт, пепел светлее лишь вдвое; красное в кадре
+    // даёт только лава и прокал.
+    let vr = 0.095 + (0.170 - 0.095) * ash;
+    let vg = 0.088 + (0.160 - 0.088) * ash;
+    let vb = 0.088 + (0.155 - 0.088) * ash;
     const rk = 0.84 + ropy * 0.32;
     const gk = 0.86 + grit * 0.28;
     vr *= rk * gk;
@@ -1262,11 +1408,15 @@ export function terrainColorAt(
       vg *= 1 + (k - 1) * ash;
       vb *= 1 + (k - 1) * ash * 1.08;
     }
-    // крутые грани — голая порода с рыжиной окисла
+    // ★★ КРУТЫЕ ГРАНИ — БАЗАЛЬТ, А НЕ ПУСТОТА. Было 0.085/0.052/0.042, и это
+    // ещё домножается на тинт биома (0.27) — итого 0.023, то есть чистая
+    // чернота при любом свете: борта ущелий читались дырами в мире, а не
+    // камнем (луч в такое место: ламберт 0.49, солнце светит — а всё равно
+    // чёрное). Камень обязан оставаться камнем: тёмным, но с фактурой.
     const sk2 = sstep(0.34, 0.62, steep);
-    vr += (0.085 - vr) * sk2;
-    vg += (0.052 - vg) * sk2;
-    vb += (0.042 - vb) * sk2;
+    vr += (0.14 - vr) * sk2;
+    vg += (0.13 - vg) * sk2;
+    vb += (0.125 - vb) * sk2;
     // ★ УСТЬЕ ПАРА ПОМЕЧЕНО НА ЗЕМЛЕ. Струя подбрасывает — это выгодно, и
     // игрок должен видеть цель заранее, а не в момент удара. Вокруг щели
     // натёк серно-жёлтый налёт, сама щель тёмная. Вдали метку не считаем:
@@ -1313,9 +1463,9 @@ export function terrainColorAt(
     // выметенный пепел, а не ратрак: серый, а не белый.
     // Замер контраста: в альпах жёлоб светлее целины в 1.1–1.7 раза, а здесь
     // при цели 0.40 выходило 6 раз — потому лента и читалась снежной.
-    const tr = PISTE_TINT.r + (0.20 - PISTE_TINT.r) * vw;
-    const tg = PISTE_TINT.g + (0.185 - PISTE_TINT.g) * vw;
-    const tb = PISTE_TINT.b + (0.175 - PISTE_TINT.b) * vw;
+    const tr = PISTE_TINT.r + (0.15 - PISTE_TINT.r) * vw;
+    const tg = PISTE_TINT.g + (0.14 - PISTE_TINT.g) * vw;
+    const tb = PISTE_TINT.b + (0.135 - PISTE_TINT.b) * vw;
     const k = pt * (0.75 - vw * 0.1);
     cr += (tr - cr) * k;
     cg += (tg - cg) * k;
@@ -1326,142 +1476,44 @@ export function terrainColorAt(
   out.hot = glowHz;
 }
 
-/**
- * ★ ГДЕ ГОРЯЧИЙ ШОВ. Сеть трещин живёт в шейдере — оттуда её не спросить, а
- * искрам нужно откуда-то вылетать. Здесь тот же рисунок, посчитанный на
- * стороне игры: те же плиты, разломы и маска жара. Точность до пикселя не
- * нужна — важно, чтобы искры шли из тех же мест, где светится.
- */
-function chash(x: number, y: number): number {
-  // ★ ИМЕННО fract, А НЕ ОСТАТОК. В шейдере стоит fract(), который для
-  // отрицательных даёт 0.7 из −0.3, а «% 1» в JS даёт −0.3. Из-за этого
-  // рисунок плит у двойника не совпадал с нарисованным: игрок ехал по
-  // светящейся сети, а игра считала, что швов под ним нет — шкала не росла,
-  // колея рисовалась, искры не летели.
-  const v = Math.sin(Math.floor(x) * 127.1 + Math.floor(y) * 311.7) * 43758.5453;
-  return v - Math.floor(v);
-}
-function cnoise(x: number, y: number): number {
-  const ix = Math.floor(x);
-  const iy = Math.floor(y);
-  let fx = x - ix;
-  let fy = y - iy;
-  fx = fx * fx * (3 - 2 * fx);
-  fy = fy * fy * (3 - 2 * fy);
-  const a = chash(ix, iy);
-  const b = chash(ix + 1, iy);
-  const c = chash(ix, iy + 1);
-  const d = chash(ix + 1, iy + 1);
-  const top = a + (b - a) * fx;
-  return top + (c + (d - c) * fx - top) * fy;
-}
-function cstep(a: number, b: number, x: number): number {
-  const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
-  return t * t * (3 - 2 * t);
-}
+import { damage } from '../fx/damage';
+import { bandProfile } from './slice';
 
-/** время, по которому коробится сеть трещин — то же, что в шейдере */
-let crackTime = 0;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type N = any;
 
-export function crackHeatAt(x: number, z: number, t = 0): number {
-  // ★ ТЕ ЖЕ КООРДИНАТЫ, ЧТО У ШЕЙДЕРА. Сеть в шейдере считается по
-  // ПОКОРОБЛЕННОМУ домену (она ходит во времени), и двойник, считавший по
-  // чистым координатам, промахивался на метры: игрок ехал по светящемуся шву,
-  // а игра считала, что швов под ним нет.
-  const wax = (cnoise(x * 0.021 + t * 0.16, z * 0.021 + 3) - 0.5) * 9;
-  const waz = (cnoise(x * 0.019 + 11, z * 0.019 + t * 0.13) - 0.5) * 9;
-  const wbx = (cnoise(x * 0.055 + t * 0.34, z * 0.055) - 0.5) * 11;
-  const wbz = (cnoise(x * 0.048 + 5, z * 0.048 - t * 0.29) - 0.5) * 11;
-  const px0 = x + wax;
-  const pz0 = z + waz;
-  const rx = x + wbx;
-  const rz = z + wbz;
-  const reg = cnoise(x * 0.009, z * 0.009);
-  const sizeN = cnoise(x * 0.006 + 7, z * 0.006 + 7);
-  const seamW = 0.115 * (0.55 + 0.8 * Math.sin(t * 1.15 + reg * 9) * 0.5 + 0.4);
-  const cs = 0.4 + (0.145 - 0.4) * sizeN;
-  const px = px0 * cs;
-  const pz = pz0 * cs;
-  const ipx = Math.floor(px);
-  const ipz = Math.floor(pz);
-  const fpx = px - ipx;
-  const fpz = pz - ipz;
-  let d1 = 8;
-  let d2 = 8;
-  for (let j = -1; j <= 1; j++) {
-    for (let i = -1; i <= 1; i++) {
-      const ox = chash(ipx + i + 0.5, ipz + j + 0.5);
-      const oz = chash(ipx + i + 17.3, ipz + j + 17.3);
-      const dd = Math.hypot(i + ox - fpx, j + oz - fpz);
-      if (dd < d1) {
-        d2 = d1;
-        d1 = dd;
-      } else if (dd < d2) d2 = dd;
-    }
-  }
-  const plate = 1 - cstep(0, Math.max(0.02, seamW), d2 - d1);
-  const r1 = 1 - Math.abs(cnoise(rx * 0.16, rz * 0.16) * 2 - 1);
-  const r2 = 1 - Math.abs(cnoise(rx * 0.47 + 11, rz * 0.47 + 11) * 2 - 1);
-  const rift = cstep(0.94, 1, r1) * cstep(0.66, 1, r2);
-  const f1 = 1 - Math.abs(cnoise(px0 * 1.9 + 3, pz0 * 1.9 + 3) * 2 - 1);
-  const craze = cstep(0.84, 1, f1) * 0.6;
-  let cr = Math.max(
-    Math.max(plate * cstep(0.62, 0.34, reg), rift),
-    craze * cstep(0.58, 0.82, reg)
+/** хэш по ЯЧЕЙКЕ и value-noise рельефа */
+// ★ хэш решётки — целочисленный: sin() на больших координатах ломается (NaN на Apple GPU)
+const thash = Fn(([p0]: [N]) => {
+  const p: N = floor(p0);
+  const h = uint(int(p.x)).mul(uint(374761393)).add(uint(int(p.y)).mul(uint(668265263))).toVar();
+  h.assign(h.bitXor(h.shiftRight(uint(13))).mul(uint(1274126177)));
+  return float(h.bitXor(h.shiftRight(uint(16)))).div(4294967295.0);
+});
+const tnoise = Fn(([p]: [N]) => {
+  const i: N = floor(p);
+  const f0: N = fract(p);
+  const f = f0.mul(f0).mul(f0.mul(-2.0).add(3.0));
+  return mix(
+    mix(thash(i), thash(i.add(vec2(1, 0))), f.x),
+    mix(thash(i.add(vec2(0, 1))), thash(i.add(vec2(1, 1))), f.x),
+    f.y
   );
-  cr *= cstep(0.12, 0.3, cnoise(x * 0.015 + 21, z * 0.015 + 21));
-  // ★ ПОРОГИ ЖАРА ОБЯЗАНЫ СОВПАДАТЬ С ШЕЙДЕРОМ. В шейдере маску ужесточили до
-  // 0.62…0.92 (иначе тлела половина сети), а двойник остался на 0.45…0.84 — и
-  // разошлись они ровно там, где это заметнее всего: игра грела доску на земле,
-  // где никаких светящихся швов не нарисовано, и молчала на части настоящих.
-  const hot = cstep(0.62, 0.92, cnoise(x * 0.02 + 31, z * 0.02 + 31));
-  return cr * cr * hot;
-}
-
-/**
- * Насколько раскалено само МЕСТО (без учёта конкретного шва). В таких полях
- * земля горячая и между трещинами: сеть там частая, и доска всё равно идёт по
- * жару. Без этого слагаемого шкала не набиралась вовсе — доска шириной в метр
- * попадает точно в шов лишь несколько процентов времени.
- */
-export function hotGroundAt(x: number, z: number): number {
-  // те же пороги, что в шейдере и в crackHeatAt — иначе поле жара разъедется
-  return cstep(0.62, 0.92, cnoise(x * 0.02 + 31, z * 0.02 + 31));
-}
-
-import { CRATERS } from '../fx/craters';
-import { MARKS, MOLTEN, COOL, DEPTH as LAS_DEPTH, CUT_R } from '../fx/laser';
-
-/**
- * ★ ПАРНАЯ ФОРМУЛА К fx/laser.ts. Борозду от луча считают четверо: этот шейдер
- * (вершины и цвет), доска, камера и колея следа. Расходиться им нельзя, поэтому
- * и там и здесь стоит одно и то же выражение — и менять его надо в обоих местах.
- * Возвращает vec3: профиль поперёк борозды, а в yz — направление ОТ оси звена
- * к точке (оно нужно нормалям).
- */
-const LASER_GLSL = /* glsl */ `
-vec3 lasAt(vec4 a, vec2 p) {
-  vec2 u = a.zw - a.xy;
-  float l2 = max(1e-4, dot(u, u));
-  float h = clamp(dot(p - a.xy, u) / l2, 0.0, 1.0);
-  vec2 d = p - a.xy - u * h;
-  float len = length(d);
-  if (len >= LAS_R) return vec3(0.0);
-  float k = 1.0 - len / LAS_R;
-  return vec3(k * k, len > 1e-4 ? d / len : vec2(0.0));
-}
-`;
-
+});
 /** сколько очагов лавы освещают рельеф одновременно */
 export const GLOWS = 10;
+/** сколько ударных волн башни бежит по земле одновременно (и меток-колец) */
+export const WAVES = 4;
+/** ширина вала и высота гребня, м */
+export const WAVE_W = 16;
+export const WAVE_H = 5.5;
 
 export class Terrain {
   group = new THREE.Group();
-  /** юниформы материала рельефа — время нужно живым трещинам */
-  private matUniforms: Record<string, THREE.IUniform> | null = null;
+  /** юниформы материала рельефа — время нужно тлению у лавы и следам */
+  private matUniforms: UniformMap | null = null;
 
   setTime(t: number): void {
-    crackTime = t;
     if (this.matUniforms) this.matUniforms.uTime.value = t;
   }
 
@@ -1474,35 +1526,6 @@ export class Terrain {
    *
    * @param s яркость; 0 — пятна нет
    */
-  /**
-   * Свежие воронки: до CRATERS штук, кольцевым буфером.
-   * @param arr [x, z, радиус, свежесть] по четвёрке на воронку
-   */
-  setCraters(arr: Float32Array): void {
-    if (!this.matUniforms) return;
-    const u = this.matUniforms.uCrater.value as THREE.Vector4[];
-    let live = 0;
-    for (let i = 0; i < CRATERS; i++) {
-      u[i].set(arr[i * 4], arr[i * 4 + 1], Math.max(0.5, arr[i * 4 + 2]), arr[i * 4 + 3]);
-      if (arr[i * 4 + 3] > 0.002) live++;
-    }
-    this.matUniforms.uCrN.value = live;
-  }
-
-  /** звенья реза: [ax, az, bx, bz] и [возраст, живучесть] */
-  setLaser(a: Float32Array, b: Float32Array): void {
-    if (!this.matUniforms) return;
-    const ua = this.matUniforms.uLaserA.value as THREE.Vector4[];
-    const ub = this.matUniforms.uLaserB.value as THREE.Vector4[];
-    let live = 0;
-    for (let i = 0; i < MARKS; i++) {
-      ua[i].set(a[i * 4], a[i * 4 + 1], a[i * 4 + 2], a[i * 4 + 3]);
-      ub[i].set(b[i * 4], b[i * 4 + 1], 0, 0);
-      if (b[i * 4 + 1] > 0.002) live++;
-    }
-    this.matUniforms.uMarks.value = live;
-  }
-
   setSpot(x: number, z: number, r: number, s: number): void {
     if (!this.matUniforms) return;
     (this.matUniforms.uSpot.value as THREE.Vector4).set(x, z, r, s);
@@ -1511,10 +1534,30 @@ export class Terrain {
   /** очаги лавы, освещающие рельеф: [x, z, радиус, сила] × GLOWS */
   setGlows(arr: Float32Array): void {
     if (!this.matUniforms) return;
-    const u = this.matUniforms.uGlow.value as THREE.Vector4[];
+    const u = this.matUniforms.uGlow.array as THREE.Vector4[];
     for (let i = 0; i < GLOWS; i++) {
       u[i].set(arr[i * 4], arr[i * 4 + 1], Math.max(1, arr[i * 4 + 2]), arr[i * 4 + 3]);
     }
+  }
+
+  /** ударные волны башни: [x, z, радиус, сила] × WAVES */
+  setWaves(arr: Float32Array): void {
+    if (!this.matUniforms) return;
+    const u = this.matUniforms.uWave.array as THREE.Vector4[];
+    for (let i = 0; i < WAVES; i++) u[i].set(arr[i * 4], arr[i * 4 + 1], arr[i * 4 + 2], arr[i * 4 + 3]);
+  }
+
+  /** метки-кольца перед волнами: [x, z, радиус, сила] × WAVES */
+  setMarks(arr: Float32Array): void {
+    if (!this.matUniforms) return;
+    const u = this.matUniforms.uMark.array as THREE.Vector4[];
+    for (let i = 0; i < WAVES; i++) u[i].set(arr[i * 4], arr[i * 4 + 1], arr[i * 4 + 2], arr[i * 4 + 3]);
+  }
+
+  /** цвет пятна прожектора (янтарь при поиске, красный при захвате) */
+  setSpotCol(r: number, g: number, b: number): void {
+    if (!this.matUniforms) return;
+    (this.matUniforms.uSpotCol.value as THREE.Color).setRGB(r, g, b);
   }
 
   /** направление от земли к оку — по нему свет ложится по закону косинуса */
@@ -1529,7 +1572,7 @@ export class Terrain {
   private cragBuilt = new Map<number, THREE.Object3D>();
   private archBuilt = new Map<number, THREE.Object3D>();
   private snowMat = (() => {
-    const m = new THREE.MeshLambertMaterial({
+    const m = lambert({
       color: 0xffffff,
       flatShading: true,
       vertexColors: true, // снег/скала по крутизне грани
@@ -1537,425 +1580,284 @@ export class Terrain {
     // ★ РАЗЛОМЫ СВЕТЯТСЯ САМИ. Через цвет вершины это не сделать: он
     // умножается на освещение, и в тени раскалённая щель погасла бы. Поэтому
     // отдельный вершинный атрибут aGlow и ДОБАВЛЕНИЕ цвета в самом конце
-    // фрагмента — после света и после тумана. Порог блума в пост-обработке
-    // 0.72, так что яркая щель зажигается ореолом бесплатно.
-    m.onBeforeCompile = (sh) => {
-      sh.uniforms.uGlowCol = { value: GLOW_COL };
-      sh.uniforms.uHazCol = { value: HAZ_COL };
-      sh.uniforms.uTime = { value: 0 };
-      sh.uniforms.uSpot = { value: new THREE.Vector4(0, 0, 1, 0) };
-      // ★ ВОРОНКИ ЖИВУТ В ШЕЙДЕРЕ. По-настоящему промять рельеф нельзя: высота
-      // задаётся формулой, по ней же строятся меши чанков и считаются
-      // столкновения — пересобирать их на каждый взрыв немыслимо. Но след от
-      // удара — это в первую очередь ПЯТНО: выжженная чаша, тёмный обод и
-      // приподнятый вал по краю. Их и рисуем поверх породы.
-      sh.uniforms.uCrater = {
-        value: Array.from({ length: CRATERS }, () => new THREE.Vector4(0, 0, 1, 0)),
-      };
-      // рез луча: цепочка звеньев «где был — где стал»
-      // ★ СКОЛЬКО СЛЕДОВ ЖИВО. Циклы по воронкам и звеньям луча крутились
-      // всегда — на каждом пикселе рельефа и на каждой его вершине, даже когда
-      // ни одного следа нет. Для лазера это 24 проверки капсулы, и работает он
-      // хорошо если пятую часть времени. Счётчик даёт один когерентный переход
-      // по юниформу: нет следов — тела цикла нет вовсе.
-      sh.uniforms.uMarks = { value: 0 };
-      sh.uniforms.uCrN = { value: 0 };
-      sh.uniforms.uLaserA = {
-        value: Array.from({ length: MARKS }, () => new THREE.Vector4(0, 0, 0, 0)),
-      };
-      sh.uniforms.uLaserB = {
-        value: Array.from({ length: MARKS }, () => new THREE.Vector4(0, 0, 0, 0)),
-      };
-      sh.uniforms.uSpotCol = { value: new THREE.Color(1.7, 0.45, 0.08) };
-      sh.uniforms.uSpotDir = { value: new THREE.Vector3(0, 1, 0) };
-      // очаги лавы: их свет ложится на рельеф здесь же, без настоящих ламп
-      sh.uniforms.uGlow = {
-        value: Array.from({ length: GLOWS }, () => new THREE.Vector4(0, 0, 1, 0)),
-      };
-      this.matUniforms = sh.uniforms;
-      sh.vertexShader = sh.vertexShader
-        .replace(
-          '#include <common>',
-          `#include <common>
-#define CRATERS_N ${CRATERS}
-#define MARKS_N ${MARKS}
-#define LAS_DEPTH ${LAS_DEPTH.toFixed(3)}
-#define LAS_R ${CUT_R.toFixed(3)}
-attribute float aGlow;
-attribute float aHazard;
-varying float vGlow;
-varying float vHaz;
-varying vec3 vWPos;
-uniform vec4 uCrater[CRATERS_N];
-uniform vec4 uLaserA[MARKS_N];
-uniform vec4 uLaserB[MARKS_N];
-uniform float uMarks;
-uniform float uCrN;
-${LASER_GLSL}`
-        )
-        .replace(
-          '#include <beginnormal_vertex>',
-          `#include <beginnormal_vertex>
-// ★ У ЯМЫ ДОЛЖНЫ БЫТЬ СКЛОНЫ, А НЕ ТОЛЬКО ГЛУБИНА. Вершины опускались, а
-// нормали оставались от РОВНОГО склона — свет ложился так, будто ничего не
-// произошло, и воронка читалась подкрашенным пятном. Отсюда и ощущение, что
-// «геометрия старая»: доска в яме, а поверхность освещена по-старому.
-// Чаша задана формулой, поэтому уклон берём аналитически, а не пересчётом
-// нормалей: dip = A·(1−d²)² ⇒ ∇dip = −4A(1−d²)·(p−c)/r².
-{
-  vec3 cwp = (modelMatrix * vec4(position, 1.0)).xyz;
-  vec2 s = vec2(objectNormal.x, objectNormal.z) / max(0.15, objectNormal.y);
-  bool touched = false;
-  if (uCrN > 0.5) for (int ci = 0; ci < CRATERS_N; ci++) {
-    float cw = uCrater[ci].w;
-    if (cw <= 0.002) continue;
-    float cr = uCrater[ci].z;
-    vec2 rel = cwp.xz - uCrater[ci].xy;
-    float cd = length(rel) / cr;
-    if (cd >= 1.0) continue;
-    float amp = min(6.5, cr * 0.55) * cw;
-    s -= 4.0 * amp * (1.0 - cd * cd) * rel / (cr * cr);
-    touched = true;
-  }
-  // ★ У БОРОЗДЫ ТОЖЕ ЕСТЬ СТЕНКИ. Тот же довод, что и у воронки: без наклона
-  // нормалей рез читается полосой краски. Уклон аналитический:
-  // dip = D·f·(1 − d/R)² ⇒ ∇dip = −2·D·f·(1 − d/R)/R · (единичный вектор от оси).
-  if (uMarks > 0.5) for (int li = 0; li < MARKS_N; li++) {
-    float f = uLaserB[li].y;
-    if (f <= 0.002) continue;
-    vec3 ls = lasAt(uLaserA[li], cwp.xz);
-    if (ls.x <= 0.001) continue;
-    s += -2.0 * LAS_DEPTH * f * sqrt(ls.x) / LAS_R * ls.yz;
-    touched = true;
-  }
-  if (touched) objectNormal = normalize(vec3(s.x, 1.0, s.y));
-}`
-        )
-        .replace(
-          '#include <begin_vertex>',
-          `#include <begin_vertex>
-vGlow = aGlow;
-vHaz = aHazard;
-vWPos = (modelMatrix * vec4(position, 1.0)).xyz;
-// ★ ВОРОНКА ПРОДАВЛИВАЕТ САМУ ГЕОМЕТРИЮ. Одного пятна в пикселях мало: удар
-// должен оставлять форму. Пересобирать чанки нельзя (высота задаётся формулой,
-// по ней же считаются столкновения), но вершины можно сдвинуть прямо здесь —
-// это бесплатно и работает на всех чанках сразу, потому что смещение считается
-// от МИРОВОЙ точки, а значит на стыках сходится само.
-// Чаша неглубокая: рельеф под доской остаётся прежним, и расхождения не видно.
-if (uCrN > 0.5) for (int ci = 0; ci < CRATERS_N; ci++) {
-  float cw = uCrater[ci].w;
-  if (cw <= 0.002) continue;
-  float cr = uCrater[ci].z;
-  float cd = length(vWPos.xz - uCrater[ci].xy) / cr;
-  if (cd >= 1.0) continue;
-  // гладкая чаша: у кромки касательная горизонтальна, изломов нет
-  float k = 1.0 - cd * cd;
-  float dip = min(6.5, cr * 0.55) * cw * k * k;
-  transformed.y -= dip;
-  vWPos.y -= dip;
-}
-// борозда от луча: берём максимум по звеньям, иначе на их стыках вылезает
-// двойная яма — ступенька поперёк реза
-float lasDip = 0.0;
-if (uMarks > 0.5) for (int li = 0; li < MARKS_N; li++) {
-  float f = uLaserB[li].y;
-  if (f <= 0.002) continue;
-  vec3 ls = lasAt(uLaserA[li], vWPos.xz);
-  lasDip = max(lasDip, LAS_DEPTH * ls.x * f);
-}
-transformed.y -= lasDip;
-vWPos.y -= lasDip;`
+    // фрагмента — после света и после тумана (outputNode читает `output`,
+    // который уже прошёл туман). Порог блума в пост-обработке 0.72, так что
+    // яркая щель зажигается ореолом бесплатно.
+    const uGlowCol = uniform(GLOW_COL);
+    const uHazCol = uniform(HAZ_COL);
+    const uTime = uniform(0);
+    const uSpot = uniform(new THREE.Vector4(0, 0, 1, 0)); // xz — центр, z — радиус, w — яркость
+    // ★ ВОРОНКИ И РЕЗ ЖИВУТ В КАРТЕ ПОВРЕЖДЕНИЙ (fx/damage.ts). По-настоящему
+    // промять рельеф нельзя: высота задаётся формулой, по ней же строятся меши
+    // чанков и считаются столкновения. Но след — это ПЯТНО и ПРОВАЛ, и оба
+    // читаются из карты одной выборкой: в вершине — провал, в пикселе — чаша,
+    // вал, стекло борозды и расплав. Никаких циклов по спискам и никаких
+    // потолков на число следов.
+    const uSpotCol = uniform(new THREE.Color(1.7, 0.30, 0.06));
+    const uSpotDir = uniform(new THREE.Vector3(0, 1, 0)); // от земли к оку
+    // очаги лавы: их свет ложится на рельеф здесь же, без настоящих ламп
+    const uGlow = uniformArray(Array.from({ length: GLOWS }, () => new THREE.Vector4(0, 0, 1, 0)));
+    // ★ УДАРНЫЕ ВОЛНЫ БАШНИ: (x, z, радиус, сила). Кольцо-вал бежит по земле —
+    // это смещение вершин в positionNode и раскалённый гребень в outputNode.
+    const uWave = uniformArray(Array.from({ length: WAVES }, () => new THREE.Vector4(0, 0, 0, 0)));
+    // метки-кольца перед волной: (x, z, радиус, сила) — сужаются в точку удара
+    const uMark = uniformArray(Array.from({ length: WAVES }, () => new THREE.Vector4(0, 0, 0, 0)));
+    // DEV: 0 — обычный вывод, 1..6 — визуализация слагаемых трещин (cr, hot, heat, plate, rift, craze)
+    this.matUniforms = { uGlowCol, uHazCol, uTime, uSpot, uSpotCol, uSpotDir, uGlow, uWave, uMark };
+
+    const aGlow: N = attribute('aGlow', 'float');
+    const aHazard: N = attribute('aHazard', 'float');
+
+    // ★ ВОРОНКА ПРОДАВЛИВАЕТ САМУ ГЕОМЕТРИЮ. Одного пятна в пикселях мало: удар
+    // должен оставлять форму. Пересобирать чанки нельзя, но вершины можно
+    // сдвинуть прямо здесь — это бесплатно и работает на всех чанках сразу,
+    // потому что смещение считается от МИРОВОЙ точки, а значит на стыках
+    // сходится само. Чаша неглубокая: рельеф под доской остаётся прежним.
+    // Чанки стоят без поворота и масштаба, поэтому local.y == world.y.
+    // ★ Нормали здесь не трогаем: материал плоский (flatShading), и нормаль
+    // грани считается из производных уже СМЕЩЁННОЙ позиции — склоны у чаши
+    // и стенки у борозды получаются сами.
+    m.positionNode = Fn(() => {
+      const p = positionLocal.toVar();
+      const wxz: N = modelWorldMatrix.mul(vec4(positionGeometry, 1.0)).xz;
+      // ★ ВОРОНКА И БОРОЗДА ПРОДАВЛИВАЮТ САМУ ГЕОМЕТРИЮ. Смещение берётся из
+      // карты по МИРОВОЙ точке — на стыках чанков сходится само. Чанки стоят
+      // без поворота и масштаба, поэтому local.y == world.y. Нормали не трогаем:
+      // материал плоский, нормаль грани считается из производных уже смещённой
+      // позиции — склоны у чаши и стенки у борозды получаются сами.
+      p.y.subAssign(damage.damageNode(wxz).dip);
+      // вал ударной волны: гребень шириной WAVE_W, высотой WAVE_H·сила
+      // ★ ГРЕБЕНЬ НЕРОВНЫЙ: по кольцу идут горбы и провалы (шум по углу и
+      // радиусу), а за фронтом — второй, меньший вал. Ровное кольцо одной
+      // высоты читалось плоской заливкой; рваный вал с «хвостом» видно как
+      // движение самой земли.
+      Loop({ start: 0, end: WAVES, type: 'int', condition: '<' }, ({ i }: { i: N }) => {
+        const wv: N = uWave.element(i);
+        If(wv.w.greaterThan(0.001), () => {
+          const rel = wxz.sub(wv.xy);
+          const d = length(rel);
+          const ang = atan(rel.y, rel.x);
+          const lumps = tnoise(vec2(ang.mul(2.2), wv.z.mul(0.08))).mul(0.9).add(
+            tnoise(vec2(ang.mul(5.0).add(7.0), d.mul(0.2))).mul(0.5)
+          );
+          // фронт крутой (треть ширины), спад назад пологий — стена, а не холм
+          const dd = d.sub(wv.z);
+          const q = dd.abs().div(select(dd.greaterThan(0.0), WAVE_W * 0.3, WAVE_W * 0.7)).min(1.0);
+          const bump = q.mul(q).oneMinus();
+          const q2 = d.sub(wv.z.sub(WAVE_W * 1.1)).abs().div(WAVE_W * 0.4).min(1.0);
+          const tail = q2.mul(q2).oneMinus();
+          p.y.addAssign(
+            bump.mul(bump).mul(WAVE_H).mul(lumps.mul(0.7).add(0.45))
+              .add(tail.mul(tail).mul(WAVE_H * 0.35))
+              .mul(wv.w)
+          );
+        });
+      });
+      return p;
+    })();
+
+    m.outputNode = Fn(() => {
+      const col: N = output.rgb.toVar();
+      const vWPos: N = positionWorld;
+      const w: N = vWPos.xz;
+      const nrm: N = normalView;
+      const vGlow: N = aGlow;
+      const vHaz: N = aHazard;
+
+      // ★ УЗОР ПРОЕЦИРУЕТСЯ СВЕРХУ, ПОЭТОМУ НА СТЕНАХ ЕГО НЕТ. Вся сетка трещин
+      // считается от мировых XZ — то есть накладывается на склон как вид сверху.
+      // На стенке ущелья та же проекция растягивает ячейки в длинные полосы, и
+      // вместо корки выходит паутина поперёк обрыва. Гасим по крутизне: круче
+      // ~70° рисунка нет вовсе.
+      const vv: N = vGlow.mul(clamp(abs(nrm.y).sub(0.35).div(0.35), 0.0, 1.0));
+      If(vv.greaterThan(0.004), () => {
+        // зерно клинкера
+        const grit = tnoise(w.mul(1.7)).mul(0.6).add(tnoise(w.mul(5.3)).mul(0.4));
+        col.mulAssign(grit.sub(0.5).mul(0.34).mul(vv).add(1.0));
+
+        // пузырьковые оспины: поверхность вспученная, а не гладкая
+        const ves = smoothstep(0.74, 0.95, tnoise(w.mul(4.4).add(5.0)));
+        col.mulAssign(ves.mul(0.22).mul(vv).oneMinus());
+        // прокалённая земля у опасного места тлеет — видно и в тени
+        If(vHaz.greaterThan(0.004), () => {
+          const emb = tnoise(w.mul(0.6).add(13.0)).mul(0.6).add(tnoise(w.mul(2.2)).mul(0.4));
+          const pulse = sin(uTime.mul(1.1).add(emb.mul(9.0))).mul(0.2).add(0.8);
+          // прокал тлеет глуше: тёмно-красная кайма, а не оранжевая заливка
+          col.addAssign(uHazCol.mul(vHaz).mul(vHaz).mul(emb.mul(0.16).add(0.04)).mul(pulse));
+        });
+      });
+
+      // следы ударов и реза — из карты повреждений, одна выборка
+      const dmg = damage.damageNode(w);
+      // воронки от снарядов: чаша к центру темнее и глаже, вал по кромке
+      // светлее породы. ★ СЛЕД, А НЕ ДЫРА: отметина должна читаться следом
+      // удара, а не новым биомом. Свежая воронка ещё дышит жаром по трещинам дна.
+      If(dmg.cw.greaterThan(0.001).and(dmg.cd.lessThanEqual(1.25)), () => {
+        const cw = dmg.cw;
+        const cd = dmg.cd;
+        const bowl = smoothstep(0.0, 0.95, cd).oneMinus();
+        const lip = smoothstep(0.82, 0.98, cd).mul(smoothstep(0.98, 1.22, cd).oneMinus());
+        col.mulAssign(bowl.mul(0.3).mul(cw).oneMinus());
+        col.mulAssign(lip.mul(0.28).mul(cw).add(1.0));
+        const ember = tnoise(w.mul(1.4).add(3.0));
+        col.addAssign(
+          vec3(1.4, 0.36, 0.05).mul(bowl).mul(cw).mul(cw).mul(0.4)
+            .mul(smoothstep(0.7, 0.98, ember))
+            .mul(sin(uTime.mul(2.0).add(ember.mul(8.0))).mul(0.5).add(0.5))
         );
-      sh.fragmentShader = sh.fragmentShader
-        .replace(
-          '#include <common>',
-          `#include <common>
-#define CRATERS_N ${CRATERS}
-#define GLOWS_N ${GLOWS}
-#define MARKS_N ${MARKS}
-#define LAS_R ${CUT_R.toFixed(3)}
-#define LAS_MOLTEN ${MOLTEN.toFixed(3)}
-#define LAS_COOL ${COOL.toFixed(3)}
-uniform vec4 uLaserA[MARKS_N];
-uniform vec4 uLaserB[MARKS_N];
-uniform float uMarks;
-uniform float uCrN;
-uniform vec3 uGlowCol;
-uniform vec3 uHazCol;
-uniform float uTime;
-uniform vec4 uSpot;     // xz — центр, z — радиус, w — яркость
-uniform vec3 uSpotCol;
-uniform vec3 uSpotDir;   // от земли к оку
-uniform vec4 uGlow[GLOWS_N];   // xz — очаг, z — радиус, w — сила
-uniform vec4 uCrater[CRATERS_N];  // xz — центр, z — радиус, w — свежесть 0..1
-${LASER_GLSL}
-varying float vGlow;
-varying float vHaz;
-varying vec3 vWPos;
-float thash(vec2 p){return fract(sin(dot(floor(p),vec2(127.1,311.7)))*43758.5453);}
-float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
-  return mix(mix(thash(i),thash(i+vec2(1,0)),f.x),mix(thash(i+vec2(0,1)),thash(i+vec2(1,1)),f.x),f.y);}`
-        )
-        .replace(
-          '#include <dithering_fragment>',
-          `#include <dithering_fragment>
-{
-  // ★ УЗОР ПРОЕЦИРУЕТСЯ СВЕРХУ, ПОЭТОМУ НА СТЕНАХ ЕГО НЕТ. Вся сетка трещин
-  // считается от мировых XZ — то есть накладывается на склон как вид сверху.
-  // На пологом это верно, а на стенке ущелья та же проекция растягивает
-  // ячейки в длинные полосы, и вместо корки выходит паутина поперёк обрыва:
-  // видно её было в любом биоме и ни к какой геометрии она не относилась.
-  // Гасим по крутизне: круче ~70° рисунка нет вовсе.
-  float vv = vGlow * clamp((abs(normalize(normal).y) - 0.35) / 0.35, 0.0, 1.0);
-  if (vv > 0.004) {
-    vec2 w = vWPos.xz;
-    // зерно клинкера
-    float grit = tnoise(w * 1.7) * 0.6 + tnoise(w * 5.3) * 0.4;
-    gl_FragColor.rgb *= 1.0 + (grit - 0.5) * 0.34 * vv;
+      });
+      // ★ РЕЗ ЛУЧА: СНАЧАЛА РАСПЛАВ, ПОТОМ ЧЁРНОЕ СТЕКЛО. Возраст точки борозды
+      // хранится в карте, поэтому остывание видно КАК ГРАДИЕНТ вдоль полосы: у
+      // рабочего конца бело-жёлтый расплав, у дальнего — тёмный базальт. По
+      // этому градиенту игрок и читает, где полосу можно пересечь.
+      If(dmg.lw.greaterThan(0.001), () => {
+        col.assign(mix(col, vec3(0.05, 0.038, 0.042), dmg.lw.mul(0.92)));
+        // к оси борозды расплав белее — там он глубже и не успел схватиться
+        const hotL = mix(vec3(1.6, 0.3, 0.03), vec3(3.2, 1.7, 0.55), dmg.lk.mul(dmg.lk));
+        col.addAssign(hotL.mul(dmg.lm).mul(sin(uTime.mul(5.0).add(vWPos.z.mul(0.4))).mul(0.28).add(0.72)));
+      });
 
-    // ★ ТРЕЩИНЫ БЫВАЮТ РАЗНЫЕ. Одна формула давала один и тот же рисунок по
-    // всему биому — параллельные полоски. У остывшей лавы соседствуют три
-    // разных узора, и какой где — решает крупная маска региона:
-    //  • ПЛИТЫ. Расплав стынет столбчатой отдельностью: многоугольные плиты
-    //    со швами между ними (ячейки Ворonoi).
-    //  • ВЕТВЯЩИЕСЯ РАЗЛОМЫ. Длинные извилистые щели поперёк корки.
-    //  • КРАКЕЛЮР. Мелкая частая сетка на тонкой корке.
-    float reg = tnoise(w * 0.009);
-    float sizeN = tnoise(w * 0.006 + 7.0);
-
-    // ★ КОРКА ХОДИТ. Одной пульсации цвета мало: рисунок при этом стоит
-    // намертво, и видно, что это подсветка картинки, а не живая корка.
-    // Поэтому сам домен узора ведётся медленным шумом от времени: плиты
-    // подрагивают и чуть смещаются, разломы извиваются. Амплитуда нарочно
-    // мала (около метра) и частота низкая — иначе рисунок не коробится, а
-    // ползёт по склону текстурой, что ещё хуже.
-    // ★ ХОД ЗАМЕТНЫЙ. Сдвиг в метр при периоде в полминуты глаз не ловит
-    // вовсе — рисунок выглядел неподвижным. Амплитуда поднята в разы, но
-    // частота коробления оставлена НИЗКОЙ: тогда сеть именно ходит и
-    // перестраивается на месте, а не едет по склону текстурой.
-    vec2 warpA = vec2(
-      tnoise(w * 0.021 + vec2(uTime * 0.16, 3.0)),
-      tnoise(w * 0.019 + vec2(11.0, uTime * 0.13))
-    ) - 0.5;
-    vec2 wp = w + warpA * 9.0;                 // домен плит: ход до ~4.5 м
-    // разломы тоньше, им дозволено извиваться заметнее и быстрее
-    vec2 warpB = vec2(
-      tnoise(w * 0.055 + vec2(uTime * 0.34, 0.0)),
-      tnoise(w * 0.048 + vec2(5.0, -uTime * 0.29))
-    ) - 0.5;
-    vec2 wr = w + warpB * 11.0;
-    // шов дышит: щель то приоткрывается, то смыкается
-    float seamW = 0.115 * (0.55 + 0.8 * sin(uTime * 1.15 + reg * 9.0) * 0.5 + 0.4);
-
-    // плиты: размер ячейки сам по себе меняется по склону
-    // ★ РИСУНОК МЕЛЬЧЕ. При ячейке в 6–18 м плиты читались крупным узором,
-    // и глаз ловил в нём повторяющийся мотив. У корки отдельность мельче:
-    // 2.5–7 м, то есть на уровне фактуры, а не орнамента.
-    float cs = mix(0.4, 0.145, sizeN);
-    vec2 pc = wp * cs;
-    vec2 ip = floor(pc), fp = fract(pc);
-    float d1 = 8.0, d2 = 8.0;
-    for (int j = -1; j <= 1; j++) {
-      for (int i = -1; i <= 1; i++) {
-        vec2 g = vec2(float(i), float(j));
-        vec2 o = vec2(thash(ip + g + 0.5), thash(ip + g + 17.3));
-        float dd = length(g + o - fp);
-        if (dd < d1) { d2 = d1; d1 = dd; } else if (dd < d2) { d2 = dd; }
+      // ★ СВЕТ ОТ ЛАВЫ. Каждый очаг светит по закону обратного квадрата
+      // (смягчённо) и по закону косинуса — грань, отвёрнутая от расплава,
+      // остаётся тёмной. ★ ПОТОЛОК ОБЯЗАТЕЛЕН: десять очагов складываются, и без
+      // предела сцена превращается в оранжевый лист. Подсветка — акцент у
+      // самого расплава, а не освещение.
+      {
+        const lit = vec3(0.0).toVar();
+        Loop({ start: 0, end: GLOWS, type: 'int', condition: '<' }, ({ i }: { i: N }) => {
+          const g: N = uGlow.element(i);
+          const gs = g.w;
+          If(gs.greaterThan(0.002), () => {
+            const d = vec3(g.x.sub(vWPos.x), 6.0, g.y.sub(vWPos.z));
+            const dist = length(d);
+            const att = gs.div(dist.mul(dist).div(g.z.mul(g.z)).add(1.0));
+            // ★ КАК В GLSL-ВЕРСИИ: нормаль здесь в пространстве вида, а смещение к
+            // очагу — мировое. Смешение пространств досталось от WebGL-шейдера, и
+            // картинка настроена под него; «честный» перевод в вид делал подсветку
+            // заметно сильнее и уводил от эталона.
+            lit.addAssign(vec3(1.0, 0.20, 0.045).mul(att).mul(max(0.0, dot(nrm, d.div(dist))).mul(0.75).add(0.25)));
+          });
+        });
+        // ★ ПОТОЛОК НИЖЕ ВТРОЕ. С озёрами через каждые сто метров прежний
+        // потолок (0.05 линейного = 0.26 после гаммы) лежал ровным бурым слоем
+        // на всём склоне — вот откуда была «пустыня» при чёрном альбедо.
+        col.addAssign(min(lit.mul(0.09), vec3(0.018, 0.0035, 0.0012)));
       }
-    }
-    float plate = 1.0 - smoothstep(0.0, seamW, d2 - d1);
 
-    // ветвящиеся разломы
-    float r1 = 1.0 - abs(tnoise(wr * 0.16) * 2.0 - 1.0);
-    float r2 = 1.0 - abs(tnoise(wr * 0.47 + 11.0) * 2.0 - 1.0);
-    float rift = smoothstep(0.94, 1.0, r1) * smoothstep(0.66, 1.0, r2);
+      // гребень ударной волны раскалён: тонкая светящаяся линия по фронту
+      Loop({ start: 0, end: WAVES, type: 'int', condition: '<' }, ({ i }: { i: N }) => {
+        const wv: N = uWave.element(i);
+        If(wv.w.greaterThan(0.001), () => {
+          const d = length(w.sub(wv.xy));
+          const q = d.sub(wv.z).abs().div(WAVE_W * 0.5).min(1.0);
+          const crest = q.mul(q).oneMinus();
+          // и пыль/пепел, сдутый с гребня, — светлее породы
+          col.addAssign(vec3(1.6, 0.45, 0.10).mul(crest.mul(crest).mul(crest)).mul(wv.w).mul(0.9));
+          col.mulAssign(crest.mul(0.35).mul(wv.w).add(1.0));
+        });
+      });
 
-    // мелкий кракелюр
-    float f1 = 1.0 - abs(tnoise(wp * 1.9 + 3.0) * 2.0 - 1.0);
-    float craze = smoothstep(0.84, 1.0, f1) * 0.6;
+      // метка удара: тонкое красное кольцо, сужающееся в точку; в центре —
+      // тлеющая точка, чтобы место читалось и когда кольцо уже мало
+      Loop({ start: 0, end: WAVES, type: 'int', condition: '<' }, ({ i }: { i: N }) => {
+        const mk: N = uMark.element(i);
+        If(mk.w.greaterThan(0.001), () => {
+          const d = length(w.sub(mk.xy));
+          // кольцо широкое (4 м) и яркое — его надо видеть за сотню метров на
+          // тёмной земле; внутри — слабая заливка, чтобы читалась «область»
+          const ring = smoothstep(4.0, 0.5, d.sub(mk.z).abs());
+          const inner = smoothstep(mk.z, mk.z.mul(0.2), d).mul(0.12);
+          const dotc = smoothstep(4.0, 0.0, d).mul(0.9);
+          const pulse = sin(uTime.mul(12.0)).mul(0.25).add(0.75);
+          col.addAssign(vec3(2.4, 0.22, 0.05).mul(ring.add(inner).add(dotc)).mul(mk.w).mul(pulse));
+        });
+      });
 
-    float wPlate = smoothstep(0.62, 0.34, reg);
-    float wCraze = smoothstep(0.58, 0.82, reg);
-    float cr = max(max(plate * wPlate, rift), craze * wCraze);
-    // и участки гладкого пепла, где не трескается вовсе
-    // Доля площади под узором замерена портом этих же формул в JS:
-    // плиты 3.5%, разломы 0.7%, кракелюр 2.4% — суммарно 8% поверхности под
-    // трещинами и 2% со светящимся швом. Это деталь, а не покрытие.
-    cr *= smoothstep(0.12, 0.30, tnoise(w * 0.015 + 21.0));
+      // луч Ока: мягкое пятно поверх всего, включая тень и туман
+      If(uSpot.w.greaterThan(0.001), () => {
+        const sd = length(w.sub(uSpot.xy)).div(uSpot.z);
+        // ★ ПЯТНО РОВНОЕ, А ГАСНЕТ ТОЛЬКО КРАЙ; ★ КРОМКА КОРОТКАЯ: граница есть,
+        // а линии нет.
+        const f = smoothstep(0.62, 1.0, sd).oneMinus().toVar();
+        // свет живой: медленное дыхание не даёт пятну слиться с фоном
+        f.mulAssign(sin(uTime.mul(2.1)).mul(0.1).add(0.9));
+        // ★ СВЕТ ПАДАЕТ ПОД УГЛОМ: закон косинуса, но не до полной тени.
+        // (то же смешение пространств, что и у очагов — оставлено ради эталона)
+        f.mulAssign(max(0.0, dot(nrm, uSpotDir)).mul(0.75).add(0.25));
+        // ★ СВЕТ ПОДСВЕЧИВАЕТ, А НЕ ПЕРЕКРАШИВАЕТ: умножение сохраняет породу и
+        // меняет только яркость. ★ И ПРОЖЕКТОР НЕ ВЫЖИГАЕТ: полутора хватает.
+        // ★ НА СНЕГУ ПРОЖЕКТОР НЕ ВЫЖИГАЕТ. Умножение ×2.5 подобрано под тёмный
+        // пепел; на снегу с альбедо ~0.9 оно уводило всю трассу в белый лист.
+        // Усиливаем тем меньше, чем светлее сама земля — тёмное подсвечивается,
+        // светлое лишь чуть теплеет.
+        const lum = dot(col, vec3(0.3, 0.6, 0.1));
+        const boost = smoothstep(0.55, 0.18, lum);
+        col.mulAssign(uSpot.w.mul(f).mul(1.5).mul(boost).add(1.0));
+        // ★ ЯДРО СВЕТА БЕЛЕЕ КАЙМЫ — так это читается светом, а не краской
+        const sc = mix(uSpotCol, vec3(1.1, 0.62, 0.32), f.mul(f));
+        col.addAssign(sc.mul(uSpot.w).mul(f).mul(0.09));
+      });
 
-    // ★ ЖАР — НЕ ВЕЗДЕ. Светиться должны немногие швы: остальные давно остыли
-    // и просто тёмные. Иначе весь склон в оранжевой паутине.
-    // ★ ГОРЯЧИХ ШВОВ МАЛО. Замер покрытия: под трещинами 11% площади — само
-    // по себе немного, но пепел почти чёрный, и любая добавка света читается
-    // ярко. При маске 0.45…0.84 тлела почти половина сети, и склон выглядел
-    // затянутым светящейся паутиной. Жар остаётся в редких местах.
-    float hot = smoothstep(0.62, 0.92, tnoise(w * 0.02 + 31.0));
-    // ★ ТРЕЩИНА ЖИВАЯ. Ровное свечение читается нарисованным; в настоящей
-    // щели жар ходит: по ней проходят волны, ядро светлее краёв, и изредка
-    // вспыхивает уголёк.
-    //  • волна — медленный шум, ползущий вниз по склону;
-    //  • дыхание — своя фаза у каждого участка сети;
-    //  • ядро — самая середина щели белее, кромка тёмно-багровая;
-    //  • угольки — редкие точки, вспыхивающие и гаснущие.
-    // Волна идёт по сети заметно: жар то накатывает, то отступает почти в
-    // ноль. Слабая модуляция (0.45…1.55) в кадре не читалась вовсе — вся
-    // разница пропадала за блумом.
-    float wave = tnoise(w * 0.05 + vec2(0.0, -uTime * 0.55)) * 0.65
-               + tnoise(w * 0.17 + vec2(0.0, -uTime * 1.15)) * 0.35;
-    wave = smoothstep(0.25, 0.85, wave);
-    float breath = 0.45 + 0.55 * sin(uTime * 2.3 + tnoise(w * 0.03) * 12.0);
-    // ★ ДВИЖЕНИЕ ЕСТЬ, ЯРКОСТИ НЕТ. Подняв размах волны, я заодно поднял и
-    // средний уровень — склон превратился в сплошную светящуюся паутину.
-    // Волна должна ГАСИТЬ и РАЗЖИГАТЬ уже имеющееся свечение, а не добавлять
-    // своё: множитель гуляет около единицы, а не растёт.
-    // Светится не всякая трещина, а самое ядро горячих: куб по глубине шва и
-    // квадрат по маске жара оставляют лишь стержни сети. Постоянного уровня
-    // нет вовсе — без волны и дыхания свечение гаснет почти в ноль.
-    float heat = cr * cr * cr * hot * hot * (0.02 + breath * 0.3 + wave * 0.9);
-    float core = smoothstep(0.55, 0.95, cr);
-    vec3 hotCol = mix(uGlowCol, vec3(3.2, 1.9, 0.9), core * 0.55);
-    // ★ УГОЛЬКОВ НА ЗЕМЛЕ НЕТ. Вспыхивающие точки по всей поверхности читались
-    // жёлтой рябью, а не жаром: они сидели на каждой трещине разом и мельтешили
-    // по всему кадру. Жар остался в самих швах — он и так дышит.
-    gl_FragColor.rgb *= 1.0 - cr * 0.6 * vv;
-    gl_FragColor.rgb += hotCol * heat * 1.6 * vv;
+      // ★★ КОНТУР В ТЕМНОТЕ. Форму держит КРОМКА: грань, повёрнутая от взгляда,
+      // ловит скользящий свет и очерчивает силуэт. ★ КРОМКА, А НЕ ЗАЛИВКА:
+      // четвёртая степень оставляет свечение только у самого силуэта.
+      {
+        const vd = normalize(positionView.negate());
+        const rim = pow(clamp(dot(nrm, vd), 0.0, 1.0).oneMinus(), 4.0);
+        col.addAssign(vec3(0.85, 0.30, 0.10).mul(rim).mul(0.04));
 
-    // пузырьковые оспины: поверхность вспученная, а не гладкая
-    float ves = smoothstep(0.74, 0.95, tnoise(w * 4.4 + 5.0));
-    gl_FragColor.rgb *= 1.0 - ves * 0.22 * vv;
-    // прокалённая земля у опасного места тлеет — видно и в тени
-    if (vHaz > 0.004) {
-      float emb = tnoise(w * 0.6 + 13.0) * 0.6 + tnoise(w * 2.2) * 0.4;
-      float pulse = 0.8 + 0.2 * sin(uTime * 1.1 + emb * 9.0);
-      gl_FragColor.rgb += uHazCol * vHaz * (0.10 + emb * 0.3) * pulse;
-    }
-  }
-  // воронки от снарядов
-  if (uCrN > 0.5) for (int ci = 0; ci < CRATERS_N; ci++) {
-    float cw = uCrater[ci].w;
-    if (cw <= 0.002) continue;
-    float cr = uCrater[ci].z;
-    float cd = length(vWPos.xz - uCrater[ci].xy) / cr;
-    if (cd > 1.25) continue;
-    // чаша: к центру темнее и глаже; вал по кромке светлее породы
-    float bowl = 1.0 - smoothstep(0.0, 0.95, cd);
-    float lip = smoothstep(0.82, 0.98, cd) * (1.0 - smoothstep(0.98, 1.22, cd));
-    // ★ СЛЕД, А НЕ ДЫРА. Первый вариант затемнял чашу вдвое и жёг её угольями:
-    // на замере десяток воронок менял 38% кадра, и склон превращался в
-    // решето. Отметина должна читаться следом удара, а не новым биомом.
-    gl_FragColor.rgb *= 1.0 - bowl * 0.3 * cw;
-    gl_FragColor.rgb *= 1.0 + lip * 0.28 * cw;
-    // свежая воронка ещё дышит жаром по трещинам дна
-    float ember = tnoise(vWPos.xz * 1.4 + 3.0);
-    gl_FragColor.rgb += vec3(1.4, 0.36, 0.05) * bowl * cw * cw * 0.4
-      * smoothstep(0.7, 0.98, ember) * (0.5 + 0.5 * sin(uTime * 2.0 + ember * 8.0));
-  }
-  // ★ РЕЗ ЛУЧА: СНАЧАЛА РАСПЛАВ, ПОТОМ ЧЁРНОЕ СТЕКЛО. Возраст точки борозды
-  // однозначно задан её глубиной по склону — луч прошёл здесь ровно в момент
-  // (z − z0)/vz. Поэтому остывание видно КАК ГРАДИЕНТ вдоль полосы: у рабочего
-  // конца бело-жёлтый расплав, у дальнего — тёмный базальт. Игрок по этому
-  // градиенту и читает, где полосу можно пересечь.
-  float lw = 0.0, lm = 0.0, lk = 0.0;
-  if (uMarks > 0.5) for (int li = 0; li < MARKS_N; li++) {
-    float f = uLaserB[li].y;
-    if (f <= 0.002) continue;
-    vec3 ls = lasAt(uLaserA[li], vWPos.xz);
-    if (ls.x <= 0.001) continue;
-    float age = uLaserB[li].x;
-    float m = age <= LAS_MOLTEN ? 1.0 : max(0.0, 1.0 - (age - LAS_MOLTEN) / LAS_COOL);
-    float w = ls.x * f;
-    if (w > lw) { lw = w; lk = ls.x; }
-    lm = max(lm, m * w);
-  }
-  if (lw > 0.001) {
-    gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.05, 0.038, 0.042), lw * 0.92);
-    // к оси борозды расплав белее — там он глубже и не успел схватиться
-    vec3 hot = mix(vec3(1.6, 0.3, 0.03), vec3(3.2, 1.7, 0.55), lk * lk);
-    gl_FragColor.rgb += hot * lm      * (0.72 + 0.28 * sin(uTime * 5.0 + vWPos.z * 0.4));
-  }
-
-  // ★ СВЕТ ОТ ЛАВЫ. Каждый очаг светит по закону обратного квадрата (смягчённо,
-  // чтобы вблизи не выжигало) и по закону косинуса — грань, отвёрнутая от
-  // расплава, остаётся тёмной. Это и делает склон читаемым: у лавы светло,
-  // вдали от неё по-прежнему темень.
-  {
-    vec3 nrm = normalize(normal);
-    vec3 lit = vec3(0.0);
-    for (int gi = 0; gi < GLOWS_N; gi++) {
-      float gs = uGlow[gi].w;
-      if (gs <= 0.002) continue;
-      vec3 d = vec3(uGlow[gi].x - vWPos.x, 6.0, uGlow[gi].y - vWPos.z);
-      float dist = length(d);
-      float att = gs / (1.0 + (dist * dist) / (uGlow[gi].z * uGlow[gi].z));
-      lit += vec3(1.0, 0.34, 0.08) * att * (0.25 + 0.75 * max(0.0, dot(nrm, d / dist)));
-    }
-    // ★ ПОТОЛОК ОБЯЗАТЕЛЕН. Десять очагов складываются, и без предела сцена
-    // превращается в оранжевый лист — проверено. Подсветка должна помогать
-    // читать склон, а не заменять собой освещение.
-    gl_FragColor.rgb += min(lit * 0.22, vec3(0.34, 0.13, 0.05));
-  }
-
-  // луч Ока: мягкое пятно поверх всего, включая тень и туман
-  if (uSpot.w > 0.001) {
-    float sd = length(vWPos.xz - uSpot.xy) / uSpot.z;
-    // ★ ПЯТНО РОВНОЕ, А ГАСНЕТ ТОЛЬКО КРАЙ. Спад от самого центра давал яркую
-    // точку и почти ничего вокруг — свет получался неразличимым. У прожектора
-    // освещённое место равномерное, размывается лишь кромка.
-    // ★ КРОМКА КОРОЧЕ. Плавный спад через полрадиуса не давал понять, где место
-    // засветки кончается; обводить кольцом нельзя — читается нарисованным. Ядро
-    // шире, переход быстрее: граница есть, а линии нет.
-    float f = 1.0 - smoothstep(0.62, 1.0, sd);
-    // свет живой: медленное дыхание не даёт пятну слиться с фоном
-    f *= 0.9 + 0.1 * sin(uTime * 2.1);
-    // ★ СВЕТ ПАДАЕТ ПОД УГЛОМ, А НЕ ПРОСТО КРАСИТ ЗЕМЛЮ. Ровная заливка не
-    // учитывала наклон граней: склон, отвёрнутый от башни, светился так же
-    // ярко, как обращённый к ней, — оттого пятно и читалось наклейкой. Закон
-    // косинуса, но не до полной тени: иначе теневые бока бугров чернеют дырами.
-    f *= 0.25 + 0.75 * max(0.0, dot(normalize(normal), uSpotDir));
-    // ★ У ПЯТНА ДОЛЖЕН БЫТЬ КРАЙ. Изнутри круг в семьдесят метров занимает
-    // весь кадр, и одна заливка читается не прожектором, а перекраской склона.
-    // Светлый обод даёт границу: её видно, даже когда стоишь в центре, и по
-    // ней понятно, куда луч уходит.
-    // ★ СВЕТ ПОДСВЕЧИВАЕТ, А НЕ ПЕРЕКРАШИВАЕТ. Прибавка постоянного оранжевого
-    // забивала собственный цвет земли: под пятном пепел, обсидиан и клинкер
-    // становились одинаково рыжими. Умножение сохраняет породу и меняет только
-    // яркость — как и ведёт себя настоящий свет.
-    // ★ ОБВОДКИ НЕТ. Светлый обод по краю читался нарисованным кольцом, а не
-    // светом; у пятна прожектора край просто размытый.
-    gl_FragColor.rgb *= 1.0 + uSpot.w * f * 3.0;
-    // ★ ЯДРО СВЕТА БЕЛЕЕ КАЙМЫ. Один и тот же оранжевый по всей площади давал
-    // грязный ржавый налёт; у сильного источника середина выбелена, а тёплый
-    // оттенок остаётся по краю — так это и читается светом, а не краской.
-    vec3 sc = mix(uSpotCol, vec3(1.25, 1.05, 0.8), f * f);
-    gl_FragColor.rgb += sc * uSpot.w * f * 0.16;
-  }
-}`
-        );
-    };
+        // ★★ СТЕНА — НЕ ДЫРА. Чернота липнет к ущельям с РЕЗКИМИ бортами:
+        // вертикальная грань отвёрнута от солнца, а от полусферы берёт ровно
+        // половину. В ущелье так не бывает — борт всегда ловит отсвет
+        // противоположной стены. Его и добавляем цветом самой породы.
+        // ★ НЕ ПЕРЕСВЕЧИВАТЬ: 0.62 на светлой породе (обрывы у границы биомов,
+        // базальт 0.30) давал ровные кремовые стены — читались засветкой, а не
+        // камнем. Заполнение оставляем, но вдвое слабее.
+        const wall = smoothstep(0.55, 0.05, abs(nrm.y));
+        col.addAssign(diffuseColor.rgb.mul(wall).mul(0.3));
+      }
+      return vec4(col, output.a);
+    })();
     return m;
   })();
   // цвет дерева живёт в вершинах геометрии; материал биома лишь притеняет
-  private pineMat = new THREE.MeshLambertMaterial({
+  private pineMat = lambert({
     color: PALETTE.pine,
     flatShading: true,
     vertexColors: true,
   });
-  private rockMat = new THREE.MeshLambertMaterial({ color: 0x8a92a8, flatShading: true });
-  private flagMat = new THREE.MeshLambertMaterial({ color: 0xff7a3c, flatShading: true });
-  private railMat = new THREE.MeshLambertMaterial({ color: 0x2b303f, flatShading: true });
+  private rockMat = lambert({ color: 0x8a92a8, flatShading: true });
+  private flagMat = lambert({ color: 0xff7a3c, flatShading: true });
+  private railMat = lambert({ color: 0x2b303f, flatShading: true });
   private pineGeos = TREE_SPECIES.map((_, v) => buildPine(v));
   private rockGeos = [0, 1, 2, 3].map((v) => buildRockGeometry(v));
   private cragGeos = [0, 1, 2, 3].map((v) => buildCragGeometry(v));
   // Скала темнее валунов: она выше уровня снега и не запорошена, а на её
   // полках лежит снег отдельными шапками (см. cragSnowMat).
   // цвет живёт в ВЕРШИНАХ (см. buildCragGeometry), материал только светит
-  private cragMat = new THREE.MeshLambertMaterial({
-    color: 0xffffff, flatShading: true, vertexColors: true,
-  });
+  // ★★ СКАЛЫ — ЭТО И БЫЛИ «ЧЁРНЫЕ СТЕНЫ». У них своя материя, и её не касалось
+  // НИЧТО из того, чем мы лечили рельеф: ни тон биома (материал белый, цвет
+  // живёт в вершинах и он нейтрально-серый), ни заполнение крутых граней,
+  // добавленное в шейдер земли. А скала — это как раз сплошная вертикаль:
+  // солнца на ней нет, полусфера даёт половину, и в кадре она стоит чёрной
+  // глыбой рядом с яркой лавой. Даём ей то же заполнение, что и рельефу.
+  private cragMat = (() => {
+    const m = lambert({
+      color: 0xffffff, flatShading: true, vertexColors: true,
+    });
+    // ★ ЗАПОЛНЕНИЕ УМНОЖЕНИЕМ, А НЕ ДОБАВКОЙ. Добавка в 0.62 выбелила скалу
+    // целиком: у неё почти вся поверхность вертикальна, и слагаемое легло
+    // ровным слоем поверх всего. Множитель осветляет ПРОПОРЦИОНАЛЬНО — тёмная
+    // порода остаётся породой.
+    m.outputNode = Fn(() => {
+      const wall = smoothstep(0.55, 0.05, abs(normalView.y));
+      return vec4(output.rgb.mul(wall.mul(0.85).add(1.0)), output.a);
+    })();
+    return m;
+  })();
   private cragSnowGeos = this.cragGeos.map((g) => buildCragSnowGeometry(g));
   private archGeos = [0, 1, 2].map((v) => buildArchGeometry(v));
-  private cragSnowMat = new THREE.MeshLambertMaterial({
+  private cragSnowMat = lambert({
     color: 0xdfe6f5, flatShading: true,
   });
   private flagGeo = buildFlagGeometry();
@@ -1964,38 +1866,38 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
   // после ужесточения света старые тона (0x3d3745/0x4b4034/0x35424d) ушли
   // в чёрные коробки — подняты в яркости, сохранив холодный характер
   private houseMats = [0x6b6274, 0x7c6a56, 0x5c6f7d].map(
-    (c) => new THREE.MeshLambertMaterial({ color: c, flatShading: true })
+    (c) => lambert({ color: c, flatShading: true })
   );
   private roofMats = [0x413b56, 0x5a4038, 0x36505c].map(
     (c) =>
-      new THREE.MeshLambertMaterial({ color: c, flatShading: true, side: THREE.DoubleSide })
+      lambert({ color: c, flatShading: true, side: THREE.DoubleSide })
   );
-  private windowMat = new THREE.MeshBasicMaterial({ color: 0xffc873 }); // светятся сами
-  private lampGlowMat = new THREE.MeshBasicMaterial({ color: 0xffd9a0 });
+  private windowMat = basic({ color: 0xffc873 }); // светятся сами
+  private lampGlowMat = basic({ color: 0xffd9a0 });
   private houseGeo = new THREE.BoxGeometry(4.6, 2.4, 3.6);
   private roofGeo = buildRoofGeometry();
   private windowGeo = new THREE.PlaneGeometry(0.7, 0.9);
   // Детали дома. Снег на крыше и труба стоят копейки, а деревня без них
   // выглядит набором коробок, случайно оказавшихся в снегу.
   private snowCapGeo = buildRoofGeometry();
-  private roofSnowMat = new THREE.MeshLambertMaterial({
+  private roofSnowMat = lambert({
     color: 0xe9eefb, flatShading: true, side: THREE.DoubleSide,
   });
   private chimneyGeo = new THREE.BoxGeometry(0.42, 1.0, 0.42);
   private balconyGeo = new THREE.BoxGeometry(4.9, 0.12, 1.15);
   private railGeo = new THREE.BoxGeometry(4.9, 0.5, 0.1);
   private doorGeo = new THREE.PlaneGeometry(0.75, 1.35);
-  private doorMat = new THREE.MeshLambertMaterial({ color: 0x4a3a2c, flatShading: true });
-  private woodMat = new THREE.MeshLambertMaterial({ color: 0x6b543c, flatShading: true });
+  private doorMat = lambert({ color: 0x4a3a2c, flatShading: true });
+  private woodMat = lambert({ color: 0x6b543c, flatShading: true });
   private poleGeo = new THREE.CylinderGeometry(0.09, 0.09, 2.4, 4);
   private poleTopGeo = new THREE.BoxGeometry(0.42, 0.42, 0.42);
-  private poleLeftMat = new THREE.MeshBasicMaterial({ color: 0x2f6fd0 });
-  private poleRightMat = new THREE.MeshBasicMaterial({ color: 0xd83c3c });
+  private poleLeftMat = basic({ color: 0x2f6fd0 });
+  private poleRightMat = basic({ color: 0xd83c3c });
   // общественные постройки: вывеска, козырёк лавки, звонница часовни
   private signGeo = new THREE.BoxGeometry(2.2, 0.5, 0.12);
-  private signMat = new THREE.MeshBasicMaterial({ color: 0xffd08a });
+  private signMat = basic({ color: 0xffd08a });
   private awningGeo = new THREE.BoxGeometry(4.4, 0.1, 1.5);
-  private awningMat = new THREE.MeshLambertMaterial({ color: 0x8c4a3f, flatShading: true });
+  private awningMat = lambert({ color: 0x8c4a3f, flatShading: true });
   private shopWinGeo = new THREE.PlaneGeometry(2.4, 1.1);
   private belfryGeo = new THREE.BoxGeometry(0.9, 1.1, 0.9);
   private spireGeo = new THREE.ConeGeometry(0.75, 1.6, 4);
@@ -2026,10 +1928,10 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
   private cragFieldAdded = (this.group.add(this.cragField), true);
 
   /** для менеджера биомов: тонировка снега и деревьев */
-  get snowMaterial(): THREE.MeshLambertMaterial {
+  get snowMaterial(): THREE.MeshLambertNodeMaterial {
     return this.snowMat;
   }
-  get pineMaterial(): THREE.MeshLambertMaterial {
+  get pineMaterial(): THREE.MeshLambertNodeMaterial {
     return this.pineMat;
   }
 
@@ -2090,14 +1992,71 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
     i: number;
     geo: THREE.BufferGeometry | null;
     flat: THREE.BufferGeometry | null;
-    colors: Float32Array | null;
-    glows: Float32Array | null;
-    hots: Float32Array | null;
-    group: THREE.Group | null;
+    ctrlA: Float32Array | null;
+    ctrlB: Float32Array | null;
+    lattice: Uint32Array | null;
   } | null = null;
 
+  /** размер развёрнутой сетки чанка и решётки — под них собрано compute-ядро раскраски */
+  static readonly VERTS_PER_CHUNK = SEG * SEG * 6;
+  static readonly LATTICE_PER_CHUNK = (SEG + 1) * (SEG + 1);
+  /** ★ раскраска чанка идёт на GPU (см. chunkshade.ts); ставится игрой до первого update */
+  private shader: ChunkShader | null = null;
+  setShader(sh: ChunkShader): void {
+    this.shader = sh;
+  }
+
+  /**
+   * Управляющие величины узла решётки для GPU-раскраски: те части цвета,
+   * которые считаются по сплайнам и спискам мира (трасса, тип поверхности,
+   * дорога деревни, вес биома). Дёшево — доли микросекунды на узел.
+   */
+  private latticeCtrl(u: number, v: number, village: Village | null, ctrlA: Float32Array, ctrlB: Float32Array, i: number): void {
+    ctrlA[i * 4] = u;
+    ctrlA[i * 4 + 1] = v;
+    ctrlA[i * 4 + 2] = pisteAt(u, v).t;
+    ctrlA[i * 4 + 3] = surfaceKindAt(u, v);
+    let roadW = 0;
+    if (village) {
+      const rc = roadClosest(village, u, v);
+      if (rc.d2 < 7 * 7) roadW = 1 - Math.max(0, Math.min(1, (Math.sqrt(rc.d2) - 3.2) / 3.5));
+    }
+    ctrlB[i * 4] = roadW;
+    ctrlB[i * 4 + 1] = volcanoWeight(v);
+    ctrlB[i * 4 + 2] = 0;
+    ctrlB[i * 4 + 3] = 0;
+  }
+
+  /** развернуть сетку и раскрасить её на GPU; возвращает готовую геометрию */
+  private shadeChunk(geo: THREE.BufferGeometry, ctrlA: Float32Array, ctrlB: Float32Array, ox: number, oz: number): THREE.BufferGeometry {
+    const index = geo.index!.array;
+    const flat = flatten(geo);
+    geo.dispose();
+    const posArr = flat.attributes.position.array as Float32Array;
+    const n = posArr.length / 3;
+    const lattice = new Uint32Array(n);
+    for (let i = 0; i < n; i++) lattice[i] = index[i];
+    // нормалей у чанка нет: материал плоский, нормаль грани считается из
+    // производных в шейдере, а для раскраски её берёт само compute-ядро
+    flat.deleteAttribute('normal');
+    const half = CHUNK / 2;
+    const lists = hazardListsFor(ox - half, ox + half, oz - half, oz + half, terrainHeight, toWorldX);
+    const out = this.shader!.shade({ positions: posArr, lattice, ctrlA, ctrlB, lists });
+    flat.setAttribute('position', out.position);
+    flat.setAttribute('color', out.color);
+    flat.setAttribute('aGlow', out.glow);
+    flat.setAttribute('aHazard', out.hot);
+    return flat;
+  }
+
   /** Бюджет на кадр: столько миллисекунд разрешено тратить на постройку */
-  private static readonly BUILD_MS = 3;
+  /**
+   * ★ БЮДЖЕТ СБОРКИ НА КАДР. Чанк стоит около 12 мс работы, поэтому при 3 мс он
+   * доезжает за четыре кадра, и на скорости мир виден догоняющим. Кадр в самом
+   * тяжёлом биоме идёт ~6 мс из 16.7, так что запас есть — берём 6 мс: чанк
+   * успевает за два кадра, а до потолка всё равно остаётся вдвое.
+   */
+  private static readonly BUILD_MS = 6;
 
   /** Один кадр работы над очередью чанков */
   private stepBuild(needed: Set<string>): void {
@@ -2123,10 +2082,9 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
           i: 0,
           geo: null,
           flat: null,
-          colors: null,
-          glows: null,
-          hots: null,
-          group: null,
+          ctrlA: null,
+          ctrlB: null,
+          lattice: null,
         };
       }
       if (this.stepJob()) this.job = null;
@@ -2149,18 +2107,22 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
       const geo = new THREE.PlaneGeometry(CHUNK, CHUNK, SEG, SEG);
       geo.rotateX(-Math.PI / 2);
       j.geo = geo;
+      j.ctrlA = new Float32Array(geo.attributes.position.count * 4);
+      j.ctrlB = new Float32Array(geo.attributes.position.count * 4);
       j.stage = 1;
       j.i = 0;
       return false;
     }
     if (j.stage === 1) {
       const pos = j.geo!.attributes.position;
+      const village = villageAt(ox, oz);
       const end = Math.min(pos.count, j.i + SLICE);
       for (let i = j.i; i < end; i++) {
         const u = ox + pos.getX(i);
         const v = oz + pos.getZ(i);
         pos.setY(i, terrainAtValley(u, v));
         pos.setX(i, toWorldX(u, v) - wx0);
+        this.latticeCtrl(u, v, village, j.ctrlA!, j.ctrlB!, i);
       }
       j.i = end;
       if (end >= pos.count) {
@@ -2169,66 +2131,12 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
       }
       return false;
     }
-    if (j.stage === 2) {
-      const flat = flatten(j.geo!);
-      j.geo!.dispose();
-      j.geo = null;
-      flat.computeVertexNormals();
-      j.flat = flat;
-      j.colors = new Float32Array(flat.attributes.normal.count * 3);
-      j.glows = new Float32Array(flat.attributes.normal.count);
-      j.hots = new Float32Array(flat.attributes.normal.count);
-      j.stage = 3;
-      j.i = 0;
-      return false;
-    }
-    if (j.stage === 3) {
-      const flat = j.flat!;
-      const normals = flat.attributes.normal;
-      const vpos = flat.attributes.position;
-      const colors = j.colors!;
-      const glows = j.glows!;
-      const hots = j.hots!;
-      const chunkVillage = villageAt(ox, oz);
-      const col = { r: 0, g: 0, b: 0, glow: 0, hot: 0 };
-      const end = Math.min(normals.count, j.i + SLICE);
-      for (let i = j.i; i < end; i++) {
-        const wz = oz + vpos.getZ(i);
-        const wx = toValleyU(wx0 + vpos.getX(i), wz);
-        terrainColorAt(col, wx, wz, normals.getY(i), vpos.getY(i));
-        let cr = col.r, cg = col.g, cb = col.b;
-        if (chunkVillage) {
-          const rc = roadClosest(chunkVillage, wx, wz);
-          if (rc.d2 < 7 * 7) {
-            const w = 1 - Math.max(0, Math.min(1, (Math.sqrt(rc.d2) - 3.2) / 3.5));
-            cr += (ROAD_TINT.r - cr) * w;
-            cg += (ROAD_TINT.g - cg) * w;
-            cb += (ROAD_TINT.b - cb) * w;
-          }
-        }
-        const crust = lavaCrustAt(wx, wz, terrainHeight, toWorldX);
-        if (crust > 0.01) {
-          const k = crust * 0.85;
-          cr += (0.055 - cr) * k;
-          cg += (0.042 - cg) * k;
-          cb += (0.05 - cb) * k;
-        }
-        colors[i * 3] = cr;
-        colors[i * 3 + 1] = cg;
-        colors[i * 3 + 2] = cb;
-        glows[i] = col.glow ?? 0;
-        hots[i] = col.hot ?? 0;
-      hots[i] = col.hot ?? 0;
-      }
-      j.i = end;
-      if (end >= normals.count) j.stage = 4;
-      return false;
-    }
-    // 4: доводка — меш, декор, регистрация
-    const flat = j.flat!;
-    flat.setAttribute('color', new THREE.BufferAttribute(j.colors!, 3));
-    flat.setAttribute('aGlow', new THREE.BufferAttribute(j.glows!, 1));
-    flat.setAttribute('aHazard', new THREE.BufferAttribute(j.hots!, 1));
+    // 2: развёртка + GPU-раскраска, доводка — меш, декор, регистрация.
+    // ★ Раньше здесь были ещё два этапа: развёртка с нормалями (2 мс) и цикл
+    // раскраски по 9600 вершинам (70 мс на чанк, резался на порции по 260).
+    // Теперь цвет считает compute-ядро — этап схлопнулся в один вызов.
+    const flat = this.shadeChunk(j.geo!, j.ctrlA!, j.ctrlB!, ox, oz);
+    j.geo = null;
     const chunk = new THREE.Group();
     chunk.add(new THREE.Mesh(flat, this.snowMat));
     this.finishChunk(j.cx, j.cz, chunk, ox, oz, wx0);
@@ -2246,55 +2154,17 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
     const geo = new THREE.PlaneGeometry(CHUNK, CHUNK, SEG, SEG);
     geo.rotateX(-Math.PI / 2);
     const pos = geo.attributes.position;
+    const ctrlA = new Float32Array(pos.count * 4);
+    const ctrlB = new Float32Array(pos.count * 4);
+    const village = villageAt(ox, oz);
     for (let i = 0; i < pos.count; i++) {
       const u = ox + pos.getX(i);
       const v = oz + pos.getZ(i);
       pos.setY(i, terrainAtValley(u, v));
       pos.setX(i, toWorldX(u, v) - wx0); // изгиб долины запечён в геометрию
+      this.latticeCtrl(u, v, village, ctrlA, ctrlB, i);
     }
-    const flat = flatten(geo);
-    geo.dispose();
-    flat.computeVertexNormals();
-
-    const normals = flat.attributes.normal;
-    const vpos = flat.attributes.position;
-    const colors = new Float32Array(normals.count * 3);
-    const glows = new Float32Array(normals.count);
-    const hots = new Float32Array(normals.count);
-    const chunkVillage = villageAt(ox, oz);
-    const col = { r: 0, g: 0, b: 0, glow: 0, hot: 0 };
-    for (let i = 0; i < normals.count; i++) {
-      const wz = oz + vpos.getZ(i);
-      const wx = toValleyU(wx0 + vpos.getX(i), wz);
-      terrainColorAt(col, wx, wz, normals.getY(i), vpos.getY(i));
-      let cr = col.r, cg = col.g, cb = col.b;
-      if (chunkVillage) {
-        const rc = roadClosest(chunkVillage, wx, wz);
-        if (rc.d2 < 7 * 7) {
-          const w = 1 - Math.max(0, Math.min(1, (Math.sqrt(rc.d2) - 3.2) / 3.5));
-          cr += (ROAD_TINT.r - cr) * w;
-          cg += (ROAD_TINT.g - cg) * w;
-          cb += (ROAD_TINT.b - cb) * w;
-        }
-      }
-      // ★ ОСТЫВШАЯ КОРКА У ПОТОКА. Переход от пепла к расплаву не бывает
-      // резким: рядом лежит чёрный стеклянистый базальт — то, что уже
-      // застыло. Он же предупреждает игрока за десятки метров.
-      const crust = lavaCrustAt(wx, wz, terrainHeight, toWorldX);
-      if (crust > 0.01) {
-        const k = crust * 0.85;
-        cr += (0.055 - cr) * k;
-        cg += (0.042 - cg) * k;
-        cb += (0.05 - cb) * k;
-      }
-      colors[i * 3] = cr;
-      colors[i * 3 + 1] = cg;
-      colors[i * 3 + 2] = cb;
-      glows[i] = col.glow ?? 0;
-    }
-    flat.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    flat.setAttribute('aGlow', new THREE.BufferAttribute(glows, 1));
-    flat.setAttribute('aHazard', new THREE.BufferAttribute(hots, 1));
+    const flat = this.shadeChunk(geo, ctrlA, ctrlB, ox, oz);
     chunk.add(new THREE.Mesh(flat, this.snowMat));
     this.finishChunk(cx, cz, chunk, ox, oz, wx0);
   }
@@ -2314,7 +2184,9 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
     const rocks = obstacles.filter((o) => o.kind === 'rock');
     const m = new THREE.Matrix4();
     const q = new THREE.Quaternion();
+    const qLay = new THREE.Quaternion();
     const up = new THREE.Vector3(0, 1, 0);
+    const sideAxis = new THREE.Vector3(1, 0, 0);
     const s = new THREE.Vector3();
     const p = new THREE.Vector3();
 
@@ -2349,9 +2221,15 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
         // физика (см. rockRadiusToward)
         q.setFromAxisAngle(up, r.rot ?? 0);
         const hm = r.hMul ?? 0.7;
-        s.set(r.scale, r.scale * hm, r.scale * (r.zMul ?? 1));
+        const zm = r.zMul ?? 1;
+        // ЛЕЖАЧИЙ ВАЛУН: заваливаем вокруг собственной оси X уже ПОСЛЕ разворота
+        // по азимуту, поэтому вверх у него смотрит бывшая ось Z — ровно так же
+        // это считает физика (см. rockRadiusToward и topY).
+        if (r.lay) q.multiply(qLay.setFromAxisAngle(sideAxis, r.lay));
+        s.set(r.scale, r.scale * hm, r.scale * zm);
         // глыбы утоплены в снег — из сугроба торчит только верх
-        p.set(r.x - wx0, terrainHeight(r.x, r.z) - r.scale * hm * 0.22, r.z - oz);
+        const sink = r.scale * (r.lay ? zm : hm) * 0.22;
+        p.set(r.x - wx0, terrainHeight(r.x, r.z) - sink, r.z - oz);
         m.compose(p, q, s);
         mesh.setMatrixAt(i, m);
         mesh.setColorAt(i, rockTintFor(r.z, r.tint ?? 1, TREE_TINT));
@@ -2375,9 +2253,15 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
       const bMaxX = ox + CHUNK / 2;
       const bMinZ = oz - CHUNK / 2;
       const bMaxZ = oz + CHUNK / 2;
-      for (const h of village.houses) {
+      const vPads = villageHeights(village).pads;
+      for (let hi = 0; hi < village.houses.length; hi++) {
+        const h = village.houses[hi];
         if (!(h.x >= bMinX && h.x < bMaxX && h.z >= bMinZ && h.z < bMaxZ)) continue;
-        const gy = terrainAtValley(h.x, h.z) - 0.15;
+        // ★ ДОМ СТОИТ НА СВОЕЙ ПЛОЩАДКЕ, А НЕ НА ТЕКУЩЕМ РЕЛЬЕФЕ. Для обычного
+        // дома это одно и то же (рельеф под ним выровняли по ней же), а
+        // вкопанный дом рельеф НЕ трогает — и брать высоту из земли значило бы
+        // поднять его обратно на поверхность.
+        const gy = vPads[hi] - 0.15;
         const house = new THREE.Group();
         // ★ ГАБАРИТЫ БЕРУТСЯ ИЗ ОПИСАНИЯ ДОМА, а не считаются здесь заново:
         // по крышам ездят, и физика меряет ровно эти числа (см. HOUSE_GEOM).
@@ -2386,9 +2270,26 @@ float tnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
         const wide = h.wide;
         const deep = h.deep;
 
+        // ★ ЮБКА ПОД ВКОПАННЫМ ДОМОМ. Нагорный карниз сидит вровень с землёй,
+        // а низовой угол на уклоне 0.6 висел бы в воздухе на несколько метров.
+        // Стена продолжается вниз до самой низкой точки под домом.
+        const R0 = houseRoof(h);
+        let skirt = 0;
+        if (h.sunk) {
+          for (const [sx, sz] of [
+            [R0.hw, R0.hd], [-R0.hw, R0.hd], [R0.hw, -R0.hd], [-R0.hw, -R0.hd],
+          ] as Array<[number, number]>) {
+            const c = Math.cos(h.rot);
+            const sn = Math.sin(h.rot);
+            const gx = h.x + sx * c + sz * sn;
+            const gz = h.z - sx * sn + sz * c;
+            skirt = Math.max(skirt, gy - (terrainAtValley(gx, gz) - 0.6));
+          }
+          skirt = Math.min(skirt, 14);
+        }
         const body = new THREE.Mesh(this.houseGeo, this.houseMats[h.style]);
-        body.position.y = bodyH / 2;
-        body.scale.set(wide, bodyH / 2.4, deep);
+        body.position.y = (bodyH - skirt) / 2;
+        body.scale.set(wide, (bodyH + skirt) / 2.4, deep);
         house.add(body);
 
         // Крыша со СВЕСОМ: у альпийского дома она заметно шире корпуса, и

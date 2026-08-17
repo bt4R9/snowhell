@@ -1,4 +1,6 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { psx, withUniforms, ShaderLike } from '../core/mat';
+import { Fn, uniform, attribute, vertexColor, vec4, mix, length } from 'three/tsl';
 import { noise2, hash2 } from './noise';
 import { PALETTE } from './palette';
 
@@ -112,7 +114,7 @@ function crestAt(ca: number, sa: number, jag: number, off: number, f: number): n
 export class Backdrop {
   group = new THREE.Group();
   /** для менеджера биомов: общий тон кулис */
-  material!: THREE.ShaderMaterial;
+  material!: ShaderLike<THREE.MeshBasicNodeMaterial>;
 
   constructor() {
     // дымка кулис — тот же цвет тумана: гребни обязаны сходиться к нему же,
@@ -128,49 +130,36 @@ export class Backdrop {
 
     const geo = parts[0];
     const merged = parts.length === 1 ? geo : mergeAll(parts);
-    const mat = new THREE.ShaderMaterial({
-      uniforms: {
-        uHaze: { value: PALETTE.fog.clone() },
-        uTint: { value: new THREE.Color(0xffffff) },
-        uSnow: { value: 1 },
-        uRock: { value: new THREE.Color(0x4a4657) },
-      },
-      vertexShader: `
-        attribute float aHaze;
-        attribute float aSnow;
-        varying vec3 vCol;
-        varying float vHaze;
-        varying float vSnow;
-        void main() {
-          vCol = color;
-          vHaze = aHaze;
-          vSnow = aSnow;
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        }
-      `,
-      fragmentShader: `
-        uniform vec3 uHaze;
-        uniform vec3 uTint;
-        uniform vec3 uRock;
-        uniform float uSnow;
-        varying vec3 vCol;
-        varying float vHaze;
-        varying float vSnow;
-        void main() {
-          // снег снимается там, где биом бесснежный: в вулкане кулисы должны
-          // быть тёмной породой, а не белыми шапками
-          vec3 base = mix(vCol, uRock * (0.6 + 0.7 * length(vCol) * 0.5), vSnow * (1.0 - uSnow));
-          // и сходятся кулисы РОВНО к текущему цвету тумана, иначе на общей
-          // границе с затуманенной землёй видна полоса
-          gl_FragColor = vec4(mix(base * uTint, uHaze, vHaze), 1.0);
-        }
-      `,
-      vertexColors: true,
-      fog: false,
-      depthTest: false,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-    });
+    const uHaze = uniform(PALETTE.fog.clone());
+    const uTint = uniform(new THREE.Color(0xffffff));
+    const uSnow = uniform(1);
+    // ★ ПОРОДА КУЛИС — ЦВЕТ БИОМА. Здесь было жёсткое 0x4a4657: холодный
+    // сине-серый. В снегу это правильный камень, а в вулкане он и был той
+    // «бледной снежной грядой» на горизонте — снег-то снимался, но порода
+    // под ним оставалась холодной и светлой.
+    const uRock = uniform(PALETTE.backdropRock.clone());
+    const mat = withUniforms(
+      psx(new THREE.MeshBasicNodeMaterial({
+        fog: false,
+        depthTest: false,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      })),
+      { uHaze, uTint, uSnow, uRock }
+    );
+    mat.colorNode = Fn(() => {
+      const vCol = vertexColor().rgb;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const vHaze: any = attribute('aHaze', 'float');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const vSnow: any = attribute('aSnow', 'float');
+      // снег снимается там, где биом бесснежный: в вулкане кулисы должны
+      // быть тёмной породой, а не белыми шапками
+      const base = mix(vCol, uRock.mul(length(vCol).mul(0.35).add(0.6)), vSnow.mul(uSnow.oneMinus()));
+      // и сходятся кулисы РОВНО к текущему цвету тумана, иначе на общей
+      // границе с затуманенной землёй видна полоса
+      return vec4(mix(base.mul(uTint), uHaze, vHaze), 1.0);
+    })();
     const mesh = new THREE.Mesh(merged, mat);
     mesh.frustumCulled = false;
     mesh.renderOrder = -2; // сразу после неба, до всего мира
@@ -326,19 +315,30 @@ function smooth(t: number): number {
 
 /** Простое склеивание одинаковых по атрибутам геометрий */
 function mergeAll(parts: THREE.BufferGeometry[]): THREE.BufferGeometry {
+  // ★ СКЛЕЙКА ТЕРЯЛА ДВА АТРИБУТА. Здесь копировались только position и color,
+  // а aHaze/aSnow (дымка у подножия и снятие снега на вулкане) отбрасывались —
+  // в WebGL пропавший атрибут молча читался нулём, и кулисы НИКОГДА не сходились
+  // к туману и не теряли снег. WebGPU это честно назвал в консоли.
   let n = 0;
   for (const p of parts) n += p.attributes.position.count;
   const pos = new Float32Array(n * 3);
   const col = new Float32Array(n * 3);
+  const hz = new Float32Array(n);
+  const sn = new Float32Array(n);
   let o = 0;
   for (const p of parts) {
-    pos.set(p.attributes.position.array as Float32Array, o);
-    col.set(p.attributes.color.array as Float32Array, o);
-    o += p.attributes.position.count * 3;
+    const c = p.attributes.position.count;
+    pos.set(p.attributes.position.array as Float32Array, o * 3);
+    col.set(p.attributes.color.array as Float32Array, o * 3);
+    hz.set(p.attributes.aHaze.array as Float32Array, o);
+    sn.set(p.attributes.aSnow.array as Float32Array, o);
+    o += c;
     p.dispose();
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  geo.setAttribute('aHaze', new THREE.BufferAttribute(hz, 1));
+  geo.setAttribute('aSnow', new THREE.BufferAttribute(sn, 1));
   return geo;
 }

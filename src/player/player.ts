@@ -1,12 +1,10 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { Input } from '../core/input';
 import {
   terrainHeight,
   terrainNormal,
   terrainGradient,
   railHeights,
-  crackHeatAt,
-  hotGroundAt,
 } from '../world/terrain';
 import {
   CHUNK,
@@ -25,7 +23,11 @@ import {
   volcanoWeight,
   Rail,
 } from '../world/features';
-import { lavaAt, lavaSupportAt, steamsNear, steamPower, lavaTime, bombHitsPlayer, blastHitsPlayer } from '../world/lava';
+import {
+  lavaAt, lavaSupportAt, steamsNear, steamPower, lavaTime,
+  detonateBombNear, blastHitsPlayer, lavaCrustAt, hazardHeatAt, inPoolAt,
+} from '../world/lava';
+import type { Pools } from '../world/pools';
 import { groundDip } from '../fx/ground';
 import { laserHeat } from '../fx/laser';
 import { Rig } from './rig';
@@ -109,8 +111,57 @@ const HIKE_DELAY = 0.8;        // сек в яме до включения — �
 // Работает это только в яме (см. проверку выхода), поэтому «читом» стать не
 // может: на открытом склоне тяги нет вовсе.
 const HIKE_PUSH = 23;        // м/с² тяги по направлению доски
+// ★ ЕСТЬ ЯМЫ, ИЗ КОТОРЫХ «ПЕШКОМ» НЕ РАБОТАЕТ В ПРИНЦИПЕ. Колодец слива и
+// сухая лавовая чаша — это отвесные стены в полтора десятка метров: тяга их не
+// берёт ни за какое время, а сброс на трассу игрок должен ещё догадаться
+// нажать. Если выхода нет долго — высаживаем сами, тем же resetToPiste.
+// Порог с запасом к честному вылезанию: замер выхода из обычной чаши давал
+// 6.6 с с рулём и 8.5 с вообще без ввода, поэтому 13 с — это уже точно тупик.
+const RESCUE_T = 13;
+// А если стены выше головы на этаж — ждать нечего, это колодец.
+const RESCUE_DEEP = 12;      // м: насколько борт выше райдера
+const RESCUE_DEEP_T = 4.5;   // с
+// ★ ШАГ ЛУЧА МЕНЬШЕ ВАЛА. Первая версия шла отсчётами 20/35/50/70/90 м и
+// ПЕРЕПРЫГИВАЛА через борт чаши: за ним земля ниже — «выход есть», и спасатель
+// не срабатывал ни разу (замер: райдер сидел в сухой чаше 20 с, trapT = 0).
+const RESCUE_FROM = 8;       // с какого расстояния идём
+const RESCUE_TO = 96;        // докуда
+const RESCUE_DR = 8;         // шаг, м — заведомо мельче любого борта
+const RESCUE_OUT = 32;       // ближе этого «выход» не считается — это ещё яма
+const RESCUE_STEP = 2.5;     // борт выше этого по пути = выхода тут нет
+const RESCUE_EVERY = 0.3;    // с между проверками
+/** сколько шкалы перегрева добавляет одно попадание в кайму взрыва */
+const BLAST_BURN = 0.28;
+/** и сколько — в ядро (половина радиуса): по ТЗ 55% шкалы */
+const BLAST_BURN_CORE = 0.55;
+/** ускорение отброса в кайме взрыва, м/с² */
+const BLAST_PUSH = 46;
+/** и подброс, м/с */
+const BLAST_LIFT = 5.5;
+const RESCUE_MOVED = 70;     // м: уехал дальше — значит не в ловушке
+const RESCUE_IDLE = 20;      // с на месте — забираем в любом случае
 const HOLD_SLOPE = 0.95;     // круче ≈44° кант уже не держит поперёк — сползаем
 const SLIP_ACCEL = 20;       // ускорение сползания по линии падения
+// ★ ДОСКА — ПЛАНКА, А НЕ ТОЧКА. Ориентацию брали из нормали рельефа В ТОЧКЕ
+// (terrainNormal, плечо 0.6 м): в узкой складке такая нормаль переворачивается
+// за один-два кадра, и райдера мотало — замер дал 91 °/с медианы во впадине
+// против 27 на открытом склоне. Настоящая доска через складку ПЕРЕКИДЫВАЕТСЯ:
+// опирается на края и ложится плоскостью по своим четырём точкам.
+const BOARD_LEN = 1.55;      // база нос—хвост, м
+// Поперечная база ШИРЕ доски (0.3 м) намеренно: узкий жёлоб доска перекрывает
+// вместе с ногами, а не проваливается в него кантом.
+const BOARD_SPAN = 1.5;      // база левый кант — правый, м
+// Плоскости мало: замер по фиксированной траектории (без физики, чтобы
+// конфигурации были сравнимы) показал, что почти весь выигрыш даёт ВРЕМЕННОЕ
+// сглаживание нормали, а расширение опоры — лишь 8%. Цена сглаживания —
+// отставание доски от мгновенной плоскости: при 6 это 5.4° медианы, при 4 уже
+// 7.1° и доска начинает «плыть» на перегибах.
+//     скорость │ p90 рывка │ отставание
+//        16    │  231 °/с  │   2.4°
+//         8    │  163      │   4.4°
+//         6    │  135      │   5.4°   ← здесь
+//         4    │  102      │   7.1°
+const NORMAL_RATE = 6;       // 1/с — с какой скоростью нормаль догоняет плоскость
 const SPEED_REF = 55;        // опорная скорость для темпа поворота (не потолок!)
 const MIN_SPEED = 4;
 const START_SPEED = 16;   // не с нуля: первые секунды не должны быть ожиданием
@@ -225,14 +276,17 @@ const HEAT_DEEP = 3.2;  // множитель, если провалился в 
 const HEAT_COOL = 15;   // секунд полного остывания
 /**
  * Секунд в расплавленной борозде до предела.
- * ★ ПЕРЕСЕЧЕНИЕ РЕЗА ДОЛЖНО СТОИТЬ ДОРОГО, НО НЕ УБИВАТЬ С ОДНОГО КАСАНИЯ.
- * Борозда всего одиннадцать метров поперёк: на двадцати шести метрах в секунду
- * её проходят за четыре десятых секунды. При мягком нагреве замер дал 0.11 из
- * 1.0 — ехать прямо сквозь расплав было выгоднее, чем маневрировать; при
- * полусекунде до предела одно неудачное пересечение уже стоило жизни. Восемь
- * десятых оставляют запас на ошибку: два касания подряд — смерть, одно — нет.
+ * ★ РЕЗ ЖЖЁТ РОВНО КАК ЛАВА. Отдельная, вчетверо более жёсткая шкала (0.85 с
+ * против 2.4 у расплава) делала борозду опаснее самого озера — при том, что
+ * борозда стала вдвое шире и пересекать её приходится часто. Теперь это та же
+ * лава: та же шкала, тот же запас на ошибку. Но рез — оружие, а не среда, и
+ * по просьбе он жжёт в полтора раза быстрее расплава: 1.6 с против 2.4.
  */
-const LASER_HEAT = 0.85;
+// ★ И ОБРАТНО: с резом «по ходу движения» (eye.ts) борозда шириной 24 м стала
+// встречаться на каждом приёме, и 1.6 с не оставляли шанса — одно пересечение
+// на 20 м/с давало 0.75 шкалы, второе убивало. Пересечение должно стоить
+// ~0.4: два — предел, три — смерть. Ехать ВДОЛЬ борозды по-прежнему нельзя.
+const LASER_HEAT = HEAT_UP * 1.15;
 const ROOF_CATCH = 0.9;
 const RAIL_SNAP_R = 2.2;
 const RAIL_FUNNEL_R = 5.5;  // радиус у въезда
@@ -306,6 +360,11 @@ export class Player {
   /** сторона щита: −1 — к носу левой рукой, +1 — к хвосту правой */
   brakeSide = 0;
   private stuckT = 0;
+  private trapT = 0;    // сколько длится «выхода нет» по длинным лучам
+  private rescueT = 0;  // счётчик до следующей проверки спасателя
+  private idleT = 0;    // сколько райдер топчется на одном месте
+  private trapX = 0;    // откуда считаем, что райдер не продвинулся
+  private trapZ = 0;
   wasReset = false; // одноразовый флаг для HUD и комбо
   railTilt = 0;          // рад: завал с рейла, + = на правый борт
   private railTiltVel = 0;
@@ -325,8 +384,16 @@ export class Player {
   heat = 0;
   /** насколько доска приподнята коркой расплава, м */
   private lavaLift = 0;
-  /** жар шва под доской 0..1 — из него летят искры и по нему не остаётся следа */
+  /** живая лава — ей сообщаем касания доски (волны по расплаву) */
+  private pools: Pools | null = null;
+  private splashAcc = 0;
+  setPools(p: Pools): void {
+    this.pools = p;
+  }
+  /** горячее под доской 0..1 (корка потока, прокал, рез луча) — искры, обрыв колеи */
   crackHot = 0;
+  /** жар для нагрева доски (рез луча) */
+  crackBurn = 0;
   /** в этот кадр коснулись лавы (для звука и вспышки в HUD) */
   justMelted = false;
   /** доска сейчас опирается на крышу дома */
@@ -348,6 +415,7 @@ export class Player {
   private grad = new THREE.Vector2();
   private tmpF = new THREE.Vector3();
   private tmpR = new THREE.Vector3();
+  private tmpN = new THREE.Vector3(0, 1, 0);
   private tmpM = new THREE.Matrix4();
   private worldUp = new THREE.Vector3(0, 1, 0);
   private qYaw = new THREE.Quaternion();
@@ -416,27 +484,65 @@ export class Player {
     // огненный камень: попадание — это краш
     // ★ СБИВАЕТ И ВЗРЫВ, А НЕ ТОЛЬКО ПРЯМОЕ ПОПАДАНИЕ. Снаряд, рванувший в
     // трёх метрах, раньше не значил ничего — и уворачиваться было незачем.
-    if (
-      this.tumbleT <= 0 &&
-      (bombHitsPlayer(this.pos.x, this.pos.y, this.pos.z) ||
-        blastHitsPlayer(this.pos.x, this.pos.z))
-    ) {
-      this.velH.multiplyScalar(0.25);
-      this.tumbleT = TUMBLE_TIME;
-      this.crashed = true;
-      this.trickYaw = 0;
-      this.trickFlip = 0;
-      this.spinVel = 0;
-      this.flipVel = 0;
-      this.airTime = 0;
+    // ★ КАЙМА ВЗРЫВА ТОЛКАЕТ, ЯДРО УБИВАЕТ. Раньше любое касание ударной волны
+    // было падением, и «зацепило краем» ничем не отличалось от эпицентра.
+    // ★ ЯДРО ВЗРЫВА БОЛЬШЕ НЕ УБИВАЕТ МГНОВЕННО. По просьбе: попадание в
+    // пределах половины радиуса даёт 55% шкалы перегрева и отшвыривает, а не
+    // заканчивает заезд. Умереть от фаербола можно только «догорев» — когда
+    // шкала перегрева и без того была почти полной.
+    // ★ СНАЧАЛА ПОДРЫВ, ПОТОМ ПРИГОВОР. Снаряд у самого игрока подрываем ЗДЕСЬ,
+    // до чтения волны, иначе взрыв опаздывает на кадр. Раньше этот же вызов сам
+    // ставил краш — и ядро всё равно кончалось мгновенным WIPEOUT, минуя обе
+    // зоны.
+    detonateBombNear(this.pos.x, this.pos.y, this.pos.z);
+    const blast = blastHitsPlayer(this.pos.x, this.pos.z);
+    if (blast && this.tumbleT <= 0) {
+      // в ядре толкает сильнее, чем в кайме
+      const kick = BLAST_PUSH * (blast.kill ? 1 : blast.push);
+      this.velH.x += blast.dx * kick * dt;
+      this.velH.z += blast.dz * kick * dt;
+      // ★ КАЙМА НЕ УБИВАЕТ, НО ОБЖИГАЕТ. Иначе «зацепило краем» не стоит
+      // ничего: отшвырнуло и поехал дальше. Доля шкалы за одно попадание, а не
+      // за секунду — взрыв мгновенный.
+      this.heat = Math.min(1, this.heat + (blast.kill ? BLAST_BURN_CORE : BLAST_BURN * blast.push));
+      if (this.heat >= 1) {
+        this.heat = 0;
+        this.meltT = MELT_TIME;
+        this.justMelted = true;
+        this.crashed = true;
+      }
+      // подбрасывает: волна идёт от земли, и это читается прыжком, а не рывком
+      const lift = BLAST_LIFT * (blast.kill ? 1 : blast.push);
+      if (this.grounded && this.vy < lift) {
+        this.vy = lift;
+        this.grounded = false;
+      }
     }
 
     {
       const u = toValleyU(this.pos.x, this.pos.z);
       const lvl = lavaAt(u, this.pos.z, terrainHeight, toWorldX);
-      // едем ПО корке: греет и то, и другое, но глубина считается от верха
+      // едем ПО языку: греет; глубина считается от верха
       const onLava = lvl !== null && this.pos.y < lvl + 1.1;
-      if (onLava) {
+      // ★ ОЗЕРО И КОЛОДЕЦ — ГЛУБОКО, ДОСКА ТОНЕТ. Опоры там нет (см.
+      // lavaSupportAt), доска падает под зеркало, и это уже не «жарко», а конец
+      // заезда за доли секунды. Язык — другое дело: по нему едут и греются.
+      const pool = inPoolAt(u, this.pos.z);
+      const sinking = pool !== null && this.pos.y < pool + 0.6;
+      if (sinking) {
+        this.heat += dt * 3.2;
+        const k = 1 - Math.min(0.6, dt * 3.5);
+        this.velH.multiplyScalar(k);
+        this.speed *= k;
+        this.pools?.splash(this.pos.x, this.pos.z, 1.0);
+      }
+      if (onLava && !sinking) {
+        // ★ ДОСКА ПУСКАЕТ ВОЛНЫ ПО РАСПЛАВУ: кольца от касаний, тем чаще, чем быстрее
+        this.splashAcc += dt * (0.8 + this.speed * 0.12);
+        if (this.splashAcc >= 1) {
+          this.splashAcc = 0;
+          this.pools?.splash(this.pos.x, this.pos.z, 0.55);
+        }
         // чем глубже сидит доска, тем быстрее греется: по кромке проехать
         // можно, а провалившись в озеро — нет
         const deep = Math.max(0, Math.min(1, (lvl - this.pos.y) / 1.6));
@@ -451,31 +557,6 @@ export class Player {
           this.speed *= k;
         }
       } else {
-        // ★ РАСКАЛЁННЫЕ ШВЫ ТОЖЕ ГРЕЮТ. Не так, как расплав, — вчетверо
-        // медленнее, — но проехать всю дорогу по светящейся сети трещин
-        // безнаказанно нельзя: это тоже горячая земля, а не узор.
-        // жар меряем по нескольким точкам под доской: она длиной в полтора
-        // метра, и по одной точке шов ловится лишь несколько процентов времени
-        let cr = 0;
-        if (this.grounded && this.pos.y - surfaceY(this.pos.x, this.pos.z) < 1.2) {
-          const vw = volcanoWeight(this.pos.z);
-          if (vw > 0.05) {
-            const sp = Math.max(0.001, this.speed);
-            const dx = (this.velH.x / sp) * 0.75;
-            const dz = (this.velH.z / sp) * 0.75;
-            const t = lavaTime();
-            const seam = Math.max(
-              crackHeatAt(this.pos.x, this.pos.z, t),
-              Math.max(
-                crackHeatAt(this.pos.x + dx, this.pos.z + dz, t),
-                crackHeatAt(this.pos.x - dx, this.pos.z - dz, t)
-              )
-            );
-            // и фон самого поля: там, где всё в сетке, земля горяча и между швов
-            const field = hotGroundAt(this.pos.x, this.pos.z);
-            cr = Math.max(seam, field * field * 0.45) * vw;
-          }
-        }
         // ★ РЕЗ ЛУЧА ЖЖЁТ БЫСТРЕЕ ВСЕГО. Озеро лавы обойти легко, шов греет
         // медленно — а борозда от ока лежит поперёк курса и живёт секунды:
         // если она вообще не опаснее прочего, пересекать её можно не глядя.
@@ -493,19 +574,32 @@ export class Player {
         const lasHot = near > 0 ? laserHeat(this.pos.x, this.pos.z) * near : 0;
         // искры и обрыв колеи считаем по самому горячему из двух, а нагрев
         // берём по одному источнику — иначе рез считался бы дважды
-        this.crackHot = Math.max(cr, lasHot);
+        // ★ ПРИВЯЗКА К ТИПУ ПОВЕРХНОСТИ — ТУПИК, ПРОВЕРЕНО ДВАЖДЫ. Сначала я
+        // повесил искры на тлеющую CINDER, потом на блики обсидиана — и оба
+        // раза получил ровно исходную жалобу: «стою на обычной поверхности, а
+        // искры есть». Тип не светится сам по себе; светятся ОБЪЕКТЫ на нём.
+        // Здесь остаются только они: раскалённые швы, КОРКА ПОТОКА и рез луча.
+        // ★ КОРКА — ЭТО И ЕСТЬ «СВЕТЯЩАЯСЯ ШТУКА, НО НЕ ЛАВА». Остывающая кайма
+        // вдоль языка и вокруг озера светится изнутри; ехать по ней можно, и
+        // именно на ней доска обязана искрить. Прокал (раскалённая земля рядом
+        // с расплавом) — та же природа, добавляем и его.
+        const lu = toValleyU(this.pos.x, this.pos.z);
+        const crust = lavaCrustAt(lu, this.pos.z, terrainHeight, toWorldX);
+        const haz = hazardHeatAt(lu, this.pos.z, terrainHeight, toWorldX);
+        const hotSurf = Math.max(crust, haz);
+        this.crackHot = Math.max(hotSurf, lasHot);
+        this.crackBurn = lasHot;
         if (lasHot > 0.05) {
           // ★ ГРЕЕТ ВСЯ БОРОЗДА, А НЕ ТОЛЬКО ЕЁ ОСЬ. Профиль (1 − d/w)² нужен
           // геометрии — у стенок канава мельче; но лава на дне разлита ровно, и
           // считать край втрое безопаснее центра неправильно. Насыщаем.
           this.heat = Math.min(
             1,
-            this.heat + (dt / LASER_HEAT) * Math.min(1, lasHot * 1.7)
-          );
-        } else if (cr > 0.06) {
-          this.heat = Math.min(
-            1,
-            this.heat + (dt / (HEAT_UP * 4)) * Math.min(1, cr * 2.2)
+            // ★ НАСЫЩЕНИЕ СИЛЬНЕЕ = ШИРЕ ПОЛОСА ПОРАЖЕНИЯ. Профиль борозды
+            // спадает как (1 − d/R)², поэтому у края нагрев вчетверо слабее
+            // осевого и кромка была почти безопасной. Множитель 2.6 выводит на
+            // полный нагрев уже с 38% радиуса — горит вся борозда, а не ось.
+            this.heat + (dt / LASER_HEAT) * Math.min(1, lasHot * 2.6)
           );
         } else {
           this.heat = Math.max(0, this.heat - dt / HEAT_COOL);
@@ -615,7 +709,7 @@ export class Player {
       // стена вернулась посреди подъёма, скатился обратно.
       if (this.speed < HIKE_SPEED || this.stuckT > HIKE_DELAY) {
         let hasExit = false;
-        for (let a = 0; a < 8 && !hasExit; a++) {
+        for (let a = 0; a < 8; a++) {
           const an = (a / 8) * Math.PI * 2;
           const cx = Math.cos(an);
           const cz = Math.sin(an);
@@ -634,6 +728,7 @@ export class Player {
       } else {
         this.stuckT = 0;
       }
+      this.rescueCheck(dt);
       // тяга гаснет к HIKE_SPEED, поэтому «пешком» не разгоняет
       if (control > 0 && this.stuckT > HIKE_DELAY) {
         const push = HIKE_PUSH * Math.min(1, (HIKE_SPEED - this.speed) / 2);
@@ -1035,11 +1130,11 @@ export class Player {
             }
             const rr =
               (o.kind === 'crag'
-                ? cragRadiusToward(o, dx, dz)
+                ? cragRadiusToward(o, dx, dz, this.pos.y)
                 : o.kind === 'rock'
                   ? rockRadiusToward(o, dx, dz)
                 : o.kind === 'arch'
-                  ? archLegRadius(o, dx, dz)
+                  ? archLegRadius(o, dx, dz, this.pos.y)
                   : o.kind === 'house'
                     ? houseRadiusToward(o, dx, dz)
                     : o.r) + 0.35;
@@ -1146,7 +1241,9 @@ export class Player {
       // поворот worldUp вокруг горизонтальной оси (ax, 0, az) по Родригу
       this.normal.set(az * st, ct, -ax * st).normalize();
     } else if (this.grounded) {
-      terrainNormal(this.pos.x, this.pos.z, this.normal);
+      // плоскость под доской, а не нормаль в точке (см. BOARD_LEN)
+      this.boardNormal(dir, this.tmpN);
+      this.normal.lerp(this.tmpN, 1 - Math.exp(-NORMAL_RATE * dt)).normalize();
     } else {
       this.normal.lerp(this.worldUp, 1 - Math.exp(-2 * dt)).normalize();
     }
@@ -1157,6 +1254,29 @@ export class Player {
     this.targetQuat.setFromRotationMatrix(this.tmpM);
     const rate = this.grounded ? 14 : 5;
     this.quat.slerp(this.targetQuat, 1 - Math.exp(-rate * dt));
+  }
+
+  /**
+   * Нормаль ПЛОСКОСТИ, на которую ложится доска: уклон меряется между носом и
+   * хвостом и между кантами, а не производной в точке. Складка уже базы доски
+   * под неё просто подставляет края — ровно как в жизни.
+   */
+  private boardNormal(dir: THREE.Vector3, out: THREE.Vector3): THREE.Vector3 {
+    const hl = BOARD_LEN * 0.5;
+    const hw = BOARD_SPAN * 0.5;
+    const fx = dir.x;
+    const fz = dir.z;
+    const rx = fz; // вправо по ходу (dir горизонтален и единичен)
+    const rz = -fx;
+    const x = this.pos.x;
+    const z = this.pos.z;
+    const sF =
+      (terrainHeight(x + fx * hl, z + fz * hl) - terrainHeight(x - fx * hl, z - fz * hl)) /
+      BOARD_LEN;
+    const sR =
+      (terrainHeight(x + rx * hw, z + rz * hw) - terrainHeight(x - rx * hw, z - rz * hw)) /
+      BOARD_SPAN;
+    return out.set(-(fx * sF + rx * sR), 1, -(fz * sF + rz * sR)).normalize();
   }
 
   private land(dir: THREE.Vector3): void {
@@ -1335,6 +1455,83 @@ export class Player {
   }
 
   /**
+   * ★ СПАСАТЕЛЬ. «Пешком» смотрит на 16 м вперёд — этого хватает бортику, но не
+   * лавовой чаше: у неё радиус полсотни метров, и со дна ВСЕ ближние лучи
+   * показывают выход (пол чаши наклонён к сливу, земля в шестнадцати метрах
+   * честно ниже). Замер: райдер сидел на дне 25 с, stuckT всё это время был
+   * ноль. Поэтому у спасателя свой горизонт — до 90 м, и своя мера: выход
+   * засчитывается, только если по пути не пришлось перелезать через борт.
+   *
+   * Проверяем редко (RESCUE_EVERY): это 60 выборок высоты, в каждом кадре они
+   * не нужны — стенки никуда не денутся.
+   */
+  private rescueCheck(dt: number): void {
+    if (this.grinding || this.tumbleT > 0) return;
+    this.rescueT += dt;
+    if (this.rescueT < RESCUE_EVERY) return;
+    this.rescueT = 0;
+    // ★ МЕРА НЕ СКОРОСТЬ, А ПРОЙДЕННОЕ. Сначала здесь стоял выход по
+    // this.speed > HIKE_SPEED — и он гасил счётчик в колодце: райдер там
+    // мечется по стенкам, разгоняясь до 30 км/ч, никуда при этом не уезжая
+    // (замер: 18 с в колодце, trapT ни разу не дорос до секунды). Ловушка —
+    // это когда НЕ ПРОДВИНУЛСЯ, а не когда стоишь.
+    const dx = this.pos.x - this.trapX;
+    const dz = this.pos.z - this.trapZ;
+    if (dx * dx + dz * dz > RESCUE_MOVED * RESCUE_MOVED) {
+      this.trapX = this.pos.x;
+      this.trapZ = this.pos.z;
+      this.trapT = 0;
+      this.idleT = 0;
+      return;
+    }
+    // ★ ЖЁСТКИЙ ЗАДНИК. Лучи считают выходом и обрыв — с точки зрения игры
+    // это верно (с обрыва прыгают), но чаша, из которой «выход» ведёт в
+    // соседний колодец, так и остаётся ловушкой: замер поймал райдера,
+    // просидевшего в такой двадцать секунд при живом вердикте «выход есть».
+    // Поэтому вне зависимости от лучей: не продвинулся совсем — забираем.
+    this.idleT += RESCUE_EVERY;
+    if (this.idleT > RESCUE_IDLE) {
+      this.trapT = 0;
+      this.idleT = 0;
+      this.stuckT = 0;
+      this.resetToPiste();
+      return;
+    }
+    let free = false;
+    let lowWall = Infinity;
+    for (let a = 0; a < 12; a++) {
+      const an = (a / 12) * Math.PI * 2;
+      const cx = Math.cos(an);
+      const cz = Math.sin(an);
+      let wall = 0;
+      for (let rr = RESCUE_FROM; rr <= RESCUE_TO; rr += RESCUE_DR) {
+        const h = surfaceY(this.pos.x + cx * rr, this.pos.z + cz * rr) - this.pos.y;
+        if (h > wall) wall = h;
+        // Спустились ниже и не перелезали ничего выше пояса — это выход. Но
+        // ЗАСЧИТЫВАЕМ ТОЛЬКО ДАЛЬШЕ RESCUE_OUT: пол колодца сам наклонён, и
+        // в десятке метров земля честно ниже — «выход», который никуда не ведёт.
+        if (rr >= RESCUE_OUT && h < -2 && wall <= RESCUE_STEP) {
+          free = true;
+          break;
+        }
+      }
+      if (wall < lowWall) lowWall = wall;
+      if (free) break;
+    }
+    if (free) {
+      this.trapT = 0;
+      return;
+    }
+    this.trapT += RESCUE_EVERY;
+    const limit = lowWall > RESCUE_DEEP ? RESCUE_DEEP_T : RESCUE_T;
+    if (this.trapT > limit) {
+      this.trapT = 0;
+      this.stuckT = 0;
+      this.resetToPiste();
+    }
+  }
+
+  /**
    * Годится ли точка под высадку после сброса.
    *
    * ★ СБРОС ВЫСАЖИВАЛ ТУДА ЖЕ, ГДЕ ЗАСТРЯЛИ. Он ставил игрока на ось трассы на
@@ -1437,6 +1634,78 @@ export class Player {
   }
 
   /** Событие приземления (одно на прыжок); null, если ничего не произошло */
+  /**
+   * ★ УДАРНАЯ ВОЛНА БАШНИ. Гребень высотой h идёт по земле: кто на земле или в
+   * воздухе ниже гребня — сбит с ног и заторможен (и слегка обожжён); кто выше
+   * — перепрыгнул. Возвращает true, если задело.
+   */
+  shockHit(h: number): boolean {
+    if (this.tumbleT > 0 || this.meltT > 0 || this.hitCooldown > 0) return false;
+    const above = this.pos.y - surfaceY(this.pos.x, this.pos.z);
+    // перепрыгнул: вал высокий (5+ м), поэтому порог — треть гребня, иначе
+    // перепрыгнуть его нельзя ни с какого кикера
+    if (above > Math.min(2.2, h * 0.4)) return false;
+    this.hitCooldown = HIT_COOLDOWN;
+    this.velH.multiplyScalar(0.35);
+    this.vy = Math.max(this.vy, 3.5); // подбрасывает и опрокидывает
+    this.grounded = false;
+    this.tumbleT = TUMBLE_TIME;
+    this.crashed = true;
+    this.grinding = false;
+    this.grindRail = null;
+    this.trickYaw = 0;
+    this.trickFlip = 0;
+    this.spinVel = 0;
+    this.flipVel = 0;
+    this.airTime = 0;
+    this.heat = Math.min(1, this.heat + 0.18);
+    return true;
+  }
+
+  /**
+   * ★ ГОРЯЩАЯ ГЛЫБА. Катящаяся бьёт (кувырок, отброс, ожог), лежащая — просто
+   * камень: выталкивает и чуть тормозит, но обжигает, пока горячая.
+   */
+  boulderHit(push: number, dx: number, dz: number, heat: number): boolean {
+    if (this.tumbleT > 0 || this.meltT > 0) return false;
+    // выталкиваем всегда — сквозь камень не проехать
+    this.pos.x += dx * 0.6;
+    this.pos.z += dz * 0.6;
+    const into = this.velH.x * -dx + this.velH.z * -dz;
+    if (into > 0) {
+      this.velH.x += dx * into;
+      this.velH.z += dz * into;
+    }
+    // ★ УДАР = УРОН: раскалённая глыба на ходу снимает почти всю шкалу
+    this.heat = Math.min(1, this.heat + 0.45 * heat + 0.25 * push);
+    if (this.heat >= 1) {
+      this.heat = 0;
+      this.meltT = MELT_TIME;
+      this.justMelted = true;
+      this.crashed = true;
+      return true;
+    }
+    if (this.hitCooldown > 0) return false;
+    this.hitCooldown = HIT_COOLDOWN;
+    if (push > 0.35 || this.speed > HIKE_SPEED * 1.5) {
+      this.velH.multiplyScalar(0.3);
+      this.velH.x += dx * 8 * push;
+      this.velH.z += dz * 8 * push;
+      this.vy = Math.max(this.vy, 3 + push * 4);
+      this.grounded = false;
+      this.tumbleT = TUMBLE_TIME;
+      this.crashed = true;
+      this.grinding = false;
+      this.grindRail = null;
+      this.trickYaw = 0; this.trickFlip = 0; this.spinVel = 0; this.flipVel = 0; this.airTime = 0;
+      return true;
+    }
+    this.velH.multiplyScalar(0.8);
+    this.wobbleT = Math.max(this.wobbleT, 0.4);
+    this.grazed = true;
+    return true;
+  }
+
   consumeLanding(): LandingEvent | null {
     const l = this.landing;
     this.landing = null;

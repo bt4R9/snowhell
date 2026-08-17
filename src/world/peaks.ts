@@ -1,4 +1,6 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { psx, withUniforms, ShaderLike } from '../core/mat';
+import { Fn, uniform, attribute, vertexColor, vec4, mix, clamp, positionView } from 'three/tsl';
 import { noise2 } from './noise';
 import { PALETTE, SUN_DIR } from './palette';
 import { valleyX } from './features';
@@ -73,110 +75,88 @@ const ROCK = new THREE.Color(0x8a8698);
 // закатный свет на снегу вершины — тот же приём, что и на кулисах
 const GLOW = new THREE.Color(0xffc39a);
 
-const VERT = /* glsl */ `
-varying vec3 vCol;
-varying float vDist;
-attribute vec3 color;
-void main() {
-  vCol = color;
-  vec4 mv = modelViewMatrix * vec4(position, 1.0);
-  vDist = -mv.z;
-  gl_Position = projectionMatrix * mv;
-}
-`;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type N = any;
 
 // Своя дымка, а не общий туман сцены: тот полностью растворяет всё дальше
 // 3.7 км, то есть съел бы вершины целиком. Здесь дымка сгущается медленно,
 // поэтому массив виден за 4 км, но остаётся воздушным — и, главное, СЛАБЕЕТ
 // по мере приближения. Это и есть вторая половина ощущения параллакса:
 // вершина не только уезжает вбок, но и проявляется.
-const FRAG = /* glsl */ `
-uniform vec3 uHaze;
-uniform vec3 uTint;
-uniform float uNear;
-uniform float uFar;
-varying vec3 vCol;
-varying float vDist;
-void main() {
-  float h = clamp((vDist - uNear) / (uFar - uNear), 0.0, 1.0);
-  // Потолок дымки 0.62, а не единица: полностью растворённая вершина — это
-  // просто пятно тумана, а весь смысл главной горы в том, что она ВИДНА.
-  // На закате снег дальней стены светлее неба, а не бледнее его.
-  // тон биома ложится на СВОЙ цвет вершины, но не на дымку: иначе дальний
-  // хребет разойдётся по тону с туманом сцены и вырежется из картинки
-  gl_FragColor = vec4(mix(vCol * uTint, uHaze, h * 0.62), 1.0);
+function buildPeakMaterial(): ShaderLike<THREE.MeshBasicNodeMaterial> {
+  // ★ ДЫМКА ПИКОВ — ЖИВАЯ, ЕЁ ПИШЕТ БИОМ. Здесь стояла ссылка на PALETTE.fog,
+  // которую никто не обновлял: на вулкане дальняя цепь смешивалась на 55% с
+  // АЛЬПИЙСКИМ бледно-голубым туманом — это и была «бледная снежная гряда» на
+  // горизонте, которую мы искали в кулисах и снеге пиков.
+  const uHaze = uniform(PALETTE.fog.clone());
+  const uTint = uniform(new THREE.Color(0xffffff));
+  // Подобрано под общий туман сцены: на 2 км мир затуманен на 35%, и
+  // хребет обязан быть примерно там же, иначе он вырезан из другой
+  // картинки. Чуть чётче — можно: снег ярче склона.
+  const uNear = uniform(900);
+  const uFar = uniform(9000);
+  const m = withUniforms(
+    psx(new THREE.MeshBasicNodeMaterial({ fog: false, side: THREE.DoubleSide })),
+    { uHaze, uTint, uNear, uFar }
+  );
+  m.colorNode = Fn(() => {
+    const vDist = positionView.z.negate();
+    const h = clamp(vDist.sub(uNear).div(uFar.sub(uNear)), 0.0, 1.0);
+    // Потолок дымки 0.62, а не единица: полностью растворённая вершина — это
+    // просто пятно тумана, а весь смысл главной горы в том, что она ВИДНА.
+    // тон биома ложится на СВОЙ цвет вершины, но не на дымку: иначе дальний
+    // хребет разойдётся по тону с туманом сцены и вырежется из картинки
+    return vec4(mix(vertexColor().rgb.mul(uTint), uHaze, h.mul(0.62)), 1.0);
+  })();
+  return m;
 }
-`;
 
 // СНЕЖНЫЙ ФЛАГ. Самая узнаваемая деталь восьмитысячника: с гребня в струе
 // джет-стрима непрерывно сдувает снег, и с вершины тянется полотнище на
 // километры. Стоит трёх десятков треугольников, а читается мгновенно.
-const PLUME_VERT = /* glsl */ `
-attribute float aA;
-varying float vA;
-varying float vDist;
-void main() {
-  vA = aA;
-  vec4 mv = modelViewMatrix * vec4(position, 1.0);
-  vDist = -mv.z;
-  gl_Position = projectionMatrix * mv;
+function buildPlumeMaterial(): ShaderLike<THREE.MeshBasicNodeMaterial> {
+  const uCol = uniform(new THREE.Color(0xfdf3ec));
+  const uNear = uniform(900);
+  const uFar = uniform(9000);
+  // ★ ФЛАГ — ЭТО СНЕГ. На вулкане снега нет, а белое полотнище над чёрной
+  // вершиной читалось «бледной снежной грядой» на горизонте — той самой, что
+  // мы долго искали в кулисах и пиках. Гаснет вместе с долей снега биома.
+  const uSnow = uniform(1);
+  const m = withUniforms(
+    psx(new THREE.MeshBasicNodeMaterial({
+      transparent: true,
+      // Глубину НЕ пишем: полотнище полупрозрачное, и запись глубины прорезала
+      // бы в нём дыры на самопересечениях. Тест оставляем — за скалой флага
+      // не видно.
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      fog: false,
+    })),
+    { uCol, uNear, uFar, uSnow }
+  );
+  m.colorNode = Fn(() => {
+    const vA: N = attribute('aA', 'float');
+    const vDist = positionView.z.negate();
+    const h = clamp(vDist.sub(uNear).div(uFar.sub(uNear)), 0.0, 1.0);
+    return vec4(uCol, vA.mul(h.mul(0.55).oneMinus()).mul(uSnow));
+  })();
+  return m;
 }
-`;
-
-const PLUME_FRAG = /* glsl */ `
-uniform vec3 uCol;
-uniform float uNear;
-uniform float uFar;
-varying float vA;
-varying float vDist;
-void main() {
-  float h = clamp((vDist - uNear) / (uFar - uNear), 0.0, 1.0);
-  gl_FragColor = vec4(uCol, vA * (1.0 - h * 0.55));
-}
-`;
 
 export class Peaks {
   group = new THREE.Group();
 
   /** для менеджера биомов: тон цепи */
-  get material(): THREE.ShaderMaterial {
+  get material(): ShaderLike {
     return this.mat;
   }
 
-  private mat = new THREE.ShaderMaterial({
-    vertexShader: VERT,
-    fragmentShader: FRAG,
-    uniforms: {
-      uHaze: { value: PALETTE.fog },
-      uTint: { value: new THREE.Color(0xffffff) },
-      // Подобрано под общий туман сцены: на 2 км мир затуманен на 35%, и
-      // хребет обязан быть примерно там же, иначе он вырезан из другой
-      // картинки. Чуть чётче — можно: снег ярче склона.
-      uNear: { value: 900 },
-      uFar: { value: 9000 },
-    },
-    fog: false,
-    side: THREE.DoubleSide,
-  });
-  private plumeMat = new THREE.ShaderMaterial({
-    vertexShader: PLUME_VERT,
-    fragmentShader: PLUME_FRAG,
-    uniforms: {
-      uCol: { value: new THREE.Color(0xfdf3ec) },
-      uNear: { value: 900 },
-      uFar: { value: 9000 },
-    },
-    transparent: true,
-    // Глубину НЕ пишем: полотнище полупрозрачное, и запись глубины прорезала
-    // бы в нём дыры на самопересечениях. Тест оставляем — за скалой флага
-    // не видно.
-    depthWrite: false,
-    side: THREE.DoubleSide,
-    fog: false,
-  });
+  private mat = buildPeakMaterial();
+  private plumeMat = buildPlumeMaterial();
   private live = new Map<string, THREE.Mesh>();
 
   update(pz: number): void {
+    this.plumeMat.uniforms.uSnow.value = PALETTE.peakSnow;
     const i0 = Math.floor((pz - BEHIND) / SEG_Z);
     const i1 = Math.floor((pz + AHEAD) / SEG_Z);
     for (let i = i0; i <= i1; i++) {
@@ -186,7 +166,12 @@ export class Peaks {
         // к камере, чем ближняя, — на общей глубине это читается кляксой.
         // Вернуть можно, но только разведя ряды по renderOrder и высоте.
         for (const row of [0]) {
-          const rk = side + ':' + i + ':' + row;
+          // ★ СНЕГ ЗАПЕКАЕТСЯ В ВЕРШИНЫ, ПОЭТОМУ КЛЮЧ ЗНАЕТ ПРО СНЕГ. Сегменты
+          // строятся в первых кадрах — раньше, чем биом успевает объявить
+          // «снега нет», — и дальше живут в кэше как есть. На вулкане от этого
+          // на горизонте оставалась белая заснеженная вершина. Ключ с долей
+          // снега заставляет пересобрать сегмент, когда биом сменился.
+          const rk = side + ':' + i + ':' + row + ':' + Math.round(PALETTE.peakSnow * 8);
           if (this.live.has(rk)) continue;
           const m = this.build(side, i, row);
           this.live.set(rk, m);
@@ -194,9 +179,11 @@ export class Peaks {
         }
       }
     }
+    const snowKey = String(Math.round(PALETTE.peakSnow * 8));
     for (const [key, mesh] of this.live) {
-      const i = Number(key.split(':')[1]);
-      if (i >= i0 && i <= i1) continue;
+      const parts = key.split(':');
+      const i = Number(parts[1]);
+      if (i >= i0 && i <= i1 && parts[3] === snowKey) continue;
       this.group.remove(mesh);
       mesh.geometry.dispose();
       for (const ch of mesh.children) {
@@ -287,6 +274,8 @@ export class Peaks {
       // сахарную голову, а на восьмитысячнике верхушку выдувает до скалы.
       const scour = Math.max(0, Math.min(1, (p.t - 0.76) / 0.2));
       snowT *= 1 - scour * scour * (3 - 2 * scour) * 0.5;
+      // биом решает, есть ли снег вообще: на вулкане цепь голая
+      snowT *= PALETTE.peakSnow;
       c.copy(ROCK).lerp(SNOW, snowT);
       c.multiplyScalar(0.62 + lit * 0.62);
       c.lerp(GLOW, Math.max(0, lit) * hTop * 0.5);

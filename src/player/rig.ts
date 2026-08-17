@@ -1,4 +1,5 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { lambert } from '../core/mat';
 
 // Фигурка сноубордиста и доска. Стиль PSX: только коробки и плоские грани,
 // никаких скруглений — но деталей достаточно, чтобы читался человек, а не
@@ -12,11 +13,13 @@ import * as THREE from 'three';
  * шкала температуры, тем краснее и горячее выглядит сам райдер — на скорости
  * шкалу в углу не разглядываешь, а фигуру перед носом видно всегда.
  */
-const RIG_MATS: Array<{ m: THREE.MeshLambertMaterial; base: THREE.Color }> = [];
+const RIG_MATS: Array<{ m: THREE.MeshLambertNodeMaterial; base: THREE.Color; glow?: THREE.Color }> = [];
 
-function mat(color: number): THREE.MeshLambertMaterial {
-  const m = new THREE.MeshLambertMaterial({ color, flatShading: true });
-  RIG_MATS.push({ m, base: new THREE.Color(color) });
+function mat(color: number, glow?: number): THREE.MeshLambertNodeMaterial {
+  const m = lambert({ color, flatShading: true });
+  const g = glow !== undefined ? new THREE.Color(glow) : undefined;
+  if (g) m.emissive.copy(g);
+  RIG_MATS.push({ m, base: new THREE.Color(color), glow: g });
   return m;
 }
 
@@ -118,7 +121,11 @@ const PANTS_DARK = 0x1e2340;
 const SKIN = 0xe8b48e;
 const BOOT = 0x2b2b33;
 const BOARD_TOP = 0xff4d5a;
-const BOARD_BASE = 0x1d2030;
+// ★ СКОЛЬЗЯК СВЕТЛЫЙ И ЧУТЬ СВЕТИТСЯ. Чёрное днище на тёмном вулкане
+// исчезало вовсе — доска в воздухе читалась одним топшитом. Ледяной цвет плюс
+// слабое собственное свечение видны в любой тени.
+const BOARD_BASE = 0xbfe4ff;
+const BOARD_BASE_GLOW = 0x203a52;
 const BINDING = 0x23262f;
 const GOGGLE = 0x1b2430;
 const GOGGLE_LENS = 0x7fd4e8;
@@ -165,6 +172,8 @@ export class Rig {
     for (const e of RIG_MATS) {
       e.m.color.copy(e.base).lerp(HEAT_COL, k * 0.85);
       HEAT_EM.setRGB(1.5 * k * k, 0.25 * k * k, 0.05 * k * k);
+      // собственное свечение детали (скользяк) сохраняется под нагревом
+      if (e.glow) HEAT_EM.add(e.glow);
       e.m.emissive.copy(HEAT_EM);
     }
   }
@@ -297,7 +306,7 @@ export class Rig {
   private buildBoard(): THREE.Group {
     const g = new THREE.Group();
     const top = mat(BOARD_TOP);
-    const base = mat(BOARD_BASE);
+    const base = mat(BOARD_BASE, BOARD_BASE_GLOW);
     const edge = mat(0xdfe6f5);
     const binding = mat(BINDING);
 

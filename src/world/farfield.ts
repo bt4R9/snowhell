@@ -1,4 +1,5 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { lambert } from '../core/mat';
 import { terrainHeight, terrainColorAt } from './terrain';
 import { toValleyU } from './features';
 
@@ -46,11 +47,36 @@ const SINK2 = 20;
 // детальные чанки туда не достают — совпадать не с чем, прятать нечего.
 
 
+/**
+ * ★ ГРУБАЯ СЕТКА НЕ ИМЕЕТ ПРАВА БЫТЬ ВЫШЕ ЗЕМЛИ. Ячейка центральной сетки — 18 м,
+ * а ущелья на вулкане уже: ни один узел не попадает на дно, и поверхность
+ * дальнего плана протягивалась НАД трещиной, перекрывая её как крышка. Игрок
+ * видел это тёмной стеной ровно там, где пол сходится со стенами.
+ * Первый вариант брал минимум из пяти выборок высоты в каждом узле — и
+ * впятеро удорожал сборку (при 108 км/ч центр пересобирается каждые 40 м, замер:
+ * 13 мс на кадр). Теперь высота берётся один раз, а минимум — по соседним
+ * узлам уже готовой решётки: тот же эффект «нырнуть под деталь», ноль лишних
+ * выборок рельефа.
+ */
+function minFilter(h: number[], n: number): void {
+  const src = h.slice();
+  for (let j = 0; j < n; j++) {
+    for (let i = 0; i < n; i++) {
+      let m = src[j * n + i];
+      if (i > 0) m = Math.min(m, src[j * n + i - 1]);
+      if (i + 1 < n) m = Math.min(m, src[j * n + i + 1]);
+      if (j > 0) m = Math.min(m, src[(j - 1) * n + i]);
+      if (j + 1 < n) m = Math.min(m, src[(j + 1) * n + i]);
+      h[j * n + i] = m;
+    }
+  }
+}
+
 export class FarField {
   group = new THREE.Group();
 
   private blocks = new Map<string, THREE.Mesh>();
-  private mat = new THREE.MeshLambertMaterial({
+  private mat = lambert({
     vertexColors: true,
     flatShading: true,
     polygonOffset: true,
@@ -217,7 +243,7 @@ export class FarField {
       if (d < 230) return 0.3 + (1 - (d - 130) / 100) * 2.7;
       return 0.3;
     };
-    const end = Math.min(n * n, j.i + 420);
+    const end = Math.min(n * n, j.i + 120);
     for (let k = j.i; k < end; k++) {
       const i = k % n;
       const jj = (k / n) | 0;
@@ -229,6 +255,7 @@ export class FarField {
     if (end < n * n) return;
     this.centerX = j.cx;
     this.centerZ = j.cz;
+    minFilter(j.heights, n);
     const mesh = this.gridFromHeights(ox, oz, size, seg, j.heights);
     this.centerJob = null;
     if (this.center) {
@@ -275,6 +302,7 @@ export class FarField {
         h.push(terrainHeight(x, z) - sink(Math.hypot(x - mx, z - mz)));
       }
     }
+    minFilter(h, n);
     return this.gridFromHeights(ox, oz, size, seg, h);
   }
 
@@ -343,7 +371,7 @@ export class FarField {
   }
 
   /** для менеджера биомов: общая тонировка дальнего плана */
-  get material(): THREE.MeshLambertMaterial {
+  get material(): THREE.MeshLambertNodeMaterial {
     return this.mat;
   }
 }

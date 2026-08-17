@@ -1,4 +1,5 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { lambert } from '../core/mat';
 import { terrainHeight } from '../world/terrain';
 import { groundDip } from './ground';
 import { SURF_PACKED, SURF_POWDER, SURF_ICE, SURF_DIRT } from '../world/features';
@@ -106,7 +107,7 @@ export class Trail {
     this.geo.setAttribute('normal', new THREE.BufferAttribute(this.normals, 3));
     this.geo.setAttribute('color', new THREE.BufferAttribute(this.colors, 3));
     this.geo.setDrawRange(0, 0);
-    const mat = new THREE.MeshLambertMaterial({
+    const mat = lambert({
       vertexColors: true,
       side: THREE.DoubleSide,
       polygonOffset: true,

@@ -1,15 +1,25 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { Fn, float, vec3, uniform, instancedArray, instanceIndex, sin, round } from 'three/tsl';
+import { spriteCloud, SpriteCloud } from './sprites';
 
-// Спрей из-под доски + лёгкий снегопад вокруг камеры. Всё на THREE.Points.
+// Спрей из-под доски + лёгкий снегопад вокруг камеры.
+//
+// ★ WebGPU: обе системы — инстансированные спрайты (см. sprites.ts). Спрей
+// эмитится с CPU (его рождают события: приземление, поворот), а снегопад
+// СЧИТАЕТСЯ НА GPU: у него нет ни эмиссии, ни событий — только тысяча
+// хлопьев, которые падают, качаются и заворачиваются в коробку вокруг
+// камеры. Это ровно тот случай, ради которого нужен compute: буфер позиций
+// живёт в видеопамяти, шейдер сдвигает все хлопья за один вызов, и на CPU
+// не остаётся ни цикла, ни загрузки атрибута.
 
 const SPRAY_MAX = 900;
 
 export class Spray {
-  points: THREE.Points;
+  points: THREE.Sprite;
   /** ★ ЦВЕТ БРЫЗГ ЗАДАЁТ БИОМ. Из-под доски летит то, по чему едешь: на снегу
    * белая пыль, на вулкане — серый пепел. Белые брызги посреди пепла читались
    * снегом сильнее, чем любая другая деталь. */
-  private mat!: THREE.PointsMaterial;
+  private mat: THREE.PointsNodeMaterial;
 
   setTint(c: THREE.Color, opacity: number): void {
     this.mat.color.copy(c);
@@ -20,22 +30,21 @@ export class Spray {
   private velocities = new Float32Array(SPRAY_MAX * 3);
   private life = new Float32Array(SPRAY_MAX);
   private count = 0;
-  private geo = new THREE.BufferGeometry();
+  private cloud: SpriteCloud;
   private emitAcc = 0;
 
   constructor() {
-    this.geo.setAttribute('position', new THREE.BufferAttribute(this.positions, 3));
-    this.geo.setDrawRange(0, 0);
-    const mat = new THREE.PointsMaterial({
-      color: 0xffffff,
-      size: 0.11,
-      transparent: true,
-      opacity: 0.6,
-      depthWrite: false,
+    // PointsMaterial size=0.11 с аттенюацией: px = 0.11 × (полвысоты буфера) / dist
+    this.cloud = spriteCloud({
+      count: 0, pos: this.positions,
+      fixedSize: 0.11, k: 120, minPx: 0, maxPx: 1e4,
+      materialColor: true,
+      alpha: () => float(1.0),
     });
-    this.mat = mat;
-    this.points = new THREE.Points(this.geo, mat);
-    this.points.frustumCulled = false;
+    this.mat = this.cloud.material;
+    this.mat.color.set(0xffffff);
+    this.mat.opacity = 0.6;
+    this.points = this.cloud.sprite;
   }
 
   /** rate — частиц в секунду; вызывается каждый кадр пока едем */
@@ -81,8 +90,10 @@ export class Spray {
       this.positions[i * 3 + 1] += this.velocities[i * 3 + 1] * dt;
       this.positions[i * 3 + 2] += this.velocities[i * 3 + 2] * dt;
     }
-    this.geo.setDrawRange(0, this.count);
-    this.geo.attributes.position.needsUpdate = true;
+    // живых частиц — столько инстансов и рисуем; ноль инстансов — не рисуем вовсе
+    this.points.count = this.count;
+    this.points.visible = this.count > 0;
+    this.cloud.touch();
   }
 }
 
@@ -94,48 +105,63 @@ const BOX = new THREE.Vector3(64, 32, 64);
 
 export class Snowfall {
   /** для менеджера биомов: в воздухе не всегда снег — на вулкане это пепел */
-  readonly mat: THREE.PointsMaterial;
+  readonly mat: THREE.PointsNodeMaterial;
 
-  points: THREE.Points;
-  private positions = new Float32Array(FLAKES * 3);
-  private drift = new Float32Array(FLAKES);
-  private geo = new THREE.BufferGeometry();
+  points: THREE.Sprite;
+  private uCenter = uniform(new THREE.Vector3());
+  private uDt = uniform(0);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private kernel: any;
 
-  constructor(center: THREE.Vector3) {
+  constructor(center: THREE.Vector3, private renderer: THREE.WebGPURenderer) {
+    // стартовое облако считаем на CPU один раз — дальше буферы живут на GPU
+    const pos = new Float32Array(FLAKES * 3);
+    const drift = new Float32Array(FLAKES);
     for (let i = 0; i < FLAKES; i++) {
-      this.positions[i * 3] = center.x + (Math.random() - 0.5) * BOX.x;
-      this.positions[i * 3 + 1] = center.y + (Math.random() - 0.5) * BOX.y;
-      this.positions[i * 3 + 2] = center.z + (Math.random() - 0.5) * BOX.z;
-      this.drift[i] = 1.5 + Math.random() * 2.5;
+      pos[i * 3] = center.x + (Math.random() - 0.5) * BOX.x;
+      pos[i * 3 + 1] = center.y + (Math.random() - 0.5) * BOX.y;
+      pos[i * 3 + 2] = center.z + (Math.random() - 0.5) * BOX.z;
+      drift[i] = 1.5 + Math.random() * 2.5;
     }
-    this.geo.setAttribute('position', new THREE.BufferAttribute(this.positions, 3));
-    const mat = new THREE.PointsMaterial({
-      color: 0xffffff,
-      size: 0.075,
-      transparent: true,
-      opacity: 0.55,
-      depthWrite: false,
+    const posBuf = instancedArray(pos, 'vec3');
+    const driftBuf = instancedArray(drift, 'float');
+
+    // ★ ХЛОПЬЯ НЕПОДВИЖНЫ В МИРЕ и заворачиваются в box вокруг камеры (mod с
+    // сохранением мировой позиции). Один вызов на все хлопья.
+    const uCenter = this.uCenter;
+    const uDt = this.uDt;
+    this.kernel = Fn(() => {
+      const p = posBuf.element(instanceIndex);
+      const d = driftBuf.element(instanceIndex);
+      const i = float(instanceIndex);
+      const x = p.x.toVar();
+      const y = p.y.sub(d.mul(uDt)).toVar();
+      const z = p.z.toVar();
+      x.addAssign(sin(y.mul(0.5).add(i)).mul(uDt).mul(0.8));
+      x.subAssign(round(x.sub(uCenter.x).div(BOX.x)).mul(BOX.x));
+      y.subAssign(round(y.sub(uCenter.y).div(BOX.y)).mul(BOX.y));
+      z.subAssign(round(z.sub(uCenter.z).div(BOX.z)).mul(BOX.z));
+      p.assign(vec3(x, y, z));
+    })().compute(FLAKES);
+
+    // PointsMaterial size=0.075 с аттенюацией: px = 0.075 × (полвысоты буфера) / dist
+    const cloud = spriteCloud({
+      count: FLAKES,
+      positionNode: posBuf.toAttribute(),
+      fixedSize: 0.075, k: 120, minPx: 0, maxPx: 1e4,
+      materialColor: true,
+      alpha: () => float(1.0),
     });
-    this.mat = mat;
-    this.points = new THREE.Points(this.geo, mat);
-    this.points.frustumCulled = false;
+    this.mat = cloud.material;
+    this.mat.color.set(0xffffff);
+    this.mat.opacity = 0.55;
+    this.points = cloud.sprite;
   }
 
-  /** Хлопья неподвижны в мире и заворачиваются в box вокруг камеры */
+  /** сдвинуть хлопья на dt: один compute-вызов вместо цикла по 1100 точкам */
   update(dt: number, center: THREE.Vector3): void {
-    for (let i = 0; i < FLAKES; i++) {
-      let x = this.positions[i * 3];
-      let y = this.positions[i * 3 + 1] - this.drift[i] * dt;
-      let z = this.positions[i * 3 + 2];
-      x += Math.sin(y * 0.5 + i) * dt * 0.8;
-      // wrap в box вокруг камеры (mod с сохранением мировой позиции)
-      x -= Math.round((x - center.x) / BOX.x) * BOX.x;
-      y -= Math.round((y - center.y) / BOX.y) * BOX.y;
-      z -= Math.round((z - center.z) / BOX.z) * BOX.z;
-      this.positions[i * 3] = x;
-      this.positions[i * 3 + 1] = y;
-      this.positions[i * 3 + 2] = z;
-    }
-    this.geo.attributes.position.needsUpdate = true;
+    this.uCenter.value.copy(center);
+    this.uDt.value = dt;
+    void this.renderer.compute(this.kernel);
   }
 }

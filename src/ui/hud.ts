@@ -1,4 +1,6 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { basic, withUniforms, ShaderLike } from '../core/mat';
+import { Fn, If, uniform, uv, vec3, vec4, mix, smoothstep, clamp, select, Discard } from 'three/tsl';
 import { buildTextGeometry } from './font5x7';
 import { LandingQuality } from '../tricks';
 
@@ -8,7 +10,7 @@ import { LandingQuality } from '../tricks';
 
 class PixelText {
   mesh: THREE.Mesh;
-  private mat: THREE.MeshBasicMaterial;
+  private mat: THREE.MeshBasicNodeMaterial;
   private text = '';
   private width = 0;
   private x = 0;
@@ -24,7 +26,7 @@ class PixelText {
     private centeredGeo = false // геометрия вокруг центра — для pop-анимации
   ) {
     this.baseScale = scale;
-    this.mat = new THREE.MeshBasicMaterial({
+    this.mat = basic({
       color,
       transparent: true,
       opacity,
@@ -142,14 +144,14 @@ export class Hud {
   // состояние читаемым мгновенно — бегунок к центру зелёный, к краю красный.
   private balBg: THREE.Mesh;
   private balMark: THREE.Mesh;
-  private balMat: THREE.MeshBasicMaterial;
+  private balMat: THREE.MeshBasicNodeMaterial;
   // ★ ШКАЛА ПЕРЕГРЕВА. По расплаву можно проехать, но недолго: доска
   // раскаляется. Без шкалы это нечитаемо — игрок не знает, сколько у него
   // осталось, и смерть выглядит случайной. Полоса растёт быстро и остывает
   // медленно, поэтому она же и решает, стоит ли срезать через язык.
   private heatBg: THREE.Mesh;
   private heatFill: THREE.Mesh;
-  private heatMat: THREE.ShaderMaterial;
+  private heatMat: ShaderLike<THREE.MeshBasicNodeMaterial>;
   private heatT = 0;
 
   /**
@@ -161,7 +163,7 @@ export class Hud {
   private ovDim: THREE.Mesh;
   private ovLines: PixelText[];
   private ovTitle: PixelText;
-  private ovMat: THREE.MeshBasicMaterial;
+  private ovMat: THREE.MeshBasicNodeMaterial;
   private ovOn = false;
   /**
    * ★ ЗАПРЕТ СИЛЬНЕЕ ОДНОКРАТНОГО ПРЯТАНЬЯ. Строки поверхности (ACC/GRIP/DRAG)
@@ -192,7 +194,7 @@ export class Hud {
     this.score.setText('0');
     this.perf.setText('-- FPS');
 
-    this.ovMat = new THREE.MeshBasicMaterial({
+    this.ovMat = basic({
       color: 0x05040a,
       transparent: true,
       opacity: 0,
@@ -213,7 +215,7 @@ export class Hud {
 
     const barGeo = new THREE.PlaneGeometry(1, 1);
     const barMat = (opacity: number) =>
-      new THREE.MeshBasicMaterial({
+      basic({
         color: 0xffffff,
         transparent: true,
         opacity,
@@ -232,7 +234,7 @@ export class Hud {
     // казалось, что полоса уже полна
     this.heatBg = new THREE.Mesh(
       barGeo,
-      new THREE.MeshBasicMaterial({
+      basic({
         color: 0x14121a,
         transparent: true,
         opacity: 0.72,
@@ -246,35 +248,26 @@ export class Hud {
     // левый край зелёный, правый красный, и заполнение просто доходит до
     // нужного места. Переход ведём через янтарный — прямой лерп зелёного в
     // красный проходит через грязно-оливковый.
-    this.heatMat = new THREE.ShaderMaterial({
-      uniforms: { uFill: { value: 0 }, uBlink: { value: 1 } },
-      vertexShader: `
-        varying vec2 vUv;
-        void main() {
-          vUv = uv;
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        }
-      `,
-      fragmentShader: `
-        uniform float uFill;
-        uniform float uBlink;
-        varying vec2 vUv;
-        void main() {
-          if (vUv.x > uFill) discard;
-          vec3 green = vec3(0.22, 0.78, 0.34);
-          vec3 amber = vec3(0.98, 0.66, 0.13);
-          vec3 red   = vec3(0.92, 0.16, 0.12);
-          float t = clamp(vUv.x, 0.0, 1.0);
-          vec3 c = t < 0.5
-            ? mix(green, amber, smoothstep(0.0, 0.5, t))
-            : mix(amber, red, smoothstep(0.5, 1.0, t));
-          gl_FragColor = vec4(c, 0.95 * uBlink);
-        }
-      `,
-      transparent: true,
-      depthTest: false,
-      depthWrite: false,
-    });
+    {
+      const uFill = uniform(0);
+      const uBlink = uniform(1);
+      const m = new THREE.MeshBasicNodeMaterial({ transparent: true, depthTest: false, depthWrite: false });
+      m.colorNode = Fn(() => {
+        const x = uv().x;
+        If(x.greaterThan(uFill), () => Discard());
+        const green = vec3(0.22, 0.78, 0.34);
+        const amber = vec3(0.98, 0.66, 0.13);
+        const red = vec3(0.92, 0.16, 0.12);
+        const t = clamp(x, 0.0, 1.0);
+        const c = select(
+          t.lessThan(0.5),
+          mix(green, amber, smoothstep(0.0, 0.5, t)),
+          mix(amber, red, smoothstep(0.5, 1.0, t))
+        );
+        return vec4(c, uBlink.mul(0.95));
+      })();
+      this.heatMat = withUniforms(m, { uFill, uBlink });
+    }
     this.heatFill = new THREE.Mesh(barGeo, this.heatMat);
     this.heatBg.visible = false;
     this.heatFill.visible = false;

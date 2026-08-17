@@ -1,4 +1,5 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { Fn, If, floor, modelViewProjection, uniform } from 'three/tsl';
 
 // Дрожание вершин — главная примета PlayStation-графики.
 //
@@ -8,34 +9,27 @@ import * as THREE from 'three';
 // этого ощущения мало — оно даёт крупный пиксель, но геометрия остаётся
 // стеклянно-гладкой.
 //
-// Патчим глобальный чанк project_vertex — его используют ВСЕ встроенные
-// материалы, поэтому снег, деревья, скалы и рейлы дрожат согласованно. Это
-// важно: если привязать эффект к части материалов, на стыках разъедутся швы.
+// ★ WebGPU: глобального чанка project_vertex больше нет — у node-материалов
+// клип-позицию задаёт `vertexNode`. Поэтому один общий узел `psxVertex`
+// подставляется КАЖДОМУ материалу мира через фабрику `psx()` (см. core/mat.ts).
+// Смысл прежний: снег, деревья, скалы и рейлы дрожат согласованно, и на
+// стыках не разъезжаются швы — узел один и тот же, а не «похожий».
 //
-// ОРТОГРАФИЮ НЕ ТРОГАЕМ. HUD рисуется тем же MeshBasicMaterial, но своей
-// ортокамерой, и у неё w == 1. Округлять буквы по сетке нельзя — текст
-// начинает трястись и плыть. Условие w > 1.001 отделяет мир от интерфейса без
-// единого uniform'а: у перспективной камеры w — это глубина в метрах.
-//
-// Вызывать до первого рендера.
+// ОРТОГРАФИЮ НЕ ТРОГАЕМ. HUD рисуется своей ортокамерой, и у неё w == 1.
+// Округлять буквы по сетке нельзя — текст начинает трястись и плыть. Условие
+// w > 1.001 отделяет мир от интерфейса без единого флага: у перспективной
+// камеры w — это глубина в метрах.
 
 /** Сетка привязки в пикселях (ширина × высота). Меньше — грубее дрожание. */
-export function installVertexSnap(gridX = 220, gridY = 124): void {
-  THREE.ShaderChunk.project_vertex = /* glsl */ `
-vec4 mvPosition = vec4( transformed, 1.0 );
+export const SNAP_GRID = uniform(new THREE.Vector2(220, 124));
 
-#ifdef USE_INSTANCING
-  mvPosition = instanceMatrix * mvPosition;
-#endif
-
-mvPosition = modelViewMatrix * mvPosition;
-
-gl_Position = projectionMatrix * mvPosition;
-
-if ( gl_Position.w > 1.001 ) {
-  vec2 snapGrid = vec2( ${gridX.toFixed(1)}, ${gridY.toFixed(1)} );
-  vec2 ndc = gl_Position.xy / gl_Position.w;
-  gl_Position.xy = floor( ndc * snapGrid + 0.5 ) / snapGrid * gl_Position.w;
-}
-`;
-}
+/** Клип-позиция вершины, прибитая к сетке — общий vertexNode всех материалов мира */
+export const psxVertex = Fn(() => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const clip = (modelViewProjection as any).toVar();
+  If(clip.w.greaterThan(1.001), () => {
+    const ndc = clip.xy.div(clip.w);
+    clip.xy.assign(floor(ndc.mul(SNAP_GRID).add(0.5)).div(SNAP_GRID).mul(clip.w));
+  });
+  return clip;
+})();

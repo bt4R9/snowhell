@@ -21,6 +21,11 @@ export function worldSeed(): number {
   return SEED;
 }
 
+/** смещения шума от сида — GPU-порту noise2 нужны те же числа */
+export function noiseOffset(): { x: number; z: number } {
+  return { x: NOISE_OFF_X, z: NOISE_OFF_Z };
+}
+
 /** Детерминированная фаза из сида — для аналитических синусов мира */
 export function seedPhase(i: number): number {
   if (!phaseCache) {

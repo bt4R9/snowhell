@@ -1,6 +1,8 @@
-import * as THREE from 'three';
-import { noise2 } from './noise';
-import { PISTE_HALF_W, pisteCenterX, volcanoWeight } from './features';
+import * as THREE from 'three/webgpu';
+import { spriteCloud, SpriteCloud } from '../fx/sprites';
+import { lambert, basic, line } from '../core/mat';
+import { noise2, hash2 } from './noise';
+import { pisteCenterX, volcanoWeight } from './features';
 
 // ЛАВОВЫЕ ЯЗЫКИ.
 //
@@ -129,1146 +131,99 @@ export function ventFor(z: number): Vent | null {
 // строится один раз и стримится как скалы. Прежнее полотно пересобиралось
 // каждые 30 м пути — это и был спайк раз в секунду.
 
-/** Озеро расплава */
-export interface Lake {
-  /** насколько стена чаши выше зеркала — по ней считают, куда бросать искры */
-  wall?: number;
-  u: number;   // центр в координатах долины
-  z: number;
-  y: number;   // уровень поверхности (горизонталь)
-  r: number;   // радиус чаши
-  depth: number; // глубина по центру
-}
 
-const lakeCache = new Map<number, Lake[]>();
+// ─── ЛАВА ЖИВЁТ В pools.ts ─────────────────────────────────────────────────
+// Озёра, языки, провалы, их меши, шейдер и частицы переехали в world/pools.ts
+// (чаши строятся ПОД лаву явной формулой). Здесь остались тонкие делегаты для
+// физики и раскраски рельефа — чтобы игроку и терраину не менять импортов.
+import {
+  poolLevelAt, flowAt as poolFlowAt, poolHeatAt, poolCrustAt, poolListsFor,
+} from './pools';
 
 /**
- * ★ ЧАШУ ДЕЛАЕТ САМА ЛАВА. Замер показал очевидное, но упущенное: на склоне,
- * падающем полметра на метр, замкнутых впадин НЕТ — нижний край любого кольца
- * ниже центра, поэтому «налить озеро во впадину» было невозможно в принципе
- * (замер: ноль озёр на двадцати вулканах).
- *
- * В природе лавовое озеро и стоит не в случайной ямке, а в провале, который
- * расплав сам проплавил. Поэтому центры задаются ЧИСТО детерминированно, без
- * обращения к рельефу — иначе рекурсия: рельеф зависел бы от озёр, а озёра от
- * рельефа. Рельеф в этих местах проседает чашей, и уже в ней стоит
- * горизонтальная поверхность.
+ * Расплав под точкой (координаты долины): уровень зеркала озера/колодца — там
+ * доска ТОНЕТ; либо верх языка — по нему можно ехать. null — сухо.
  */
-// Шаг между озёрами. При 150 м чаши сливались в сплошной разлив: замер дал
-// лаву у трассы каждые 100 м, то есть раз в три секунды — склон тонул.
-// ★ ОЗЁР СТАЛО БОЛЬШЕ. Замер: пятнадцать штук на три километра спуска и 4.3%
-// коридора под расплавом — лава читалась редким событием, а не средой. Шаг
-// между чашами короче, поэтому цепочка озёр вдоль языка становится плотнее.
-const LAKE_STEP = 120;
-
-/** До этой отметки лавы нет: игроку нужен разгон, а не смерть на старте */
-const LAVA_START = 620;
-
-/** Запас глубины котлована сверх зеркала: борт должен быть выше лавы */
-const POOL_D = 26;
-/**
- * На сколько метров от низшей точки дна налито озеро.
- * ★ НАЛИВ ЖЁСТКО СВЯЗАН С ГЛУБИНОЙ КОТЛОВАНА. Котлован вырыт на POOL_D ниже
- * окрестной земли, и налив ОБЯЗАН быть меньше: иначе зеркало встаёт выше
- * кромки и расплав ложится куполом поверх склона — ровно это и вышло, когда я
- * поставил сорок метров при борте в двадцать шесть. Наливаем до восьмидесяти
- * пяти процентов чаши: полно, но борт всегда выше.
- */
-/** какая доля площади чаши должна оказаться под расплавом */
-const POOL_COVER = 0.72;
-/** докуда ищем перевал впадины, м */
-const BASIN_R = 150;
-/** высота вала застывшей корки ниже по склону — он и замыкает чашу */
-const DAM_H = 26;
-
-// ★ ЦЕНТРЫ КЭШИРУЮТСЯ. Просадку под озером спрашивает ФУНКЦИЯ ВЫСОТЫ, то есть
-// миллионы раз за кадр; без кэша каждый такой вызов заново строил массив со
-// своим шумом. Замер до кэша: p95 кадра 42.7 мс при медиане 11.9 — это и был
-// спайк.
-const centerCache = new Map<number, Array<{ u: number; z: number; r: number }>>();
-
-/** Центры озёр вулкана: путь от бокового разрыва вниз, без выборок рельефа */
-export function lakeCenters(v: Vent): Array<{ u: number; z: number; r: number }> {
-  const hit = centerCache.get(v.k);
-  if (hit) return hit;
-  const out: Array<{ u: number; z: number; r: number }> = [];
-  // ★ ЧИСТЫЙ РАЗГОН. Замер прогона с нуля: первое озеро ложилось в 80 м от
-  // старта, игрок плавился на пятой секунде и дальше не уезжал вовсе.
-  // Первые метры спуска — без лавы, иначе биом начинается со смерти.
-  const axis0 = pisteCenterX(v.z);
-  const toward = v.u > axis0 ? -1 : 1;
-  const u0 = v.u + toward * v.coneR * 0.85;
-  const n = Math.max(1, Math.floor(v.reach / LAKE_STEP));
-  for (let i = 0; i < n; i++) {
-    const t = (i + 1) / n;
-    const z = v.z + v.coneR * 0.25 + i * LAKE_STEP;
-    if (z < LAVA_START) continue;
-    // ★ ЛАВА ЖИВЁТ ТОЛЬКО В ЯДРЕ БИОМА. На стыке со снежным вес вулкана
-    // падает плавно, и вместе с ним ИСЧЕЗАЕТ ПРОСАДКА рельефа под чашей — а
-    // само зеркало нет: озеро оставалось стоять на снегу, будто наклеенное.
-    // Поэтому чаши и языки просто не заводятся там, где вес уже не полный.
-    // проверяем и дальний край чаши: иначе озеро краем заходит в зону, где
-    // просадка уже ослаблена, и этот край приподнимается над землёй
-    if (volcanoWeight(z) < 0.85 || volcanoWeight(z + 80) < 0.85) continue;
-    // Поток сходит от разрыва к оси долины: она и есть низина (замер рельефа —
-    // борта на ±900 м выше оси на две сотни метров). Но НЕ ложится на ось:
-    // при полном сходе лава шла ровно по линии спуска, и «ехать прямо»
-    // означало ехать по расплаву. Пересекать поток поперёк — интереснее, чем
-    // тащиться вдоль него.
-    const pull = t * t * (3 - 2 * t);
-    let u = u0 + (pisteCenterX(z) - u0) * pull * 0.95 + noise2(z * 0.006 + v.ph, 4.4) * 55;
-    const r = 24 + (noise2(z * 0.01 - v.ph, 8.8) * 0.5 + 0.5) * 14;
-    // ★ ЧАША НЕ ЛОЖИТСЯ НА ЛИНИЮ СПУСКА. Озеро тянулось к оси долины и в конце
-    // доставало до неё вплотную — замер поймал две ловушки на трёх километрах
-    // трассы: чаши в 26 и 35 м от оси с выездом наверх 96 и 22 м, то есть
-    // стеной. Провал глубиной с девятиэтажку прямо по курсу — это не опасность,
-    // которую объезжают, а тупик. Отжимаем центр так, чтобы КРАЙ чаши не
-    // доставал до ездового коридора: лава остаётся вплотную к линии, но сама
-    // линия остаётся проезжей.
-    const axis = pisteCenterX(z);
-    const keep = PISTE_HALF_W * 0.95 + r * 1.6;
-    const off = u - axis;
-    if (Math.abs(off) < keep) u = axis + (off >= 0 ? keep : -keep);
-    out.push({ u, z, r });
-  }
-  centerCache.set(v.k, out);
-  if (centerCache.size > 512) centerCache.clear();
-  return out;
-}
-
-/**
- * Просадка рельефа под озером. Вызывается из функции высоты, поэтому не имеет
- * права трогать саму высоту — только детерминированные центры.
- */
-/**
- * ★ ПРОПАСТЬ В КОНЦЕ ЦЕПИ. Расплав должен куда-то деваться, иначе цепь озёр
- * просто обрывается. В конце пути вулкана рельеф проваливается колодцем с
- * крутыми стенками, на дне стоит лава, и в неё с борта льётся водопад.
- */
-// ★ И ЭТОТ СПИСОК КЭШИРУЕТСЯ. Сливы спрашивает функция высоты, то есть
-// миллионы раз за кадр; без кэша каждый вызов заново строил массив с шумом —
-// ровно та же ошибка, что была с центрами озёр.
-const chasmCache = new Map<number, Array<Chasm | null>>();
-
-export interface Chasm { u: number; z: number; r: number; depth: number }
-
-export function chasmsOf(v: Vent): Array<Chasm | null> {
-  const hit = chasmCache.get(v.k);
-  if (hit) return hit;
-  // Сток отвечает на вопрос «куда девается расплав»: один колодец на весь
-  // вулкан только откладывал его.
-  // ★ НО НЕ У КАЖДОГО ОЗЕРА. Слив под каждой чашей делал их одинаковыми:
-  // всегда чаша плюс дыра. Часть котловин — просто стоячий расплав.
-  const out: Array<Chasm | null> = lakeCenters(v).map((c, i) => {
-    if (noise2(i * 9.1 + v.ph * 2, 6.3) < -0.05) return null;
-    // ★ КОЛОДЕЦ НЕ МЕНЬШЕ ШЕСТИ ЯЧЕЕК РЕЛЬЕФА. Сетка чанка — 3 м, и слив
-    // радиусом в десяток метров вырождался в угловатый многоугольник, а лава
-    // на его дне — в треугольную кляксу.
-    // Слив соразмерен чаше: крупный съедал её целиком, мелкий вырождался на
-    // сетке рельефа в угловатый многоугольник.
-    const r = 11 + (noise2(i * 5.5 + v.ph, 3.3) * 0.5 + 0.5) * 7;
-    // ★ СЛИВ ВПРИТЫК К ОЗЕРУ. Раньше он стоял на 1.15 радиуса чаши, и между
-    // берегом и колодцем оставалась полоса голой земли: озеро никуда не
-    // впадало, слив просто лежал рядом.
-    // ★ КОЛОДЕЦ ВНУТРИ ОЗЕРА, А НЕ ЗА ЕГО БОРТОМ. Выравнивание дна поднимает
-    // низ котлована — получается перемычка, и слив, поставленный за ней,
-    // оказывался отделён от лавы полосой сухой земли (замер: 16 м медианы).
-    // Сток стоит в нижней части самого дна: озеро окружает его и стекает в
-    // него через край.
-    const d = c.r * 0.55;
-    const ang = noise2(i * 3.7 + v.ph, 1.1) * 0.45; // ±0.22 рад от «вниз по склону»
-    return {
-      u: c.u + Math.sin(ang) * d,
-      z: c.z + Math.cos(ang) * d,
-      r,
-      depth: 42 + (noise2(i * 7.7 + v.ph, 9.1) * 0.5 + 0.5) * 34,
-    };
-  });
-  chasmCache.set(v.k, out);
-  if (chasmCache.size > 512) chasmCache.clear();
-  return out;
-}
-
-export function chasmOf(v: Vent): { u: number; z: number; r: number; depth: number } {
-  const cs = lakeCenters(v);
-  const last = cs[cs.length - 1];
-  return {
-    u: last.u,
-    z: last.z + LAKE_STEP * 0.9,
-    // ★ ЭТО СЛИВ, А НЕ КАНЬОН. Не котлован на полкилометра, а узкий отвесный
-    // колодец, куда уходит расплав из нижнего озера.
-    r: 16 + (noise2(v.k * 5.5, 3.3) * 0.5 + 0.5) * 14,
-    depth: 45 + (noise2(v.k * 7.7, 9.1) * 0.5 + 0.5) * 35,
-  };
-}
-
-/**
- * ★ ПРОСАДКА ИЩЕТСЯ ПО КОРЗИНАМ, А НЕ ПЕРЕБОРОМ. Это САМАЯ горячая функция в
- * игре: она внутри функции высоты, то есть её зовут миллионы раз за кадр —
- * из чанков, дальнего плана, физики, постройки лавы. После уплотнения озёр
- * (шаг 175 м) на каждую выборку приходилось под сотню проверок, и подорожало
- * ВСЁ разом: замер поймал постройку озера в 31 мс и чанк в 23. Чаши и колодцы
- * разложены по 128-метровым корзинам вдоль z — остаётся несколько проверок.
- */
-const BOWL_CELL = 128;
-type BowlItem = { u: number; z: number; r: number; depth: number; well: boolean };
-const bowlCache = new Map<number, Map<number, BowlItem[]>>();
-
-function bowlBuckets(v: Vent): Map<number, BowlItem[]> {
-  const hit = bowlCache.get(v.k);
-  if (hit) return hit;
-  const m = new Map<number, BowlItem[]>();
-  const put = (it: BowlItem, reach: number): void => {
-    const j0 = Math.floor((it.z - reach) / BOWL_CELL);
-    const j1 = Math.floor((it.z + reach) / BOWL_CELL);
-    for (let j = j0; j <= j1; j++) {
-      const arr = m.get(j);
-      if (arr) arr.push(it);
-      else m.set(j, [it]);
-    }
-  };
-  for (const c of lakeCenters(v)) {
-    put({ u: c.u, z: c.z, r: c.r * 1.7, depth: POOL_D, well: false }, c.r * 1.7);
-  }
-  for (const ch of chasmsOf(v)) {
-    if (!ch) continue;
-    put({ u: ch.u, z: ch.z, r: ch.r * 1.15, depth: ch.depth, well: true }, ch.r * 1.15);
-  }
-  bowlCache.set(v.k, m);
-  if (bowlCache.size > 512) bowlCache.clear();
-  return m;
-}
-
-export function lavaBowl(u: number, z: number): number {
-  const k0 = Math.floor(z / VENT_STEP);
-  const cell = Math.floor(z / BOWL_CELL);
-  let d = 0;
-  for (let k = k0 - 3; k <= k0 + 1; k++) {
-    const v = ventAt(k);
-    if (!v) continue;
-    // грубый отсев по всему вулкану до заглядывания в корзины
-    if (z < v.z - 200 || z > v.z + v.reach + 200) continue;
-    const arr = bowlBuckets(v).get(cell);
-    if (!arr) continue;
-    for (const it of arr) {
-      const du = u - it.u;
-      const dz = z - it.z;
-      if (du > it.r || du < -it.r || dz > it.r || dz < -it.r) continue;
-      const dist = Math.sqrt(du * du + dz * dz);
-      if (dist > it.r) continue;
-      if (it.well) {
-        // ★ СТЕНКИ ОТВЕСНЫЕ: спуск укладывается в полосу около метра, иначе
-        // вокруг колодца шла сухая кайма шириной в несколько метров.
-        const t = 1 - dist / it.r;
-        const w = Math.min(1, t / 0.09);
-        d -= it.depth * (w * w * (3 - 2 * w));
-      } else {
-        // Чаша пологая: выравнивать дно под горизонтальное зеркало нельзя —
-        // при уклоне 0.667 м/м это давало воронки под сто метров глубиной.
-        const t = 1 - dist / it.r;
-        const w = t * t * (3 - 2 * t);
-        d -= it.depth * w * w;
-        // ★ ПЕРЕМЫЧКА НИЖЕ ПО СКЛОНУ. Без неё чаша на склоне 0.667 м/м не
-        // замкнута: её низовой борт лежит НИЖЕ дна, расплаву не в чем стоять,
-        // и озеро либо висит плитой над уходящей землёй, либо исчезает вовсе
-        // (замер: после привязки уровня к борту не осталось ни одного озера).
-        // Настоящее лавовое озеро и стоит за валом собственной застывшей
-        // корки — вот он.
-        if (dz > 0) {
-          // высота вала задана размером чаши: на уклоне 0.667 м/м низовой
-          // борт лежит примерно на 0.9 радиуса ниже верхового, и меньшая
-          // перемычка чашу не замыкает
-          const dam = (it.r / 1.7) * 1.15;
-          const lip = Math.max(0, 1 - Math.abs(t - 0.24) / 0.26);
-          const far = Math.min(1, dz / (it.r * 0.5));
-          // ★ ВАЛ НЕ ПЕРЕГОРАЖИВАЕТ ТРАССУ. Он высотой в шестнадцать метров, и
-          // юбкой доставал до ездового коридора — замер ловил ровно эту ступень
-          // поперёк линии спуска (подъём 16 м на 12 м пути). В коридоре вал
-          // сходит на нет; уровень озера это учитывает сам, потому что он
-          // считается по самой низкой седловине борта — расплав просто встаёт
-          // ниже и подходит к трассе краем, а не стеной.
-          const lat = Math.abs(u - pisteCenterX(z));
-          const near = Math.max(0, Math.min(1, 1 - (lat - PISTE_HALF_W) / 26));
-          d += dam * lip * lip * far * (1 - near);
-        }
-      }
-    }
-  }
-  return d;
-}
-
-
-/** Озёра вулкана: наполняем проплавленные чаши до уровня ниже борта */
-/**
- * ★ ОЗЕРО НЕ МОЖЕТ СТОЯТЬ ВЫШЕ СВОЕГО БЕРЕГА.
- * Прежний уровень наливался от дна на фиксированную высоту, и на склоне в
- * 0.667 м/м зеркало сплошь и рядом оказывалось выше низового борта: плоская
- * плита висела над уходящей землёй, а меш обрубался по глубине — отсюда
- * «лава висит в воздухе» (замер: 71% вершин озёр выше земли на 2+ м, p95 —
- * 21.8 м). Теперь уровень задаёт САМЫЙ НИЗКИЙ борт: выше него налить нельзя.
- * Если чаша не держит хотя бы метр — озера здесь просто нет.
- */
-export function lakesOf(
-  v: Vent,
-  ground: (x: number, z: number) => number,
-  toWorldX: (u: number, z: number) => number
-): Lake[] {
-  const hit = lakeCache.get(v.k);
-  if (hit) return hit;
-  const out: Lake[] = [];
-  const cs = lakeCenters(v);
-  const chs = chasmsOf(v);
-  for (let i = 0; i < cs.length; i++) {
-    const c = cs[i];
-    const ch = chs[i];
-    const R = c.r * 1.25;
-    // ★ ЧАША СЧИТАЕТСЯ ВОКРУГ НАСТОЯЩЕГО ДНА, А НЕ ВОКРУГ ЗАДАННОГО ЦЕНТРА.
-    // Центр озера берётся из генератора и с формой рельефа связан лишь примерно:
-    // если яма смещена, лучи в одну сторону уходят далеко, в другую упираются
-    // сразу, медиана даёт большой радиус — а залитой оказывается узкая долька.
-    // Замер поймал это по глубине: мелкие чаши (11–22 м) залиты на 61–77%, а
-    // глубокие (63–81 м) — на 12–19%, потому что чем глубже яма, тем сильнее
-    // она смещена относительно номинального центра. Сначала находим дно.
-    let cu = c.u;
-    let cz = c.z;
-    {
-      let bestY = Infinity;
-      let bu = c.u;
-      let bz = c.z;
-      for (let a2 = 0; a2 < 8; a2++) {
-        const an = (a2 / 8) * Math.PI * 2;
-        for (let t = 0; t <= R; t += R / 3) {
-          const pu = c.u + Math.cos(an) * t;
-          const pz = c.z + Math.sin(an) * t;
-          const g = ground(toWorldX(pu, pz), pz);
-          if (g < bestY) {
-            bestY = g;
-            bu = pu;
-            bz = pz;
-          }
-        }
-      }
-      // сдвигаемся не до конца: центр из генератора всё же держит озеро
-      // подальше от трассы, и совсем отпускать его нельзя
-      cu = c.u + (bu - c.u) * 0.7;
-      cz = c.z + (bz - c.z) * 0.7;
-    }
-    // дальше этого впадину не считаем: за сотней метров это уже склон, а не чаша
-    // 1. борт: самая низкая земля по кромке чаши
-    // ★ БОРТ — ЭТО ПЕРЕВАЛ ВПАДИНЫ, А НЕ КОЛЬЦО ВОКРУГ ЛУЖИ. Я мерил кромку на
-    // полутора радиусах озера — но сама впадина в разы больше, и расплав
-    // оставался лужей на её дне при пустой чаше вокруг. Настоящий уровень
-    // налива — это высота самой низкой седловины, через которую расплав
-    // перелился бы наружу. Идём лучами наружу, запоминаем наибольшую высоту по
-    // пути (это гребень) и прекращаем, когда за гребнем земля пошла вниз;
-    // минимум таких гребней по всем лучам и есть перевал.
-    let rim = Infinity;
-    for (let a2 = 0; a2 < 20; a2++) {
-      const an = (a2 / 20) * Math.PI * 2;
-      const dx = Math.cos(an);
-      const dz = Math.sin(an);
-      let ridge = -Infinity;
-      for (let t = 6; t <= BASIN_R; t += 7) {
-        const pu = cu + dx * t;
-        const pz = cz + dz * t;
-        const g = ground(toWorldX(pu, pz), pz);
-        if (g > ridge) ridge = g;
-        // спустились заметно ниже гребня — значит перевал пройден
-        else if (g < ridge - 4) break;
-      }
-      if (ridge < rim) rim = ridge;
-    }
-    // ★ УРОВЕНЬ СЧИТАЕТСЯ ПО ФОРМЕ ЧАШИ, А НЕ ОТ ЕЁ ДНА. Налив «столько-то
-    // метров от самой низкой точки» верен только для цилиндра, а чаша — воронка:
-    // замер поймал, что из 323 узлов внутри озера 219 оказывались СУШЕЙ ВЫШЕ
-    // ЗЕРКАЛА, и от расплава оставался серп у самого колодца. Собираем высоты
-    // по всей площади и ставим зеркало так, чтобы под ним оказалась заданная
-    // доля этой площади: тогда чаша выглядит налитой при любом профиле.
-    const hs: number[] = [];
-    let floor = Infinity;
-    for (let a2 = 0; a2 < 16; a2++) {
-      const an = (a2 / 16) * Math.PI * 2;
-      for (const rf of [0.12, 0.34, 0.55, 0.74, 0.9]) {
-        const pu = cu + Math.cos(an) * R * rf;
-        const pz = cz + Math.sin(an) * R * rf;
-        if (ch && Math.hypot(pu - ch.u, pz - ch.z) < ch.r * 1.4) continue;
-        const g = ground(toWorldX(pu, pz), pz);
-        hs.push(g);
-        if (g < floor) floor = g;
-      }
-    }
-    if (!isFinite(floor)) floor = ground(toWorldX(cu, cz), cz);
-    hs.sort((a2, b2) => a2 - b2);
-    // под зеркалом — POOL_COVER площади чаши
-    const cover = hs.length ? hs[Math.min(hs.length - 1, Math.floor(hs.length * POOL_COVER))] : floor;
-    // ★ УРОВЕНЬ ЗАДАЁТ БОРТ, А РАДИУС ПОДСТРАИВАЕТСЯ ПОД УРОВЕНЬ. Я дважды
-    // пытался налить чашу до заданной доли площади при фиксированном радиусе —
-    // и оба раза получал либо сушу внутри озера (замер: 68% площади выше
-    // зеркала), либо расплав выше кромки (замер: борт ниже зеркала у 12 озёр
-    // из 14). Причина одна: круг радиуса R — не котловина, а просто круг на
-    // склоне. Поэтому уровень ставит кромка (только она отвечает за перелив),
-    // а границей озера становится ТА ЛИНИЯ, ГДЕ ЗЕМЛЯ ВЫХОДИТ ИЗ-ПОД ЗЕРКАЛА.
-    // ★ ЧУТЬ НИЖЕ ПЕРЕВАЛА. Вровень с седловиной расплав стоял впритык к
-    // краю и выглядел готовым перелиться; пара метров запаса читается как
-    // «налито почти доверху», но берег остаётся берегом.
-    const level = rim - 2.4;
-    const depth = level - floor;
-    if (depth < 1.2) continue; // чаша не держит расплав — озера нет
-    // радиус залива: по лучам ищем, где земля выходит выше зеркала, и берём
-    // медиану — одна пологая сторона не должна обрезать всё озеро
-    const reach: number[] = [];
-    for (let a2 = 0; a2 < 16; a2++) {
-      const an = (a2 / 16) * Math.PI * 2;
-      let rr = BASIN_R;
-      for (let t = 4; t <= BASIN_R; t += 5) {
-        const pu = cu + Math.cos(an) * t;
-        const pz = cz + Math.sin(an) * t;
-        if (ground(toWorldX(pu, pz), pz) > level) {
-          rr = t - 1.5;
-          break;
-        }
-      }
-      reach.push(rr);
-    }
-    reach.sort((a2, b2) => a2 - b2);
-    const rFill = reach[Math.floor(reach.length / 2)];
-    if (rFill < 6) continue; // лужа меньше доски — не озеро
-    // ★ ВЫСОТА СТЕНЫ НУЖНА ИСКРАМ. Из ямы наружу видно только то, что
-    // поднялось выше её края; без этого числа брызги остаются внутри чаши.
-    let wall = 0;
-    for (let a2 = 0; a2 < 12; a2++) {
-      const an = (a2 / 12) * Math.PI * 2;
-      const pu = cu + Math.cos(an) * rFill * 1.3;
-      const pz = cz + Math.sin(an) * rFill * 1.3;
-      wall += Math.max(0, ground(toWorldX(pu, pz), pz) - level);
-    }
-    wall /= 12;
-    out.push({ u: cu, z: cz, y: level, r: rFill, depth, wall });
-  }
-  // на дне каждого слива стоит расплав — туда озеро и стекает
-  for (const ch of chs) {
-    if (!ch) continue;
-    const gb = ground(toWorldX(ch.u, ch.z), ch.z);
-    let rimB = Infinity;
-    for (let a2 = 0; a2 < 12; a2++) {
-      const an = (a2 / 12) * Math.PI * 2;
-      const pu = ch.u + Math.cos(an) * ch.r * 0.8;
-      const pz = ch.z + Math.sin(an) * ch.r * 0.8;
-      const g = ground(toWorldX(pu, pz), pz);
-      if (g < rimB) rimB = g;
-    }
-    const lvl = Math.min(rimB - 0.3, gb + 5);
-    if (lvl - gb < 0.8) continue;
-    out.push({ u: ch.u, z: ch.z, y: lvl, r: ch.r * 0.85, depth: lvl - gb });
-  }
-  lakeCache.set(v.k, out);
-  // ★ КЭШ НЕ СБРАСЫВАЕТСЯ ЦЕЛИКОМ. clear() на переполнении означал, что в один
-  // кадр разом теряются ВСЕ соседние участки и каждый пересчитывается заново —
-  // а один участок стоит сотни миллисекунд. Выкидываем только самое старое.
-  if (lakeCache.size > 512) {
-    let drop = 256;
-    for (const key of lakeCache.keys()) {
-      if (drop-- <= 0) break;
-      lakeCache.delete(key);
-    }
-  }
-  return out;
-}
-
-export function lakesNear(
-  z: number,
-  ground: (x: number, zz: number) => number,
-  toWorldX: (u: number, zz: number) => number,
-  range = 400
-): Lake[] {
-  const k0 = Math.floor(z / VENT_STEP);
-  const out: Lake[] = [];
-  const kBack = Math.ceil(range / VENT_STEP) + 2;
-  for (let k = k0 - kBack; k <= k0 + 1; k++) {
-    const v = ventAt(k);
-    if (!v) continue;
-    for (const l of lakesOf(v, ground, toWorldX)) {
-      if (Math.abs(l.z - z) < range) out.push(l);
-    }
-  }
-  return out;
-}
-
-/**
- * Расплав в точке: уровень озера, если точка внутри чаши и земля ниже уровня.
- * Поверхность строго горизонтальна — это и делает её гладкой.
- */
-/**
- * ★ ПОТОК ПОВЕРХ СКЛОНА. Озеро обязано лежать в углублении: у жидкости
- * зеркало горизонтально, а замер рельефа даёт перепад 22…60 м на пятне в 50 м
- * (ноль ровных площадок из 1008 проб) — плоский диск на таком склоне одним
- * краем уходит под землю, другим повисает. Но из ямы лаву не видно издалека, а
- * видно должно быть.
- *
- * Поток эту проблему не имеет, потому что он НЕ горизонтален: он течёт вдоль
- * склона и лежит на нём телом толщиной в пару метров. Ключ к тому, чтобы это
- * читалось жидкостью, — поверхность потока ГЛАДЧЕ рельефа: он засыпает мелкие
- * ямки и обтекает бугры, а не повторяет каждую складку (именно повторение
- * складок губило все прежние попытки). Поэтому высота берётся не от земли под
- * точкой, а от земли, усреднённой вдоль пути, и принудительно не возрастает.
- */
-export interface FlowNode {
-  u: number;
-  z: number;
-  y: number;   // верх расплава
-  w: number;   // средняя полуширина (для грубых проверок)
-  wl: number;  // полуширина влево — своя, потому что склон с боков разный
-  wr: number;  // и вправо
-  al: number;  // вылет фартука влево
-  ar: number;  // и вправо
-  t: number;   // толщина тела
-}
-
-const flowCache = new Map<number, FlowNode[]>();
-
-/** Осевая линия потока: боковой разрыв конуса → центры озёр */
-function flowSpine(v: Vent): Array<{ u: number; z: number }> {
-  const cs = lakeCenters(v);
-  if (!cs.length) return [];
-  const axis0 = pisteCenterX(v.z);
-  const toward = v.u > axis0 ? -1 : 1;
-  const pts = [{ u: v.u + toward * v.coneR * 0.8, z: v.z + v.coneR * 0.22 }];
-  for (const c of cs) pts.push({ u: c.u, z: c.z });
-  // хвост ниже последнего озера: поток не обрывается ровно по озеру
-  const last = pts[pts.length - 1];
-  pts.push({ u: last.u + (pisteCenterX(last.z + 160) - last.u) * 0.3, z: last.z + 160 });
-  return pts.filter((p) => p.z >= LAVA_START - 60);
-}
-
-const FLOW_STEP = 11;
-
-export function flowOf(
-  v: Vent,
-  ground: (x: number, z: number) => number,
-  toWorldX: (u: number, z: number) => number
-): FlowNode[] {
-  const hit = flowCache.get(v.k);
-  if (hit) return hit;
-  const spine = flowSpine(v);
-  const out: FlowNode[] = [];
-  if (spine.length < 2) {
-    flowCache.set(v.k, out);
-    return out;
-  }
-  // 1. пересемплировали осевую с мелким шагом и сгладили углы на стыках
-  const raw: Array<{ u: number; z: number }> = [];
-  for (let i = 0; i < spine.length - 1; i++) {
-    const a = spine[i];
-    const b = spine[i + 1];
-    const n = Math.max(1, Math.round((b.z - a.z) / FLOW_STEP));
-    for (let j = 0; j < n; j++) {
-      const t = j / n;
-      raw.push({ u: a.u + (b.u - a.u) * t, z: a.z + (b.z - a.z) * t });
-    }
-  }
-  raw.push(spine[spine.length - 1]);
-  const path: Array<{ u: number; z: number }> = [];
-  for (let i = 0; i < raw.length; i++) {
-    let su = 0;
-    let n = 0;
-    for (let d = -3; d <= 3; d++) {
-      const j = i + d;
-      if (j < 0 || j >= raw.length) continue;
-      su += raw[j].u;
-      n++;
-    }
-    path.push({ u: su / n, z: raw[i].z });
-  }
-  // 2. высота: ВЕРХНЯЯ ОГИБАЮЩАЯ, а не средняя. По средней половина ленты
-  // уходила под бугры (замер: 28 узлов из 53 погребены). Расплав ведёт себя
-  // иначе: мелкие ямы он засыпает, над буграми утончается, но не прячется.
-  // Поэтому берём максимум земли поперёк всей ширины, а затем идём от низа
-  // потока вверх суффиксным максимумом — так поверхность гарантированно
-  // не возрастает вверх по склону и нигде не ныряет под склон.
-  const env: number[] = [];
-  const gc: number[] = [];
-  for (let i = 0; i < path.length; i++) {
-    const p = path[i];
-    const w = 7 + (noise2(p.z * 0.013 - v.ph, 6.6) * 0.5 + 0.5) * 9;
-    const nu = i > 0 ? p.z - path[i - 1].z : 1;
-    const nz = i > 0 ? -(p.u - path[i - 1].u) : 0;
-    const ln = Math.hypot(nu, nz) || 1;
-    let e = -Infinity;
-    // берём огибающую по СЕРЕДИНЕ ленты, а не по самым краям: иначе один
-    // бугор под кромкой поднимает всю ленту, и она встаёт над склоном стеной
-    for (const off of [-0.55, -0.25, 0, 0.25, 0.55]) {
-      const pu = p.u + (nu / ln) * off * w;
-      const pz = p.z + (nz / ln) * off * w;
-      e = Math.max(e, ground(toWorldX(pu, pz), pz));
-    }
-    env.push(e + 0.7);
-    gc.push(ground(toWorldX(p.u, p.z), p.z));
-  }
-  // ★ НАД ПРОВАЛОМ ЛЕНТА РВЁТСЯ. Суффиксный максимум по-честному моделирует
-  // жидкость: перед ямой она копится, пока не переполнит. Но наши ямы — это
-  // сливы, они расплав ГЛОТАЮТ. Без разрыва поток перекрывал котлован телом в
-  // 170 м толщиной (замер) — вместо провала получалась пробка. Узлы, где
-  // требуемая толщина больше предела, помечаем дырой: там лента кончается, а
-  // дальше видно озеро и колодец.
-  const MAX_FILL = 5;
-  const y: number[] = new Array(path.length);
-  const hole: boolean[] = new Array(path.length).fill(false);
-  for (let pass = 0; pass < 2; pass++) {
-    let run = -Infinity;
-    for (let i = path.length - 1; i >= 0; i--) {
-      if (hole[i]) {
-        run = -Infinity;
-        y[i] = env[i];
-        continue;
-      }
-      run = Math.max(env[i], run);
-      y[i] = run;
-    }
-    for (let i = 0; i < path.length; i++) {
-      if (y[i] - gc[i] > MAX_FILL) hole[i] = true;
-    }
-  }
-  // 3. ШИРИНА КАЖДОГО БОКА ЗАМЕРЯЕТСЯ ОТДЕЛЬНО.
-  // ★ Прямоугольная лента постоянной ширины — это и была «геометрия из
-  // прямоугольников»: у настоящего потока язык то раздаётся долей, то
-  // сжимается в горловину, и берега у него разные, потому что слева и справа
-  // разный склон. Заодно это лечит зависание края: вбок идём ровно до того
-  // места, где земля поднимается к зеркалу, а фартук ведём до касания.
-  // ★ ПОТОК РАСТЁТ ДОЛЯМИ, А НЕ ТЯНЕТСЯ ЛЕНТОЙ.
-  // Ровная полоса 500×20 м — это и есть «прямоугольный и длинный»: сколько
-  // ни меняй ширину плавно, пропорция остаётся та же. Настоящее поле
-  // растекания устроено иначе: расплав надувает ДОЛЮ, она встаёт, из её борта
-  // прорывается следующая — и так вниз по склону. Отсюда три вещи:
-  //  • цепочка перекрывающихся долей вдоль оси, каждая своей длины и полноты;
-  //    между ними лента пережимается почти до нуля и местами рвётся совсем;
-  //  • РУКАВА — короткие ответвления вбок под углом, где борт прорвало;
-  //  • пальчатая кромка: край доли не гладкая дуга, а пальцы.
-  const rnd = (i: number, seed: number): number =>
-    noise2(v.k * 12.9 + i * 3.77 + seed, seed * 5.3 + 1.7) * 0.5 + 0.5;
-
-  // цепочка долей вдоль языка (в долях длины)
-  type Lobe = { c: number; len: number; amp: number };
-  const lobes: Lobe[] = [];
-  {
-    let f = 0;
-    let i = 0;
-    while (f < 1 && i < 24) {
-      const len = 0.09 + rnd(i, 2.2) * 0.18;
-      lobes.push({ c: f + len * 0.5, len, amp: 0.62 + rnd(i, 7.1) ** 1.3 * 1.6 });
-      // шаг меньше длины — доли налезают друг на друга, как в природе
-      f += len * (0.55 + rnd(i, 9.4) * 0.5);
-      i++;
-    }
-  }
-  const lobeAt = (f: number): number => {
-    let m = 0;
-    for (const L of lobes) {
-      const d = (f - L.c) / (L.len * 0.62);
-      m = Math.max(m, L.amp * Math.exp(-d * d));
-    }
-    return m;
-  };
-  // длина языка своя: не всякий доходит до низа
-  const reach = 0.68 + rnd(0, 15.5) * 0.32;
-  const scale = 0.95 + rnd(0, 3.3) * 0.95;
-
-  const last = Math.max(1, path.length - 1);
-  // ★ РАЗЛИВ. Язык, идущий полосой от начала до конца, — это всё ещё одна и
-  // та же фигура, сколько ни меняй ей ширину. У настоящего поля растекания
-  // есть места, где расплав вышел на пологое и расплылся ВШИРЬ: там он
-  // мелкий, но занимает десятки метров поперёк. Один-два таких участка на
-  // язык, и силуэт перестаёт быть лентой.
-  const nFields = 1 + Math.floor(rnd(0, 41.3) * 2.6);
-  const fields: Array<{ c: number; half: number; mul: number }> = [];
-  for (let i = 0; i < nFields; i++) {
-    fields.push({
-      c: 0.2 + rnd(i, 47.9) * 0.6,
-      half: 0.09 + rnd(i, 53.1) * 0.13,
-      mul: 2.2 + rnd(i, 59.7) * 2.2,
-    });
-  }
-  const fieldAt = (f: number): number => {
-    let m = 1;
-    for (const fl of fields) {
-      const d = Math.abs(f - fl.c) / fl.half;
-      if (d >= 1) continue;
-      const w = 1 - d * d;
-      m = Math.max(m, 1 + (fl.mul - 1) * w * w);
-    }
-    return m;
-  };
-  const wAt = (i: number): number => {
-    const f = i / last;
-    if (f > reach) return 0;
-    const p = path[i];
-    const fine = 0.72 + (noise2(p.z * 0.22 + v.ph * 7, 4.4) * 0.5 + 0.5) * 0.62;
-    return (10 + rnd(i, 1.9) * 6) * lobeAt(f) * fine * scale * fieldAt(f);
-  };
-
-  const emit = (
-    pu: number,
-    pz: number,
-    yy: number,
-    wBase: number,
-    nu: number,
-    nz: number
-  ): void => {
-    const g0 = ground(toWorldX(pu, pz), pz);
-    const th = Math.max(0.8, yy - g0);
-    const side = (sgn: number): number => {
-      // пальцы по кромке: каждый борт живёт своей частотой
-      const finger =
-        0.68 + (noise2(pz * 0.18 + sgn * 21.3 + v.ph * 5, 8.8) * 0.5 + 0.5) * 0.75;
-      const wMax = wBase * finger;
-      let w = wMax;
-      for (const f of [0.45, 0.72, 1.0]) {
-        const q = wMax * f;
-        const g = ground(toWorldX(pu + nu * sgn * q, pz + nz * sgn * q), pz + nz * sgn * q);
-        if (g > yy - 0.15) {
-          w = wMax * Math.max(0.12, f - 0.27);
-          break;
-        }
-      }
-      return Math.max(0.8, w);
-    };
-    const wl = side(-1);
-    const wr = side(1);
-    const ap = Math.max(2.5, Math.min(9, th * 2.2));
-    out.push({ u: pu, z: pz, y: yy, w: (wl + wr) * 0.5, wl, wr, al: ap, ar: ap, t: th });
-  };
-  // ★ РАЗРЫВ ДЕРЖИТ СВОЮ КООРДИНАТУ. Метка с z = −1e6 ломала отбор кусков
-  // при стриминге: кусок ленты, чей последний узел оказывался разрывом,
-  // целиком отбрасывался как «уехавший назад». Лава при этом продолжала
-  // существовать для столкновений — игрок ехал по земле и проваливался в
-  // расплав, которого не видно. Разрыв теперь стоит там же, где оборвался
-  // язык, и отличается только отрицательной толщиной.
-  const gap = (pu = 0, pz = 0): void => {
-    out.push({ u: pu, z: pz, y: 0, w: 0, wl: 0, wr: 0, al: 0, ar: 0, t: -1 });
-  };
-
-  // --- основная ось ---
-  for (let i = 0; i < path.length; i++) {
-    const p = path[i];
-    const wBase = wAt(i);
-    // то же для языка: за пределами ядра биома он обрывается
-    if (hole[i] || wBase < 1.2 || volcanoWeight(p.z) < 0.85) {
-      gap(p.u, p.z);
-      continue;
-    }
-    const prev = path[Math.max(0, i - 1)];
-    const next = path[Math.min(path.length - 1, i + 1)];
-    const du = next.u - prev.u;
-    const dz = next.z - prev.z;
-    const ln = Math.hypot(du, dz) || 1;
-    emit(p.u, p.z, y[i], wBase, dz / ln, -du / ln);
-  }
-
-  // --- рукава: борт прорвало, и доля ушла вбок ---
-  const nBr = 2 + Math.floor(rnd(0, 21.7) * 3.9);
-  for (let b = 0; b < nBr; b++) {
-    const f0 = 0.12 + rnd(b, 31.1) * (reach - 0.2);
-    const i0 = Math.max(1, Math.min(path.length - 2, Math.round(f0 * last)));
-    if (hole[i0] || wAt(i0) < 1.5) continue;
-    const sgn = rnd(b, 44.3) > 0.5 ? 1 : -1;
-    const nSeg = 3 + Math.floor(rnd(b, 55.9) * 6);
-    const p0 = path[i0];
-    const pr = path[i0 - 1];
-    const nx = path[i0 + 1];
-    const du = nx.u - pr.u;
-    const dz = nx.z - pr.z;
-    const ln = Math.hypot(du, dz) || 1;
-    // рукав уходит под углом 30–65° от оси и постепенно доворачивает вниз
-    let ang = (30 + rnd(b, 66.7) * 35) * (Math.PI / 180) * sgn;
-    let cu = p0.u;
-    let cz = p0.z;
-    let cy = y[i0];
-    const wStart = wAt(i0) * (0.45 + rnd(b, 77.3) * 0.4);
-    gap(p0.u, p0.z);
-    for (let j = 0; j < nSeg; j++) {
-      const ca = Math.cos(ang);
-      const sa = Math.sin(ang);
-      const dxu = (du / ln) * ca - (dz / ln) * sa;
-      const dzz = (du / ln) * sa + (dz / ln) * ca;
-      cu += dxu * FLOW_STEP;
-      cz += dzz * FLOW_STEP;
-      if (volcanoWeight(cz) < 0.85) break;
-      const g = ground(toWorldX(cu, cz), cz);
-      // рукав только стекает: выше родителя он подняться не может
-      cy = Math.min(cy - 0.25, g + 1.3);
-      if (cy < g - 1) break;
-      const k = 1 - j / nSeg;
-      emit(cu, cz, cy, Math.max(1.2, wStart * (0.35 + k * 0.75)), dzz, -dxu);
-      ang *= 0.72; // доворачивает вниз по склону
-    }
-    gap(cu, cz);
-  }
-
-  // нос и хвост каждой доли: обрубленный поперёк конец — тот же прямоугольник
-  for (let i = 0; i < out.length; i++) {
-    if (out[i].t < 0) continue;
-    let d0 = 0;
-    while (i - d0 - 1 >= 0 && out[i - d0 - 1].t > 0 && d0 < 3) d0++;
-    let d1 = 0;
-    while (i + d1 + 1 < out.length && out[i + d1 + 1].t > 0 && d1 < 3) d1++;
-    const k = Math.min(1, Math.min(d0, d1) / 3 + 0.15);
-    if (k < 1) {
-      out[i].wl *= k;
-      out[i].wr *= k;
-      out[i].t *= 0.35 + k * 0.65;
-    }
-  }
-  flowCache.set(v.k, out);
-  // ★ ПРЕДЕЛ БОЛЬШОЙ НАМЕРЕННО. Сброс чистит кэш ЦЕЛИКОМ, включая языки под
-  // ногами: следом всё пересобирается разом, и замер ловил кадры по 45 мс.
-  // Один язык — семь десятков узлов, пятьсот штук ничего не весят.
-  if (flowCache.size > 512) flowCache.clear();
-  return out;
-}
-
-/**
- * ★ ФОРМА ЯЗЫКА СЧИТАЕТСЯ В ОДНОМ МЕСТЕ. Меш рисовался рваным полем, а
- * столкновения проверялись по гладкой ленте вдоль оси — в заливах контура
- * лава убивала там, где её не нарисовано. Ровно это и было «провалился в
- * невидимую лаву». Теперь и меш, и физика спрашивают одну функцию.
- */
-export function flowShapeAt(
-  u: number,
-  z: number,
-  live: FlowNode[]
-): { y: number; th: number; inside: boolean; margin: number } {
-  let bi = 0;
-  let bd = Infinity;
-  for (let k = 0; k < live.length; k++) {
-    const du = u - live[k].u;
-    const dz = z - live[k].z;
-    const d = du * du + dz * dz;
-    if (d < bd) {
-      bd = d;
-      bi = k;
-    }
-  }
-  const n = live[bi];
-  const prev = live[Math.max(0, bi - 1)];
-  const next = live[Math.min(live.length - 1, bi + 1)];
-  const au = next.u - prev.u;
-  const az = next.z - prev.z;
-  const al = Math.hypot(au, az) || 1;
-  const du = u - n.u;
-  const dz = z - n.z;
-  const along = (du * au + dz * az) / al;
-  const cross = (du * az - dz * au) / al;
-  const nb = along >= 0 ? next : prev;
-  const seg = Math.max(1, Math.hypot(nb.u - n.u, nb.z - n.z));
-  const t = Math.min(1, Math.abs(along) / seg);
-  const y = n.y + (nb.y - n.y) * t;
-  const th = n.t + (nb.t - n.t) * t;
-  // кромка рваная: крупный шум даёт заливы и выступы, мелкий — пальцы
-  const wSide = cross < 0 ? n.wl : n.wr;
-  const bay = 0.55 + (noise2(u * 0.026 + 4.1, z * 0.026) * 0.5 + 0.5) * 1.05;
-  const finger = 0.82 + (noise2(u * 0.13 - 7.7, z * 0.13) * 0.5 + 0.5) * 0.4;
-  const R = wSide * bay * finger + (cross < 0 ? n.al : n.ar) * 0.3;
-  const dist = Math.sqrt(bd);
-  return { y, th, inside: dist <= R, margin: R - dist };
-}
-
-/**
- * ★ КРАЙ СХОДИТ КЛИНОМ, А НЕ ОБРЫВАЕТСЯ СТЕНКОЙ. Борт из отдельных стенок по
- * ячейкам давал пилу: каждая стенка сама по себе, стык с землёй рваный.
- * У растекшегося расплава край всегда тонкий — тело сходит на нет за
- * последние метры. Эта доля и считается здесь: 0.12 у самой кромки (чтобы
- * тонкий край не спорил с землёй за пиксели) и 1 в трёх метрах от неё.
- */
-export function flowEdgeFade(margin: number): number {
-  const t = Math.max(0, Math.min(1, margin / 3));
-  return 0.12 + 0.88 * (t * t * (3 - 2 * t));
-}
-
-/**
- * ★ ОДНА ФОРМУЛА ПОВЕРХНОСТИ НА ВСЁ: и меш, и урон, и опора под доской.
- * Пока их было две, они расходились: доска ехала на два с половиной метра
- * ниже нарисованной корки. Поверхность — ВЗВЕШЕННОЕ СРЕДНЕЕ по соседним
- * узлам: гладко и вдоль оси, и поперёк (выборка из ближайшего узла давала
- * ступеньку на стыке долей, а максимум куполов — стиральную доску). Рваность
- * контура при этом сохраняется: радиус каждого узла модулируется шумом от
- * координат точки, а шум — гладкая функция, ступенек она не вносит.
- */
-export function flowFieldAt(
-  u: number,
-  z: number,
-  live: FlowNode[]
-): { y: number; th: number; cover: number } {
-  let acc = 0;
-  let thAcc = 0;
-  let wsum = 0;
-  const bay = 0.55 + (noise2(u * 0.026 + 4.1, z * 0.026) * 0.5 + 0.5) * 1.05;
-  const finger = 0.82 + (noise2(u * 0.13 - 7.7, z * 0.13) * 0.5 + 0.5) * 0.4;
-  const shape = bay * finger;
-  for (const nd of live) {
-    const dz = z - nd.z;
-    if (dz > 60 || dz < -60) continue;
-    const du = u - nd.u;
-    const R = (du < 0 ? nd.wl + nd.al * 0.5 : nd.wr + nd.ar * 0.5) * shape + 1.5;
-    if (du > R || du < -R) continue;
-    const d = Math.sqrt(du * du + dz * dz);
-    if (d > R) continue;
-    const t = 1 - d / R;
-    const w = t * t * (3 - 2 * t);
-    acc += w * nd.y;
-    thAcc += w * nd.t;
-    wsum += w;
-  }
-  if (wsum <= 0.0001) return { y: 0, th: 0, cover: 0 };
-  return { y: acc / wsum, th: thAcc / wsum, cover: Math.min(1, wsum) };
-}
-
-/** Высота корки языка над точкой; null — языка тут нет */
-export function flowTopAt(
-  u: number,
-  z: number,
-  g: number,
-  live: FlowNode[]
-): number | null {
-  const f = flowFieldAt(u, z, live);
-  if (f.cover <= 0.02) return null;
-  const body = Math.min(Math.max(0, f.y - g), f.th) * f.cover;
-  return body > 0.02 ? g + body : null;
-}
-
-/** Живые узлы языка (без разрывов) — общий кэш для физики и постройки */
-const liveCache = new Map<number, FlowNode[]>();
-export function flowLive(
-  v: Vent,
-  ground: (x: number, z: number) => number,
-  toWorldX: (u: number, z: number) => number
-): FlowNode[] {
-  const hit = liveCache.get(v.k);
-  if (hit) return hit;
-  const arr = flowOf(v, ground, toWorldX).filter((n) => n.t > 0);
-  liveCache.set(v.k, arr);
-  if (liveCache.size > 512) liveCache.clear();
-  return arr;
-}
-
-/** Узлы потоков рядом по z — для столкновений и для постройки меша */
-export function flowsNear(
-  z: number,
-  ground: (x: number, zz: number) => number,
-  toWorldX: (u: number, zz: number) => number
-): FlowNode[] {
-  const k0 = Math.floor(z / VENT_STEP);
-  const out: FlowNode[] = [];
-  for (let k = k0 - 3; k <= k0 + 1; k++) {
-    const v = ventAt(k);
-    if (!v) continue;
-    for (const nd of flowOf(v, ground, toWorldX)) {
-      if (Math.abs(nd.z - z) < 60) out.push(nd);
-    }
-  }
-  return out;
-}
-
-/** Расплав ли под точкой: поток убивает так же, как озеро */
-export function flowAt(
-  u: number,
-  z: number,
-  ground: (x: number, zz: number) => number,
-  toWorldX: (uu: number, zz: number) => number
-): number | null {
-  const g = ground(toWorldX(u, z), z);
-  const k0 = Math.floor(z / VENT_STEP);
-  let best: number | null = null;
-  for (let k = k0 - 3; k <= k0 + 1; k++) {
-    const v = ventAt(k);
-    if (!v) continue;
-    if (z < v.z - 100 || z > v.z + v.reach + 300) continue;
-    const live = flowLive(v, ground, toWorldX);
-    if (live.length < 2) continue;
-    const top = flowTopAt(u, z, g, live);
-    if (top !== null && (best === null || top > best)) best = top;
-  }
-  return best;
-}
-
-/**
- * ★ ОПОРА ОТДЕЛЬНО ОТ УРОНА. Для физики важно не «лава или нет», а высота, по
- * которой едет доска, и она обязана быть НЕПРЕРЫВНОЙ: если на кромке потока
- * опора скачет на всю его толщину, игрока подбрасывает на каждом заезде.
- * Поэтому здесь тело языка гасится к нулю ЗА контуром (а не обрывается на
- * нём), и снаружи высота плавно сходится к земле.
- */
-export function lavaSupportAt(
-  u: number,
-  z: number,
-  ground: (x: number, zz: number) => number,
-  toWorldX: (uu: number, zz: number) => number
-): number | null {
-  const g = ground(toWorldX(u, z), z);
-  let best: number | null = null;
-  const k0 = Math.floor(z / VENT_STEP);
-  for (let k = k0 - 3; k <= k0 + 1; k++) {
-    const v = ventAt(k);
-    if (!v) continue;
-    if (z < v.z - 100 || z > v.z + v.reach + 300) continue;
-    const live = flowLive(v, ground, toWorldX);
-    if (live.length < 2) continue;
-    const top = flowTopAt(u, z, g, live);
-    if (top !== null && (best === null || top > best)) best = top;
-  }
-  for (const l of lakesNear(z, ground, toWorldX)) {
-    const dx = u - l.u;
-    const dz = z - l.z;
-    if (dx * dx + dz * dz > l.r * l.r) continue;
-    const d = l.y - g;
-    if (d > 0 && d <= l.depth + 1.5 && (best === null || l.y > best)) best = l.y;
-  }
-  return best;
-}
-
-/** Расплав под точкой: и языки, и озёра. Null — сухо. */
 export function lavaAt(
   u: number,
   z: number,
   ground: (x: number, zz: number) => number,
   toWorldX: (uu: number, zz: number) => number
 ): number | null {
-  const f = flowAt(u, z, ground, toWorldX);
-  if (f !== null) return f;
-  for (const l of lakesNear(z, ground, toWorldX)) {
-    const dx = u - l.u;
-    const dz = z - l.z;
-    if (dx * dx + dz * dz > l.r * l.r) continue;
-    const g = ground(toWorldX(u, z), z);
-    const d = l.y - g;
-    // ★ ОЗЕРО КОНЧАЕТСЯ ТАМ, ГДЕ КОНЧАЕТСЯ ЧАША. Условия «земля ниже уровня»
-    // мало: за краем чаши склон уходит вниз, и горизонтальная плоскость
-    // повисает над пустотой — под неё можно заехать и увидеть изнанку.
-    if (d > 0 && d <= l.depth + 1.5) return l.y;
-  }
-  return null;
+  void ground; void toWorldX;
+  const lvl = poolLevelAt(u, z);
+  if (lvl !== null) return lvl;
+  const f = poolFlowAt(u, z);
+  return f ? f.y : null;
 }
 
-/**
- * ★ ПРЕДУПРЕЖДЕНИЕ ЦВЕТОМ. Расплав убивает мгновенно, а колодец — тем более,
- * поэтому опасное место должно читаться ДО того, как игрок в него въедет.
- * Земля вокруг прокалена и окислена: чем ближе к жару, тем краснее. Это не
- * украшение, а сигнал, и берётся он из той же геометрии, что и убивает.
- * Возвращает 0..1 — близость к опасности.
- */
+/** Опора: язык держит доску (верх расплава), озеро — нет (тонем) */
+export function lavaSupportAt(
+  u: number,
+  z: number,
+  ground: (x: number, zz: number) => number,
+  toWorldX: (uu: number, zz: number) => number
+): number | null {
+  void ground; void toWorldX;
+  const f = poolFlowAt(u, z);
+  return f ? f.y : null;
+}
+
+/** Внутри озера или колодца — доска тонет */
+export function inPoolAt(u: number, z: number): number | null {
+  return poolLevelAt(u, z);
+}
+
+/** прокал земли рядом с расплавом 0..1 */
 export function hazardHeatAt(
   u: number,
   z: number,
   ground: (x: number, zz: number) => number,
   toWorldX: (uu: number, zz: number) => number
 ): number {
-  let best = 0;
-  const k0 = Math.floor(z / VENT_STEP);
-  for (let k = k0 - 3; k <= k0 + 1; k++) {
-    const v = ventAt(k);
-    if (!v) continue;
-    // ★ ИНДЕКС ПО Z, А НЕ ПЕРЕБОР. Прокал спрашивает раскраска рельефа — по
-    // разу на вершину каждого чанка. Перебор всех узлов языка стоил бы сотен
-    // итераций на вершину, поэтому узлы разложены по корзинам в 40 м.
-    const buckets = flowBuckets(v, ground, toWorldX);
-    for (let b = -1; b <= 1; b++) {
-      const arr = buckets.get(Math.floor(z / HAZ_CELL) + b);
-      if (!arr) continue;
-      for (const nd of arr) {
-        const du = u - nd.u;
-        const dz = z - nd.z;
-        const wS = (du < 0 ? nd.wl + nd.al : nd.wr + nd.ar);
-        const R = wS + 26;
-        const d2 = du * du + dz * dz;
-        if (d2 > R * R) continue;
-        const d = Math.sqrt(d2);
-        const t = 1 - Math.max(0, d - wS) / 26;
-        if (t > best) best = t;
-      }
-    }
-    for (const c of lakeCenters(v)) {
-      const R = c.r * 1.25;
-      if (Math.abs(c.z - z) > R + 34) continue;
-      const d = Math.hypot(u - c.u, z - c.z);
-      if (d > R + 34) continue;
-      const t = 1 - Math.max(0, d - R) / 34;
-      if (t > best) best = t;
-    }
-    for (const ch of chasmsOf(v)) {
-      if (!ch) continue;
-      const R = ch.r * 1.15;
-      if (Math.abs(ch.z - z) > R + 30) continue;
-      const d = Math.hypot(u - ch.u, z - ch.z);
-      if (d > R + 30) continue;
-      const t = 1 - Math.max(0, d - R) / 30;
-      if (t > best) best = t;
-    }
-  }
-  return best > 1 ? 1 : best;
+  void ground; void toWorldX;
+  return poolHeatAt(u, z);
 }
 
-const HAZ_CELL = 40;
-const bucketCache = new Map<number, Map<number, FlowNode[]>>();
-
-/** Узлы языка, разложенные по 40-метровым корзинам вдоль z */
-function flowBuckets(
-  v: Vent,
-  ground: (x: number, z: number) => number,
-  toWorldX: (u: number, z: number) => number
-): Map<number, FlowNode[]> {
-  const hit = bucketCache.get(v.k);
-  if (hit) return hit;
-  const m = new Map<number, FlowNode[]>();
-  for (const nd of flowOf(v, ground, toWorldX)) {
-    if (nd.t < 0) continue;
-    const key = Math.floor(nd.z / HAZ_CELL);
-    const arr = m.get(key);
-    if (arr) arr.push(nd);
-    else m.set(key, [nd]);
-  }
-  bucketCache.set(v.k, m);
-  if (bucketCache.size > 512) bucketCache.clear();
-  return m;
-}
-
-/** Глубина 0..1 — шейдеру: у берега тонко и остыло, в середине раскалено */
-export function lavaDepth(
-  u: number,
-  z: number,
-  ground: (x: number, zz: number) => number,
-  toWorldX: (uu: number, zz: number) => number
-): number {
-  let best = 0;
-  for (const l of lakesNear(z, ground, toWorldX)) {
-    const dx = u - l.u;
-    const dz = z - l.z;
-    if (dx * dx + dz * dz > l.r * l.r) continue;
-    const g = ground(toWorldX(u, z), z);
-    const raw = l.y - g;
-    if (raw <= 0 || raw > l.depth + 1.5) continue;
-    const d = Math.min(1, raw / Math.max(1, l.depth));
-    if (d > best) best = d;
-  }
-  return best;
-}
-
-/** Кайма застывшей корки вокруг озера */
+/** застывшая корка по берегам 0..1 */
 export function lavaCrustAt(
   u: number,
   z: number,
   ground: (x: number, zz: number) => number,
   toWorldX: (uu: number, zz: number) => number
 ): number {
-  let best = 0;
-  for (const l of lakesNear(z, ground, toWorldX)) {
-    const d = Math.hypot(u - l.u, z - l.z);
-    if (d > l.r * 1.5) continue;
-    const g = ground(toWorldX(u, z), z);
-    // корка лежит там, где земля чуть выше уровня — по берегам чаши
-    const above = g - l.y;
-    if (above < -0.5 || above > 6) continue;
-    const t = 1 - Math.max(0, above) / 6;
-    if (t > best) best = t;
+  return poolCrustAt(u, z, ground(toWorldX(u, z), z));
+}
+
+/**
+ * Плоские списки для GPU-раскраски чанка (см. chunkshade.ts):
+ *  circles: [u, z, R, fall] — озёра и колодцы
+ *  nodes:   [u, z, wS_left, wS_right] — точки языков (fall 26)
+ *  lakes:   [u, z, r, y] — зеркала с уровнем (корка по берегам)
+ *  steams:  [u, z, r·1.7, 0] — устья пара
+ */
+export function hazardListsFor(
+  u0: number,
+  u1: number,
+  z0: number,
+  z1: number,
+  ground: (x: number, zz: number) => number,
+  toWorldX: (uu: number, zz: number) => number
+): { circles: number[]; nodes: number[]; lakes: number[]; steams: number[] } {
+  void ground; void toWorldX;
+  const l = poolListsFor(z0, z1);
+  const steams: number[] = [];
+  const cxA = Math.floor(u0 / STEAM_CELL) - 1;
+  const cxB = Math.floor(u1 / STEAM_CELL) + 1;
+  const czA = Math.floor(z0 / STEAM_CELL) - 1;
+  const czB = Math.floor(z1 / STEAM_CELL) + 1;
+  for (let cx = cxA; cx <= cxB; cx++) {
+    for (let cz = czA; cz <= czB; cz++) {
+      const s = steamAt(cx, cz);
+      if (s) steams.push(s.u, s.z, s.r * 1.7, 0);
+    }
   }
-  return best;
+  return { ...l, steams };
 }
 
 // --- ПАРОВЫЕ ВЫХОДЫ ---
@@ -1475,12 +430,17 @@ export function launchBomb(
 }
 
 /**
- * Попал ли снаряд в игрока прямо сейчас — прямым касанием или взрывом рядом.
- * ★ ВЗРЫВ БЬЁТ ПО ПЛОЩАДИ. Раньше считалось только прямое попадание в ядро, и
- * снаряд, рванувший в трёх метрах, не значил ничего — уворачиваться было
- * незачем. Теперь опасна и воронка.
+ * Подорвать снаряд, оказавшийся вплотную к игроку, и записать взрыв.
+ * ★ ЭТО ВЗВОД, А НЕ ПРИГОВОР. Функция называлась bombHitsPlayer и её результат
+ * означал краш — при том, что проверяется здесь НЕ прямое касание, а сфера
+ * радиусом r+2.6 вокруг летящего снаряда. Получалось, что любой снаряд, легший
+ * рядом, сбивал игрока ДО того, как отработает двухзонная волна: она читает
+ * impacts со следующего кадра, а impact создаётся здесь же. Поэтому просьба
+ * «в ядре 55% нагрева и отшвырнуть» не работала — вместо неё был мгновенный
+ * WIPEOUT. Теперь здесь только подрыв, а что стало с игроком, решает
+ * blastHitsPlayer по расстоянию до эпицентра.
  */
-export function bombHitsPlayer(px: number, py: number, pz: number): boolean {
+export function detonateBombNear(px: number, py: number, pz: number): boolean {
   for (const b of bombs) {
     if (!b.alive) continue;
     const dx = b.x - px;
@@ -1495,8 +455,26 @@ export function bombHitsPlayer(px: number, py: number, pz: number): boolean {
   return false;
 }
 
-/** Накрыло ли игрока свежим взрывом (радиус ударной волны) */
-export function blastHitsPlayer(px: number, pz: number): boolean {
+/** Что сделал с игроком свежий взрыв: null — ничего */
+export interface Blast {
+  /** true — накрыло насмерть, false — только толкнуло */
+  kill: boolean;
+  /** единичное направление ОТ центра взрыва и сила 0..1 */
+  dx: number;
+  dz: number;
+  push: number;
+}
+
+/**
+ * ★ У ВЗРЫВА ДВЕ ЗОНЫ. Раньше вся ударная волна была смертельной, и разница
+ * между «влетел в эпицентр» и «зацепило краем» не читалась вовсе. Ядро (60%
+ * радиуса) убивает, кайма только отшвыривает — из неё можно уехать, если
+ * удержишь доску.
+ */
+const BLAST_KILL = 0.5;
+
+export function blastHitsPlayer(px: number, pz: number): Blast | null {
+  let best: Blast | null = null;
   for (const i of impacts) {
     const dx = i.x - px;
     const dz = i.z - pz;
@@ -1504,9 +482,17 @@ export function blastHitsPlayer(px: number, pz: number): boolean {
     // среднем в четырёх-пяти метрах от игрока по каждой оси — при множителе
     // 3.2 (около шести метров у среднего снаряда) он раз за разом рвался
     // ВПРИТЫК мимо, и бездействие оставалось безнаказанным.
-    if (dx * dx + dz * dz < (i.r * 4.6) * (i.r * 4.6)) return true;
+    const R = i.r * 4.6;
+    const d2 = dx * dx + dz * dz;
+    if (d2 >= R * R) continue;
+    const d = Math.sqrt(d2) || 0.001;
+    const kill = d < R * BLAST_KILL;
+    if (kill) return { kill: true, dx: -dx / d, dz: -dz / d, push: 1 };
+    // в кайме сила падает к внешнему краю
+    const t = 1 - (d - R * BLAST_KILL) / (R * (1 - BLAST_KILL));
+    if (!best || t > best.push) best = { kill: false, dx: -dx / d, dz: -dz / d, push: t };
   }
-  return false;
+  return best;
 }
 
 /** снять снаряд с полёта и записать взрыв */
@@ -1517,236 +503,6 @@ function boom(b: Bomb, scale = 1): void {
   }
 }
 
-const VERT = /* glsl */ `
-uniform float uTime;
-varying vec2 vWorld;
-varying float vHot;
-attribute float aHot;
-float wh(vec2 p){return fract(sin(dot(floor(p),vec2(127.1,311.7)))*43758.5453);}
-float wn(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
-  return mix(mix(wh(i),wh(i+vec2(1,0)),f.x),mix(wh(i+vec2(0,1)),wh(i+vec2(1,1)),f.x),f.y);}
-void main() {
-  vec4 wp = modelMatrix * vec4(position, 1.0);
-  // ★ ПО РАСПЛАВУ ИДЁТ ВОЛНА. Плоское зеркало читается стеклом; у жидкости
-  // поверхность дышит. Волна мелкая (десятки сантиметров) и медленная, идёт
-  // вниз по склону — физика считает поверхность аналитически и её не видит.
-  float w1 = wn(wp.xz * 0.06 + vec2(0.0, -uTime * 0.35));
-  float w2 = wn(wp.xz * 0.19 + vec2(0.0, -uTime * 0.75));
-  wp.y += ((w1 - 0.5) * 0.34 + (w2 - 0.5) * 0.16) * vHot;
-  vWorld = wp.xz;
-  vHot = aHot;
-  gl_Position = projectionMatrix * viewMatrix * wp;
-}
-`;
-
-// ★ ШЕЙДЕР РАСПЛАВА.
-// Первая версия мешала шум с оранжевым и давала мутную кашу. Настоящая лава
-// читается тремя вещами, и все три здесь есть:
-//  1) КОРКА ТЁМНАЯ. Расплав виден только в трещинах между плитами застывшей
-//     корки — если светится всё полотно, получается кисель, а не камень.
-//  2) ТРЕЩИНЫ ВЫТЯНУТЫ ПО ТЕЧЕНИЮ. Координата сжимается поперёк потока,
-//     поэтому рисунок тянется вниз по склону, а не выглядит пятнами.
-//  3) ЦВЕТ ИДЁТ ПО ТЕМПЕРАТУРЕ: от почти белого в глубине щели через жёлтый
-//     и оранжевый к тёмно-багровому у кромки. Один оранжевый — это лампа,
-//     а не расплав.
-const FRAG = /* glsl */ `
-precision highp float;
-uniform float uTime;
-uniform vec3 uFogColor;
-uniform float uFogNear;
-uniform float uFogFar;
-// ★ ФОРМА ЯЗЫКА СЧИТАЕТСЯ ЗДЕСЬ, А НЕ БЕРЁТСЯ ИЗ СЕТКИ.
-// Раньше принадлежность к потоку интерполировалась между узлами сетки, и
-// любая кромка получалась ломаной из отрезков — жидкость так выглядеть не
-// может. Теперь в шейдер передана сама осевая линия (мировой X и полуширина
-// на каждые несколько метров по Z), и граница считается на каждый пиксель:
-// она гладкая и кривая независимо от того, какой крупности геометрия.
-varying vec2 vWorld;
-varying float vHot;
-
-float hash(vec2 p) {
-  p = floor(p);
-  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
-}
-float noise(vec2 p) {
-  vec2 i = floor(p);
-  vec2 f = fract(p);
-  f = f * f * (3.0 - 2.0 * f);
-  return mix(mix(hash(i), hash(i + vec2(1, 0)), f.x),
-             mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), f.x), f.y);
-}
-float fbm(vec2 p) {
-  return noise(p) * 0.6 + noise(p * 2.3 + 5.0) * 0.28 + noise(p * 5.1 - 3.0) * 0.12;
-}
-
-void main() {
-  // ФОРМА ПЯТНА ЗАДАНА ГЕОМЕТРИЕЙ: урез идёт по горизонтали рельефа, то есть
-  // по контуру чаши — он гладкий и кривой по построению, дорисовывать нечего.
-  float edge = smoothstep(0.0, 0.14, vHot);
-  if (edge <= 0.01) discard;
-  float vHotP = vHot;
-
-  // ★ КОРКА — ЭТО ПЛИТЫ, А НЕ ВОЛНЫ. Шум fbm по своей природе даёт плавные
-  // полосы, и расплав выглядел нарисованным волнами. Настоящая корка
-  // разбита на ПЛИТЫ, между которыми светятся щели, поэтому здесь ячеистый
-  // шум: точки-центры плит на решётке, а трещина — там, где расстояния до
-  // двух ближайших центров сравниваются.
-  float slow = uTime * 7.0;
-  float fast = uTime * 20.0;
-  // поперёк потока координата сжата: плиты вытянуты вдоль склона
-  vec2 base = vec2(vWorld.x * 0.13, (vWorld.y + slow) * 0.045);
-  // лёгкое искажение, чтобы решётка не читалась решёткой
-  vec2 w = vec2(fbm(base * 0.6 + 3.0), fbm(base * 0.6 - 7.0)) - 0.5;
-  vec2 p = base + w * 0.9;
-
-  vec2 ip = floor(p);
-  vec2 fp = fract(p);
-  float d1 = 8.0;
-  float d2 = 8.0;
-  for (int j = -1; j <= 1; j++) {
-    for (int i = -1; i <= 1; i++) {
-      vec2 g = vec2(float(i), float(j));
-      vec2 o = vec2(hash(ip + g + 0.5), hash(ip + g + 17.3));
-      float dist = length(g + o - fp);
-      if (dist < d1) { d2 = d1; d1 = dist; }
-      else if (dist < d2) { d2 = dist; }
-    }
-  }
-  // щель тем ярче, чем ближе точка к границе двух плит
-  float seam = 1.0 - smoothstep(0.0, 0.16, d2 - d1);
-
-  // вторая, более мелкая и БЫСТРАЯ сеть — по ней и виден ход потока
-  vec2 p2 = vec2(vWorld.x * 0.4, (vWorld.y + fast) * 0.14);
-  vec2 ip2 = floor(p2);
-  vec2 fp2 = fract(p2);
-  float e1 = 8.0;
-  float e2 = 8.0;
-  for (int j = -1; j <= 1; j++) {
-    for (int i = -1; i <= 1; i++) {
-      vec2 g = vec2(float(i), float(j));
-      vec2 o = vec2(hash(ip2 + g + 5.1), hash(ip2 + g + 91.7));
-      float dist = length(g + o - fp2);
-      if (dist < e1) { e2 = e1; e1 = dist; }
-      else if (dist < e2) { e2 = dist; }
-    }
-  }
-  float fine = (1.0 - smoothstep(0.0, 0.22, e2 - e1)) * 0.5;
-
-  // ★ РАСПЛАВ — ЭТО УЗКАЯ ЖИЛА В ЧЁРНОМ ПОЛЕ, А НЕ ОРАНЖЕВОЕ ПОЛОТНО.
-  // На снимках потока девять десятых площади занимает почти чёрная корка, и
-  // светится только узкий канал по стрежню да тонкая сеть щелей между плитами.
-  // Прежняя версия жгла всё полотно — от этого и «слоп»: яркость без формы.
-  // Ядро: раскалённый канал по середине языка, с рваным краем от щелей.
-  // ★ БУЛЬКАНЬЕ. Расплав не стоит ровно: по нему всходят и лопаются пузыри.
-  // Редкие ячейки вспыхивают каждая по своей фазе — центр разгорается и гаснет.
-  vec2 bp = vWorld * 0.055;
-  vec2 bi = floor(bp);
-  vec2 bf = fract(bp) - 0.5;
-  float bph = hash(bi) * 6.283;
-  float pulse = max(0.0, sin(uTime * 1.6 + bph));
-  float bub = pulse * pulse * smoothstep(0.40, 0.04, length(bf)) * vHotP;
-
-  float core = smoothstep(0.55, 0.96, vHotP + seam * 0.12 - fine * 0.05 + bub * 0.5);
-  // Щели: тонкие и ТУСКЛЫЕ, тёмно-красные — они не должны спорить с ядром.
-  float cracks = max(seam * 0.5, fine) * (0.25 + 0.35 * vHotP);
-
-  vec3 crust = vec3(0.035, 0.026, 0.03) * (0.6 + 0.8 * fbm(p * 3.0));
-  vec3 emberDull = vec3(0.5, 0.045, 0.012);
-  vec3 emberHot = vec3(1.6, 0.22, 0.02);
-  vec3 flowMid = vec3(3.0, 0.75, 0.06);
-  vec3 flowWhite = vec3(4.6, 2.6, 0.7);
-
-  float d = length(vWorld - cameraPosition.xz);
-  // ★ ВДАЛИ РАСПЛАВ НЕ БЕЛЕЕТ. На дистанции лента сжимается до нескольких
-  // пикселей, в них остаётся только самое яркое ядро, и bloom растирает его в
-  // белые кляксы — лава читалась снегом. Поэтому добела светится лишь ближний
-  // расплав, дальний остаётся насыщенно-оранжевым.
-  float far = smoothstep(110.0, 420.0, d);
-  vec3 hotTop = mix(flowWhite, flowMid * 1.15, far);
-
-  vec3 col = crust;
-  // сначала тлеющие щели по корке
-  col = mix(col, emberDull, smoothstep(0.05, 0.4, cracks));
-  col = mix(col, emberHot, smoothstep(0.35, 0.8, cracks));
-  // затем сам канал — он и есть яркое пятно кадра
-  col = mix(col, flowMid, smoothstep(0.0, 0.55, core));
-  col = mix(col, hotTop, smoothstep(0.55, 1.0, core));
-  col *= mix(1.0, 0.78, far);
-
-  float f = clamp((d - uFogNear) / (uFogFar - uFogNear), 0.0, 1.0);
-  // в дымку уходит тёплой: расплав подсвечивает пепел над собой
-  vec3 fogged = uFogColor * vec3(1.6, 1.1, 0.85);
-  gl_FragColor = vec4(mix(col, fogged, f * 0.9), edge);
-}
-`;
-
-export function createLavaMaterial(): THREE.ShaderMaterial {
-  return new THREE.ShaderMaterial({
-    vertexShader: VERT,
-    fragmentShader: FRAG,
-    uniforms: {
-      uTime: { value: 0 },
-      uFogColor: { value: new THREE.Color(0x2a1c1c) },
-      uFogNear: { value: 300 },
-      uFogFar: { value: 2100 },
-    },
-    fog: false,
-    transparent: true,
-    depthWrite: true,
-    side: THREE.DoubleSide,
-  });
-}
-
-/**
- * Полотно расплава вокруг игрока. Языки ЖИВУТ во времени, поэтому запекать их
- * в геометрию чанка нельзя — сетка пересобирается на месте, когда игрок
- * отъехал или прошло достаточно времени.
- */
-/**
- * ВУЛКАН. Источник, который видно издалека: тёмный конус с раскалённым
- * жерлом, столб пепла и фонтан искр. Без него лава выглядит нарисованной на
- * склоне — течёт непонятно откуда.
- */
-// Выброс: точки со СВОИМ размером и цветом. Штатный PointsMaterial даёт один
-// размер на всю систему, а бомба у жерла и остывший пепел в километре — это
-// разные вещи, поэтому свой шейдер.
-const EJECT_VERT = /* glsl */ `
-attribute float aSize;
-attribute vec3 aCol;
-varying vec3 vCol;
-void main() {
-  vCol = aCol;
-  vec4 mv = modelViewMatrix * vec4(position, 1.0);
-  gl_Position = projectionMatrix * mv;
-  // ★ ПРЕДЕЛ РАЗМЕРА ОБЯЗАТЕЛЕН. Без него частица, оказавшаяся у камеры,
-  // раздувается на сотни пикселей и застилает экран пеленой — ровно это и
-  // происходило с осевшим пеплом.
-  gl_PointSize = clamp(aSize * (300.0 / max(4.0, -mv.z)), 1.0, 26.0);
-}
-`;
-const EJECT_FRAG = /* glsl */ `
-precision highp float;
-varying vec3 vCol;
-void main() {
-  // круглая частица с мягким краем
-  vec2 d = gl_PointCoord - 0.5;
-  float r = dot(d, d);
-  if (r > 0.25) discard;
-  float a = smoothstep(0.25, 0.02, r);
-  gl_FragColor = vec4(vCol, a);
-}
-`;
-
-/**
- * ВУЛКАН. Гора-источник, которую видно за километры: стратоконус с вогнутым
- * профилем, раскалённое жерло, извержение и зарево от него.
- *
- * ★ ИЗВЕРЖЕНИЕ — ЭТО БАЛЛИСТИКА, А НЕ ПЯТНО. Куски мантии вылетают во все
- * стороны, летят сотни метров и ОСТЫВАЮТ В ПОЛЁТЕ: добела раскалённые у
- * жерла, дальше жёлтые, оранжевые, багровые и наконец серый пепел, который
- * оседает. Вся жизнь частицы — это её возраст, поэтому цвет и размер считаются
- * от него, а не задаются один на всю систему.
- */
 export class Volcanoes {
   readonly group = new THREE.Group();
   private built = new Map<number, THREE.Object3D>();
@@ -1768,15 +524,20 @@ export class Volcanoes {
   private lpos: Float32Array;
   private lcol: Float32Array;
   /** зарево извержения: единственный настоящий источник света в биоме */
-  readonly light = new THREE.PointLight(0xff7a2a, 0, 2600, 1.4);
+  // ★★★ СВЕЧЕНИЕ ЛАВЫ — КРАСНОЕ. Оранжево-жёлтые источники (0xff7a2a и родня)
+  // заливали склон охрой на десятки метров вокруг, и биом читался пустыней: в
+  // кадре рядом с игроком одновременно горело шесть таких, по 19–29 единиц с
+  // 37–67 м. Цвет уводим в красный, силу режем — расплав должен подсвечивать
+  // СВОЮ окрестность, а не красить весь склон.
+  readonly light = new THREE.PointLight(0xff2f0c, 0, 2600, 1.6);
 
-  private coneMat = new THREE.MeshLambertMaterial({
+  private coneMat = lambert({
     vertexColors: true,
     flatShading: true,
   });
   // Кратер не белый диск: раскалённое озеро оранжевое, добела светится лишь
   // самая середина — на снимках так и есть.
-  private craterMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(2.6, 0.6, 0.06) });
+  private craterMat = basic({ color: new THREE.Color(2.6, 0.6, 0.06) });
 
   constructor() {
     const N = Volcanoes.N;
@@ -1787,7 +548,7 @@ export class Volcanoes {
     for (let i = 0; i < N; i++) this.age[i] = 1e9;
     this.line = new THREE.LineSegments(
       this.geo,
-      new THREE.LineBasicMaterial({
+      line({
         vertexColors: true,
         transparent: true,
         depthWrite: false,
@@ -1986,7 +747,11 @@ export class Volcanoes {
     const top = ground(wx, near.z) + near.coneH * 0.93;
     // зарево: свет стоит над жерлом и пульсирует вместе с выбросом
     this.light.position.set(wx, top + near.coneH * 0.1, near.z);
-    this.light.intensity = 12 + Math.sin(performance.now() * 0.0016) * 4;
+    // ★ СВЕЧЕНИЕ ЛАВЫ НЕ ДОЛЖНО ОСВЕЩАТЬ ВЕСЬ СКЛОН. Замер: рядом с игроком
+    // одновременно горело шесть таких источников по 19–29 единиц с 37–67 м —
+    // они и заливали пепел охрой, из-за чего биом читался пустыней. Расплав
+    // подсвечивает СВОЮ окрестность; дальше работает палитра и мгла.
+    this.light.intensity = 5 + Math.sin(performance.now() * 0.0016) * 1.6;
 
     const N = Volcanoes.N;
     const g = 9.8;
@@ -2096,8 +861,8 @@ export class Volcanoes {
    * Рисуем столбы у ближайших выходов, и высота столба равна силе выброса,
    * то есть по нему читается фаза: видно, когда прыгать.
    */
-  private steamGeo = new THREE.BufferGeometry();
-  private steamPts: THREE.Points | null = null;
+  private steamCloud: SpriteCloud | null = null;
+  private steamPts: THREE.Sprite | null = null;
   private static readonly ST = 900;
   private stPos = new Float32Array(900 * 3);
   private stCol = new Float32Array(900 * 3);
@@ -2111,20 +876,14 @@ export class Volcanoes {
     active: boolean
   ): void {
     if (!this.steamPts) {
-      this.steamGeo.setAttribute('position', new THREE.BufferAttribute(this.stPos, 3));
-      this.steamGeo.setAttribute('color', new THREE.BufferAttribute(this.stCol, 3));
-      this.steamPts = new THREE.Points(
-        this.steamGeo,
-        new THREE.PointsMaterial({
-          vertexColors: true,
-          size: 2.6,
-          sizeAttenuation: true,
-          transparent: true,
-          opacity: 0.75,
-          depthWrite: false,
-        })
-      );
-      this.steamPts.frustumCulled = false;
+      // ★ WebGPU: PointsMaterial size=2.6 с аттенюацией — это 2.6 × (полвысоты
+      // буфера) / dist пикселей; полвысоты низкого буфера ≈ 120
+      this.steamCloud = spriteCloud({
+        count: Volcanoes.ST, pos: this.stPos, col: this.stCol,
+        fixedSize: 2.6, k: 120, minPx: 0, maxPx: 1e4,
+        alpha: () => 0.75,
+      });
+      this.steamPts = this.steamCloud.sprite;
       this.group.add(this.steamPts);
     }
     this.steamPts.visible = active;
@@ -2183,8 +942,7 @@ export class Volcanoes {
     for (let i = n; i < N; i++) {
       this.stPos[i * 3 + 1] = -1e6;
     }
-    this.steamGeo.attributes.position.needsUpdate = true;
-    this.steamGeo.attributes.color.needsUpdate = true;
+    this.steamCloud!.touch();
   }
 
   get vent(): Vent | null {
@@ -2287,926 +1045,3 @@ export class Volcanoes {
  * стримится по расстоянию — как скалы. Прежняя река пересобиралась каждые
  * 30 м пути и давала спайк раз в секунду.
  */
-const EMPTY_MESH = new THREE.Mesh();
-
-// ★ РИСУНОК ТРЕЩИН — ЧЕРЕЗ ВПРЫСК. terrain.ts уже импортирует этот файл,
-// обратный импорт замкнул бы цикл модулей.
-let crackSampler: ((x: number, z: number) => number) | null = null;
-export function setCrackSampler(fn: (x: number, z: number) => number): void {
-  crackSampler = fn;
-}
-
-export class LavaField {
-  readonly group = new THREE.Group();
-  readonly material = createLavaMaterial();
-
-  private built = new Map<string, THREE.Mesh>();
-  private lastZ = 1e9;
-
-  /**
-   * ★ ИСКРЫ ИЗ ПУЗЫРЕЙ. Расплав булькает, и при разрыве пузыря вылетают
-   * брызги. Это же и делает озеро живым: статичное пятно, даже красивое,
-   * читается нарисованным.
-   */
-  /**
-   * ★ ИСКР МНОГО И ОНИ МЕЛКИЕ. Четыре сотни крупных точек читались редкими
-   * квадратами, а не роем: у брызг расплава размер должен быть на грани
-   * различимости, зато их должно быть облако.
-   */
-  private static readonly SP = 1600;
-  private spPos = new Float32Array(LavaField.SP * 3);
-  private spVel = new Float32Array(LavaField.SP * 3);
-  private spAge = new Float32Array(LavaField.SP);
-  private spLife = new Float32Array(LavaField.SP);
-  private spCol = new Float32Array(LavaField.SP * 3);
-  private spGeo = new THREE.BufferGeometry();
-  private spPts: THREE.Points | null = null;
-  private spSize = new Float32Array(LavaField.SP);
-
-  /** зарево из глубины: единственный свет в котловане */
-  readonly pitLight = new THREE.PointLight(0xff5a12, 0, 1100, 1.5);
-
-  /**
-   * ★ ЛАВА ДОЛЖНА СВЕТИТЬ НА МИР, А НЕ ТОЛЬКО СВЕТИТЬСЯ САМА. Биом тёмный по
-   * задумке, но источников в нём десятки — озёра, языки, раскалённые швы — и ни
-   * один из них не освещал окрестность: на скорости склон читался плохо, а
-   * препятствия выступали из черноты в последний момент.
-   *
-   * Настоящих ламп на все очаги не напасёшься (каждая стоит в шейдере всех
-   * материалов), поэтому свет раздаётся двумя способами:
-   *  • РЕЛЬЕФ — списком очагов прямо в его шейдере: там это почти бесплатно и
-   *    покрывает главную площадь кадра;
-   *  • ОБЪЕКТЫ (скалы, деревья, доска) — двумя настоящими лампами, которые
-   *    садятся на два ближайших сильных очага.
-   */
-  readonly lavaLights = [
-    new THREE.PointLight(0xff6a1e, 0, 260, 1.7),
-    new THREE.PointLight(0xff6a1e, 0, 260, 1.7),
-  ];
-
-  /** очаги для шейдера рельефа: [x, z, радиус, сила] × GLOW_N */
-  private glowBuf = new Float32Array(LavaField.GLOW_N * 4);
-  static readonly GLOW_N = 10;
-
-  /**
-   * ★ ЯМА ДОЛЖНА ПРЕДУПРЕЖДАТЬ О СЕБЕ ИЗДАЛЕКА. Озеро лежит на дне чаши, и его
-   * физически не видно из-за края, пока не подъедешь вплотную — объехать уже
-   * нельзя. Никакая дальность отрисовки этого не лечит: дело не в стриминге, а
-   * в геометрии. Поэтому над глубокими озёрами стоит столб раскалённого чада:
-   * он поднимается ВЫШЕ края чаши и виден за километр. Игрок читает его как
-   * «там провал», ещё не видя самой лавы.
-   */
-  private plumeGeo = new THREE.BufferGeometry();
-  private plumePts: THREE.Points | null = null;
-  private plP = new Float32Array(LavaField.PLUME * 3);
-  private plV = new Float32Array(LavaField.PLUME * 3);
-  private plAge = new Float32Array(LavaField.PLUME);
-  private plLife = new Float32Array(LavaField.PLUME);
-  private plCol = new Float32Array(LavaField.PLUME * 3);
-  private plSize = new Float32Array(LavaField.PLUME);
-  private plNext = 0;
-  private plAcc = 0;
-
-  /** узлы языков поблизости — источники искр над потоком */
-  private sparkNodes: FlowNode[] = [];
-
-  /**
-   * ★ ИСКРЫ ИЗ ТРЕЩИН. Раскалённый шов не просто светится — из него тянет
-   * жаром и выносит угольки. Прошлая попытка (мигающие точки прямо в шейдере
-   * поверхности) читалась жёлтой рябью, потому что сидела ПЛОСКО на земле и
-   * зажигалась разом по всей сети. Здесь это настоящие частицы: вылетают из
-   * конкретного шва, летят вверх с завихрением, вытянуты в штрих по своему
-   * ходу и гаснут от белого к багровому.
-   */
-  // ★ УГОЛЬКОВ МНОГО. Из-под канта на скорости идёт сноп, а не редкие точки:
-  // при потолке в 260 частиц весь запас съедали фоновые искры из швов, и на
-  // доску не оставалось.
-  private static readonly EMB = 900;
-  private emGeo = new THREE.BufferGeometry();
-  private emLine: THREE.LineSegments | null = null;
-  private emP = new Float32Array(LavaField.EMB * 3);
-  private emV = new Float32Array(LavaField.EMB * 3);
-  private emAge = new Float32Array(LavaField.EMB);
-  private emLife = new Float32Array(LavaField.EMB);
-  private emVert = new Float32Array(LavaField.EMB * 6);
-  private emSpots: number[] = [];
-  private emScan = 0;
-  private emCol = new Float32Array(LavaField.EMB * 6);
-
-  /**
-   * Искры из-под доски: те же угольки, но выброшенные кантом. Отличаются
-   * направлением — летят назад и в стороны, а не только вверх.
-   */
-  emberBurst(x: number, y: number, z: number, vx: number, vz: number, n: number): void {
-    for (let b = 0; b < n; b++) {
-      let slot = -1;
-      for (let i = 0; i < LavaField.EMB; i++) {
-        if (this.emLife[i] < 0) {
-          slot = i;
-          break;
-        }
-      }
-      if (slot < 0) return;
-      this.emP[slot * 3] = x + (Math.random() - 0.5) * 0.5;
-      this.emP[slot * 3 + 1] = y + 0.05 + Math.random() * 0.2;
-      this.emP[slot * 3 + 2] = z + (Math.random() - 0.5) * 0.5;
-      // ★ ВЕЕРОМ, А НЕ СТРОГО НАЗАД. Одинаковое направление у всех искр
-      // читается струёй из сопла; у снопа из-под канта есть разброс.
-      // ★ ВЕЕР ±30°, А НЕ СТРУЯ. Разброс задаётся ПОВОРОТОМ вектора, а не
-      // случайной добавкой: добавка при быстром ходе тонет в основном
-      // направлении, и сноп всё равно читался струёй из сопла.
-      const back = 0.2 + Math.random() * 0.34;
-      const ang = (Math.random() - 0.5) * (Math.PI / 3); // ±30°
-      const ca = Math.cos(ang);
-      const sa = Math.sin(ang);
-      const bx = (-vx * ca + vz * sa) * back;
-      const bz = (-vx * sa - vz * ca) * back;
-      this.emV[slot * 3] = bx + (Math.random() - 0.5) * 1.8;
-      this.emV[slot * 3 + 1] = 1.4 + Math.random() * 3.6;
-      this.emV[slot * 3 + 2] = bz + (Math.random() - 0.5) * 1.8;
-      this.emAge[slot] = 0;
-      this.emLife[slot] = 0.35 + Math.random() * 0.6;
-    }
-  }
-
-  private static readonly PLUME = 760;
-
-  /** столбы чада над глубокими озёрами — единственная подсказка о яме издалека */
-  private updatePlumes(
-    dt: number,
-    px: number,
-    pz: number,
-    lakes: Lake[],
-    toWorldX: (u: number, z: number) => number
-  ): void {
-    if (!this.plumePts) {
-      this.plumeGeo.setAttribute('position', new THREE.BufferAttribute(this.plP, 3));
-      this.plumeGeo.setAttribute('color', new THREE.BufferAttribute(this.plCol, 3));
-      this.plumeGeo.setAttribute('size', new THREE.BufferAttribute(this.plSize, 1));
-      this.plumePts = new THREE.Points(
-        this.plumeGeo,
-        new THREE.ShaderMaterial({
-          vertexShader: /* glsl */ `
-            attribute float size;
-            varying vec3 vCol;
-            void main() {
-              vCol = color;
-              vec4 mv = modelViewMatrix * vec4(position, 1.0);
-              gl_PointSize = size * 300.0 / max(1.0, -mv.z);
-              gl_Position = projectionMatrix * mv;
-            }
-          `,
-          fragmentShader: /* glsl */ `
-            varying vec3 vCol;
-            void main() {
-              vec2 p = gl_PointCoord * 2.0 - 1.0;
-              float r = length(p);
-              if (r > 1.0) discard;
-              // ★ ОСТЫВШИЙ ЧАД ПЛОТНЕЕ ГОРЯЧЕГО. Верх столба — тёмный дым, и
-              // именно он читается на фоне светлого неба; слишком прозрачным
-              // его было не видно с трёхсот метров.
-              gl_FragColor = vec4(vCol, pow(max(0.0, 1.0 - r), 1.6) * 0.72);
-            }
-          `,
-          vertexColors: true,
-          transparent: true,
-          depthWrite: false,
-        })
-      );
-      this.plumePts.frustumCulled = false;
-      for (let i = 0; i < LavaField.PLUME; i++) this.plLife[i] = -1;
-      this.group.add(this.plumePts);
-    }
-    // ★ ЧАД РАБОТАЕТ ТОЛЬКО ИЗДАЛЕКА. Вблизи он превращался в стену тумана
-    // поперёк всей чаши: игрок въезжал в провал и не видел вообще ничего.
-    // Столб нужен, пока яма ещё за перегибом, — от неё и рождается.
-    const src = lakes.filter((l) => l.depth > 8 && l.z > pz + 160 && l.z < pz + 1300);
-    if (src.length) {
-      this.plAcc += dt * 30;
-      while (this.plAcc >= 1) {
-        this.plAcc -= 1;
-        const l = src[(Math.random() * src.length) | 0];
-        const i = this.plNext % LavaField.PLUME;
-        this.plNext++;
-        const a = Math.random() * Math.PI * 2;
-        const rr = Math.sqrt(Math.random()) * l.r * 0.55;
-        this.plP[i * 3] = toWorldX(l.u, l.z) + Math.cos(a) * rr;
-        this.plP[i * 3 + 1] = l.y + 2;
-        this.plP[i * 3 + 2] = l.z + Math.sin(a) * rr;
-        this.plV[i * 3] = (Math.random() - 0.5) * 3;
-        // ★ ПОДНИМАЕТСЯ ВЫСОКО И МЕДЛЕННО: за жизнь частица должна перевалить
-        // через край чаши, иначе весь смысл пропадает
-        // ★ ВЫШЕ КРАЯ, НО НЕ ДО НЕБА. Первый вариант уносил чад на километр
-        // (замер: 959 м над зеркалом при чаше в 18 м) — вместо подсказки
-        // получался ядерный гриб на треть кадра. Хватает сотни метров.
-        this.plV[i * 3 + 1] = 5 + Math.random() * 4 + l.depth * 0.22;
-        this.plV[i * 3 + 2] = (Math.random() - 0.5) * 3;
-        this.plAge[i] = 0;
-        this.plLife[i] = 5.5 + Math.random() * 3.5;
-        this.plSize[i] = 4 + Math.random() * 6;
-      }
-    }
-    for (let i = 0; i < LavaField.PLUME; i++) {
-      if (this.plLife[i] < 0) continue;
-      // подъехали вплотную — частица гаснет, чтобы не застить обзор в самой яме
-      if (Math.abs(this.plP[i * 3 + 2] - pz) < 130) {
-        this.plLife[i] = -1;
-        this.plP[i * 3 + 1] = -1e6;
-        continue;
-      }
-      this.plAge[i] += dt;
-      const k = this.plAge[i] / this.plLife[i];
-      if (k >= 1) {
-        this.plLife[i] = -1;
-        this.plP[i * 3 + 1] = -1e6;
-        continue;
-      }
-      this.plV[i * 3 + 1] *= 1 - dt * 0.22;
-      this.plP[i * 3] += this.plV[i * 3] * dt;
-      this.plP[i * 3 + 1] += this.plV[i * 3 + 1] * dt;
-      this.plP[i * 3 + 2] += this.plV[i * 3 + 2] * dt;
-      // у земли раскалённый, выше — тёмный чад
-      const hot = Math.max(0, 1 - k * 2.6);
-      this.plCol[i * 3] = 0.3 + hot * 2.4;
-      this.plCol[i * 3 + 1] = 0.19 + hot * 0.7;
-      this.plCol[i * 3 + 2] = 0.18 + hot * 0.12;
-      this.plSize[i] += dt * 5.5;
-    }
-    this.plumeGeo.attributes.position.needsUpdate = true;
-    this.plumeGeo.attributes.color.needsUpdate = true;
-    this.plumeGeo.attributes.size.needsUpdate = true;
-  }
-
-  private updateEmbers(
-    dt: number,
-    px: number,
-    pz: number,
-    ground: (x: number, z: number) => number
-  ): void {
-    if (!this.emLine) {
-      this.emGeo.setAttribute('position', new THREE.BufferAttribute(this.emVert, 3));
-      this.emGeo.setAttribute('color', new THREE.BufferAttribute(this.emCol, 3));
-      this.emLine = new THREE.LineSegments(
-        this.emGeo,
-        new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, depthWrite: false })
-      );
-      this.emLine.frustumCulled = false;
-      this.group.add(this.emLine);
-      for (let i = 0; i < LavaField.EMB; i++) this.emLife[i] = -1;
-    }
-    const N = LavaField.EMB;
-    // ★ ГОРЯЧИЕ ТОЧКИ ИЩЕМ ЗАРАНЕЕ, А НЕ СЛУЧАЙНЫМИ ПРОБАМИ. Швы занимают
-    // около процента площади: пять случайных проб за кадр попадали в них
-    // раз в двадцать кадров, и в воздухе висело два уголька. Раз в полсекунды
-    // прочёсываем площадку перед игроком сеткой и держим список.
-    this.emScan -= dt;
-    if (this.emScan <= 0) {
-      this.emScan = 0.4;
-      this.emSpots.length = 0;
-      for (let i = 0; i < 13; i++) {
-        for (let j = 0; j < 13; j++) {
-          const x = px - 45 + i * 7.5 + (Math.random() - 0.5) * 6;
-          const z = pz - 25 + j * 8 + (Math.random() - 0.5) * 6;
-          if (crackSampler && crackSampler(x, z) > 0.3) this.emSpots.push(x, z);
-        }
-      }
-    }
-    const spots = this.emSpots.length / 2;
-    const births = spots ? Math.min(6, 1 + ((Math.random() * spots * 0.5) | 0)) : 0;
-    for (let tries = 0; tries < births; tries++) {
-      const si = (Math.random() * spots) | 0;
-      const x = this.emSpots[si * 2] + (Math.random() - 0.5) * 2.5;
-      const z = this.emSpots[si * 2 + 1] + (Math.random() - 0.5) * 2.5;
-      let slot = -1;
-      for (let i = 0; i < N; i++) {
-        if (this.emLife[i] < 0) {
-          slot = i;
-          break;
-        }
-      }
-      if (slot < 0) break;
-      this.emP[slot * 3] = x;
-      this.emP[slot * 3 + 1] = ground(x, z) + 0.1;
-      this.emP[slot * 3 + 2] = z;
-      this.emV[slot * 3] = (Math.random() - 0.5) * 1.2;
-      this.emV[slot * 3 + 1] = 1.6 + Math.random() * 3.4;
-      this.emV[slot * 3 + 2] = (Math.random() - 0.5) * 1.2;
-      this.emAge[slot] = 0;
-      this.emLife[slot] = 0.7 + Math.random() * 1.3;
-    }
-    for (let i = 0; i < N; i++) {
-      const o = i * 6;
-      if (this.emLife[i] < 0) {
-        this.emVert[o + 1] = -1e6;
-        this.emVert[o + 4] = -1e6;
-        continue;
-      }
-      this.emAge[i] += dt;
-      if (this.emAge[i] > this.emLife[i]) {
-        this.emLife[i] = -1;
-        continue;
-      }
-      // тёплый воздух несёт вверх, скорость гасится
-      this.emV[i * 3 + 1] += 1.2 * dt;
-      this.emV[i * 3] *= 1 - dt * 1.4;
-      this.emV[i * 3 + 2] *= 1 - dt * 1.4;
-      this.emP[i * 3] += this.emV[i * 3] * dt;
-      this.emP[i * 3 + 1] += this.emV[i * 3 + 1] * dt;
-      this.emP[i * 3 + 2] += this.emV[i * 3 + 2] * dt;
-      const k = 1 - this.emAge[i] / this.emLife[i];
-      // штрих по ходу: уголёк виден дугой, а не точкой
-      const tl = 0.055;
-      this.emVert[o] = this.emP[i * 3];
-      this.emVert[o + 1] = this.emP[i * 3 + 1];
-      this.emVert[o + 2] = this.emP[i * 3 + 2];
-      this.emVert[o + 3] = this.emP[i * 3] - this.emV[i * 3] * tl;
-      this.emVert[o + 4] = this.emP[i * 3 + 1] - this.emV[i * 3 + 1] * tl;
-      this.emVert[o + 5] = this.emP[i * 3 + 2] - this.emV[i * 3 + 2] * tl;
-      // белое ядро → оранжевый → багровый уголь
-      const c0 = 2.6 * k;
-      this.emCol[o] = c0;
-      this.emCol[o + 1] = 0.75 * k * k;
-      this.emCol[o + 2] = 0.18 * k * k * k;
-      this.emCol[o + 3] = c0 * 0.4;
-      this.emCol[o + 4] = 0.3 * k * k;
-      this.emCol[o + 5] = 0.06 * k * k * k;
-    }
-    this.emGeo.attributes.position.needsUpdate = true;
-    this.emGeo.attributes.color.needsUpdate = true;
-  }
-
-  /** очаги для шейдера рельефа */
-  get glowData(): Float32Array {
-    return this.glowBuf;
-  }
-
-  private updateSparks(dt: number, lakes: Lake[], toWorldX: (u: number, z: number) => number): void {
-    if (!this.spPts) {
-      this.spGeo.setAttribute('position', new THREE.BufferAttribute(this.spPos, 3));
-      this.spGeo.setAttribute('color', new THREE.BufferAttribute(this.spCol, 3));
-      this.spGeo.setAttribute('size', new THREE.BufferAttribute(this.spSize, 1));
-      // ★ КРУГЛЫЕ, А НЕ КВАДРАТНЫЕ. Штатный PointsMaterial без текстуры рисует
-      // ровно квадрат — вблизи это и видно. Форму задаём в шейдере, заодно у
-      // каждой искры свой размер.
-      this.spPts = new THREE.Points(
-        this.spGeo,
-        new THREE.ShaderMaterial({
-          vertexShader: /* glsl */ `
-            attribute float size;
-            varying vec3 vCol;
-            void main() {
-              vCol = color;
-              vec4 mv = modelViewMatrix * vec4(position, 1.0);
-              // ★ НИЖНИЙ ПОРОГ В ПИКСЕЛЯХ. Честный перспективный размер уводит
-              // искру в доли пикселя уже на паре сотен метров, и рой над дальней
-              // лавой исчезает — а именно он и должен быть виден издалека. Меньше
-              // полутора пикселей не даём: вдали это россыпь светлячков.
-              gl_PointSize = max(1.6, size * 300.0 / max(1.0, -mv.z));
-              gl_Position = projectionMatrix * mv;
-            }
-          `,
-          fragmentShader: /* glsl */ `
-            varying vec3 vCol;
-            void main() {
-              vec2 p = gl_PointCoord * 2.0 - 1.0;
-              float r = dot(p, p);
-              if (r > 1.0) discard;
-              // ядро плотное, к краю сходит мягко
-              gl_FragColor = vec4(vCol, (1.0 - r) * 0.9 + (1.0 - r) * (1.0 - r) * 0.6);
-            }
-          `,
-          vertexColors: true,
-          transparent: true,
-          depthWrite: false,
-          blending: THREE.AdditiveBlending,
-        })
-      );
-      this.spPts.frustumCulled = false;
-      this.group.add(this.spPts);
-      this.group.add(this.pitLight);
-      for (let i = 0; i < LavaField.SP; i++) this.spLife[i] = -1;
-    }
-    const N = LavaField.SP;
-    for (let i = 0; i < N; i++) {
-      if (this.spLife[i] > 0) {
-        this.spAge[i] += dt;
-        if (this.spAge[i] > this.spLife[i]) {
-          this.spLife[i] = -1;
-          this.spPos[i * 3 + 1] = -1e6;
-          continue;
-        }
-        this.spVel[i * 3 + 1] -= 12 * dt;
-        this.spPos[i * 3] += this.spVel[i * 3] * dt;
-        this.spPos[i * 3 + 1] += this.spVel[i * 3 + 1] * dt;
-        this.spPos[i * 3 + 2] += this.spVel[i * 3 + 2] * dt;
-        // остывает на лету: белое ядро → оранжевый → почти чёрный
-        const k = 1 - this.spAge[i] / this.spLife[i];
-        this.spCol[i * 3] = 3.2 * k;
-        this.spCol[i * 3 + 1] = 1.1 * k * k;
-        this.spCol[i * 3 + 2] = 0.25 * k * k * k;
-        continue;
-      }
-      // ★ ИСКРЫ ЛЕТЯТ И С ЯЗЫКОВ, А НЕ ТОЛЬКО С ОЗЁР. Расплав булькает везде,
-      // где он есть; привязка только к озёрам оставляла потоки мёртвыми.
-      // рождаются часто: рой держится только плотным потоком
-      if (Math.random() > 0.75) continue;
-      let su = 0;
-      let sz = 0;
-      let sy = 0;
-      let wallUp = 0;
-      if (this.sparkNodes.length && (lakes.length === 0 || Math.random() < 0.6)) {
-        const nd = this.sparkNodes[(Math.random() * this.sparkNodes.length) | 0];
-        const a2 = Math.random() * Math.PI * 2;
-        const rr = Math.sqrt(Math.random()) * Math.min(nd.wl, nd.wr) * 0.8;
-        su = nd.u + Math.cos(a2) * rr;
-        sz = nd.z + Math.sin(a2) * rr;
-        sy = nd.y + 0.25;
-      } else if (lakes.length) {
-        const l = lakes[(Math.random() * lakes.length) | 0];
-        const a = Math.random() * Math.PI * 2;
-        const r = Math.sqrt(Math.random()) * l.r * 0.85;
-        su = l.u + Math.cos(a) * r;
-        sz = l.z + Math.sin(a) * r;
-        sy = l.y + 0.3;
-        wallUp = l.wall ?? 0;
-      } else {
-        continue;
-      }
-      this.spPos[i * 3] = toWorldX(su, sz);
-      this.spPos[i * 3 + 1] = sy;
-      this.spPos[i * 3 + 2] = sz;
-      // ★ БРЫЗГИ ОБЯЗАНЫ ПЕРЕЛЕТАТЬ КРАЙ ЯМЫ. Замер: искры поднимались на 1.6 м
-      // над зеркалом при стене чаши в 47 м — снаружи их не было видно в
-      // принципе, сколько ни делай их ярче и мельче. Начальную скорость берём
-      // из высоты стены: подъём считается как sp²/(2g), целимся на дюжину
-      // метров выше кромки.
-      const need = wallUp + 12;
-      const sp = Math.sqrt(2 * 12 * Math.max(6, need)) * (0.7 + Math.random() * 0.55);
-      this.spVel[i * 3] = (Math.random() - 0.5) * 5;
-      this.spVel[i * 3 + 1] = sp;
-      this.spVel[i * 3 + 2] = (Math.random() - 0.5) * 5;
-      this.spAge[i] = 0;
-      // жить должна хотя бы до верхней точки, иначе гаснет на полпути
-      this.spLife[i] = Math.max(0.5, sp / 12) * (0.9 + Math.random() * 0.9);
-      // разброс размеров: редкая крупная капля среди мелкой пыли
-      // ★ РАЗМЕР МЕРЯЕМ В ПИКСЕЛЯХ, А НЕ В МЕТРАХ. Буфер кадра всего 426×240:
-      // искра в четверть метра на тридцати метрах даёт меньше трёх пикселей и
-      // пропадает совсем. Держим срединную около шести — как у прежних крупных
-      // точек, но круглую и вчетверо более частую.
-      this.spSize[i] = 0.45 + Math.pow(Math.random(), 2.2) * 1.05;
-    }
-    this.spGeo.attributes.position.needsUpdate = true;
-    this.spGeo.attributes.color.needsUpdate = true;
-    this.spGeo.attributes.size.needsUpdate = true;
-  }
-
-  update(
-    px: number,
-    pz: number,
-    time: number,
-    toValleyU: (x: number, z: number) => number,
-    toWorldX: (u: number, z: number) => number,
-    ground: (x: number, z: number) => number,
-    volcano: (z: number) => number
-  ): void {
-    this.material.uniforms.uTime.value = time;
-    void px;
-    void toValleyU;
-    if (volcano(pz) <= 0.01) {
-      for (const [k, m] of this.built) {
-        this.group.remove(m);
-        m.geometry.dispose();
-        this.built.delete(k);
-      }
-      return;
-    }
-    // искры и зарево — каждый кадр, они живые
-    this.sparkNodes.length = 0;
-    {
-      const k0 = Math.floor(pz / VENT_STEP);
-      for (let k = k0 - 3; k <= k0 + 1; k++) {
-        const v = ventAt(k);
-        if (!v) continue;
-        for (const nd of flowLive(v, ground, toWorldX)) {
-          if (nd.z > pz - 80 && nd.z < pz + 700 && nd.t > 0.6) this.sparkNodes.push(nd);
-        }
-      }
-    }
-    // ★ ИСКРЫ РОЖДАЮТСЯ И НАД ДАЛЬНЕЙ ЛАВОЙ. Прежнее окно кончалось метрах в
-    // пятистах, и вдали расплав стоял немым — а рой искр над ним и есть то, по
-    // чему лаву видно раньше всего.
-    const near = lakesNear(pz + 300, ground, toWorldX, 620);
-    this.updateSparks(1 / 60, near, toWorldX);
-    this.updateEmbers(1 / 60, px, pz, ground);
-    this.updatePlumes(1 / 60, px, pz, lakesNear(pz + 500, ground, toWorldX, 900), toWorldX);
-    // ★ ОЧАГИ СВЕТА: озёра и живые узлы языков, ближайшие к игроку.
-    this.glowBuf.fill(0);
-    {
-      type Src = { x: number; z: number; r: number; s: number; d: number };
-      const src: Src[] = [];
-      for (const l of near) {
-        const lx = toWorldX(l.u, l.z);
-        src.push({ x: lx, z: l.z, r: Math.max(26, l.r * 1.6), s: 1, d: Math.hypot(lx - px, l.z - pz) });
-      }
-      for (const nd of this.sparkNodes) {
-        const nx = toWorldX(nd.u, nd.z);
-        src.push({ x: nx, z: nd.z, r: 34, s: 0.5 * nd.t, d: Math.hypot(nx - px, nd.z - pz) });
-      }
-      src.sort((a, b) => a.d - b.d);
-      const n = Math.min(LavaField.GLOW_N, src.length);
-      for (let i = 0; i < n; i++) {
-        const o = src[i];
-        this.glowBuf[i * 4] = o.x;
-        this.glowBuf[i * 4 + 1] = o.z;
-        this.glowBuf[i * 4 + 2] = o.r;
-        this.glowBuf[i * 4 + 3] = o.s;
-      }
-      // две настоящие лампы — ради скал, деревьев и самой доски
-      for (let i = 0; i < 2; i++) {
-        const o = src[i];
-        if (o && o.d < 220) {
-          this.lavaLights[i].position.set(o.x, ground(o.x, o.z) + 6, o.z);
-          this.lavaLights[i].intensity = 22 * o.s * Math.max(0, 1 - o.d / 220);
-        } else {
-          this.lavaLights[i].intensity = 0;
-        }
-      }
-    }
-
-    // самое глубокое озеро рядом — это дно пропасти, оно и светит
-    let deep: Lake | null = null;
-    for (const l of near) if (!deep || l.depth > deep.depth) deep = l;
-    if (deep && deep.depth > 10) {
-      this.pitLight.position.set(toWorldX(deep.u, deep.z), deep.y + 12, deep.z);
-      this.pitLight.intensity = 26;
-      this.pitLight.distance = 1100;
-    } else {
-      this.pitLight.intensity = 0;
-    }
-
-    // ★ СПИСОК ПЕРЕСМАТРИВАЕМ КАЖДЫЙ КАДР, А СТРОИМ ПО БЮДЖЕТУ ВРЕМЕНИ.
-    // Прежняя пара «раз в 18 м пути и по одному мешу за проход» не поспевала:
-    // замер на ходу показал 7 незастроенных кусков из 8 нужных. Лава при этом
-    // жива для столкновений — игрок ехал по земле и проваливался в расплав,
-    // которого не видно. Теперь недостающее строится сколько успеет за 2.5 мс,
-    // и ближнее вперёд дальнего.
-    const want = new Set<string>();
-    const todo: Array<{ key: string; d: number; make: () => THREE.Mesh | null }> = [];
-    // ★ ОЗЁРА СТРОИМ ДАЛЕКО ВПЕРЁД. Прежнее окно давало ровно шестьсот метров
-    // (замер: на 702 м и дальше меши не построены), и на полном ходу озеро
-    // проявлялось поздно. Полтора километра — это секунд сорок пути.
-    for (const l of lakesNear(pz + 500, ground, toWorldX, 900)) {
-      const key = Math.round(l.u) + ',' + Math.round(l.z);
-      want.add(key);
-      if (this.built.has(key)) continue;
-      todo.push({ key, d: Math.abs(l.z - pz), make: () => this.buildLake(l, ground, toWorldX) });
-    }
-    // потоки строятся кусками: целиком лента слишком длинная, а куском её
-    // можно выбрасывать позади так же, как озёра
-    const k0 = Math.floor((pz + 200) / VENT_STEP);
-    for (let k = k0 - 3; k <= k0 + 1; k++) {
-      const v = ventAt(k);
-      if (!v) continue;
-      const nodes = flowOf(v, ground, toWorldX);
-      for (let i = 0; i < nodes.length; i += 8) {
-        const part = nodes.slice(i, Math.min(nodes.length, i + 9));
-        if (part.length < 2) continue;
-        // диапазон куска считаем по живым узлам, а не по краям массива
-        let zMin = Infinity;
-        let zMax = -Infinity;
-        for (const nd of part) {
-          if (nd.t < 0) continue;
-          if (nd.z < zMin) zMin = nd.z;
-          if (nd.z > zMax) zMax = nd.z;
-        }
-        if (zMin === Infinity) continue;
-        if (zMax < pz - 260 || zMin > pz + 900) continue;
-        const key = 'f' + v.k + ':' + i;
-        want.add(key);
-        if (this.built.has(key)) continue;
-        todo.push({
-          key,
-          d: Math.abs((zMin + zMax) * 0.5 - pz),
-          make: () => this.buildFlow(part, ground, toWorldX),
-        });
-      }
-    }
-    todo.sort((x, y) => x.d - y.d);
-    const t0 = performance.now();
-    for (const job of todo) {
-      const m = job.make();
-      if (m) {
-        this.built.set(job.key, m);
-        this.group.add(m);
-      } else {
-        this.built.set(job.key, EMPTY_MESH);
-      }
-      if (performance.now() - t0 > 2.5) break;
-    }
-    for (const [k, m] of this.built) {
-      if (want.has(k)) continue;
-      if (m !== EMPTY_MESH) {
-        this.group.remove(m);
-        m.geometry.dispose();
-      }
-      this.built.delete(k);
-    }
-  }
-
-  /**
-   * Меш потока: тело с валиками по краям и отвесными боками. Бока обязательны
-   * — без них лента читается наклейкой на склоне, а не телом расплава.
-   */
-  /**
-   * ★ ЯЗЫК РИСУЕТСЯ РАСТРОМ ПОЛЯ, А НЕ ЛЕНТОЙ ИЗ ЧЕТЫРЁХУГОЛЬНИКОВ.
-   * Пять заходов я правил ширину полосы — и всё равно получалась полоса:
-   * лента вдоль оси по построению имеет две параллельные кромки, сколько ни
-   * меняй расстояние между ними. Поэтому геометрия строится так же, как у
-   * озёр: сетка ячеек, и в каждой решается, есть здесь расплав или нет.
-   * Тогда контур задаётся не двумя линиями, а полем — он рваный, с заливами
-   * и островами, и режется рельефом сам собой.
-   */
-  /**
-   * ★ ЯЗЫК РИСУЕТСЯ РАСТРОМ ПОЛЯ, А НЕ ЛЕНТОЙ. Лента вдоль оси по построению
-   * имеет две параллельные кромки — сколько ни меняй расстояние между ними,
-   * это остаётся полосой. Здесь в каждой ячейке решается, есть расплав или
-   * нет, и контур получается рваным: с заливами, перешейками и островами.
-   *
-   * ★ ЯЧЕЙКА МЕЛКАЯ. Первая версия растила ячейку, пока сетка не влезет в
-   * лимит, и на широких языках доходила до 7.5 м — кромка получалась
-   * лесенкой из огромных квадратов, то есть опять «прямоугольная лава».
-   * Теперь шаг фиксирован (2.2 м), а тяжесть снята иначе: РЕЛЬЕФ спрашивается
-   * вчетверо реже и растягивается билинейно — он меняется плавно, а форма
-   * кромки от него не зависит.
-   */
-  private buildFlow(
-    nodes: FlowNode[],
-    ground: (x: number, z: number) => number,
-    toWorldX: (u: number, z: number) => number
-  ): THREE.Mesh | null {
-    const live = nodes.filter((n) => n.t > 0);
-    if (live.length < 2) return null;
-    let uMin = Infinity;
-    let uMax = -Infinity;
-    let zMin = Infinity;
-    let zMax = -Infinity;
-    for (const n of live) {
-      const R = Math.max(n.wl + n.al, n.wr + n.ar) + 5;
-      if (n.u - R < uMin) uMin = n.u - R;
-      if (n.u + R > uMax) uMax = n.u + R;
-      if (n.z - R < zMin) zMin = n.z - R;
-      if (n.z + R > zMax) zMax = n.z + R;
-    }
-    const S = 2.2;
-    const nu = Math.min(96, Math.ceil((uMax - uMin) / S));
-    const nz = Math.min(96, Math.ceil((zMax - zMin) / S));
-
-    // сетка высот рельефа вчетверо реже растра
-    // ★ СЕТКА РЕЛЬЕФА ПЛОТНЕЕ. При шаге 6.6 м колодец радиусом в десяток
-    // метров проскакивал между пробами, и лента накрывала провал плитой —
-    // замер ловил вершины языков на 92 м выше земли.
-    const GS = 2;
-    const gu = Math.ceil(nu / GS) + 1;
-    const gz = Math.ceil(nz / GS) + 1;
-    const gGrid = new Float32Array(gu * gz);
-    for (let j = 0; j < gz; j++) {
-      const z = zMin + j * GS * S;
-      for (let i = 0; i < gu; i++) {
-        const u = uMin + i * GS * S;
-        gGrid[j * gu + i] = ground(toWorldX(u, z), z);
-      }
-    }
-    const groundAt = (i: number, j: number): number => {
-      const fi = i / GS;
-      const fj = j / GS;
-      const i0 = Math.min(gu - 2, Math.floor(fi));
-      const j0 = Math.min(gz - 2, Math.floor(fj));
-      const ti = fi - i0;
-      const tj = fj - j0;
-      const a = gGrid[j0 * gu + i0];
-      const b = gGrid[j0 * gu + i0 + 1];
-      const c = gGrid[(j0 + 1) * gu + i0];
-      const d = gGrid[(j0 + 1) * gu + i0 + 1];
-      return (a + (b - a) * ti) + ((c + (d - c) * ti) - (a + (b - a) * ti)) * tj;
-    };
-
-    type P = { x: number; y: number; z: number; wet: boolean; d: number };
-    const node = (i: number, j: number): P => {
-      const u = uMin + i * S;
-      const z = zMin + j * S;
-      const g = groundAt(i, j);
-      // ★ ТА ЖЕ ФОРМУЛА, ЧТО У ФИЗИКИ И УРОНА. Пока их было две, они
-      // расходились: доска ехала на два с половиной метра ниже нарисованной
-      // корки. Тело ограничено собственной толщиной — крупную яму язык
-      // обтекает по дну, а не мостит плитой.
-      const f = flowFieldAt(u, z, live);
-      const body = Math.min(Math.max(0, f.y - g), f.th) * f.cover;
-      const wet = f.cover > 0.02 && body > 0.05;
-      return {
-        x: toWorldX(u, z),
-        y: g + body,
-        z,
-        wet,
-        d: wet ? Math.min(1, body / Math.max(1, f.th)) : 0,
-      };
-    };
-
-    const pos: number[] = [];
-    const hot: number[] = [];
-    let prevRow: P[] = [];
-    for (let j = 0; j <= nz; j++) {
-      const row: P[] = [];
-      for (let i = 0; i <= nu; i++) row.push(node(i, j));
-      if (j > 0) {
-        for (let i = 0; i < nu; i++) {
-          const a = prevRow[i];
-          const b = prevRow[i + 1];
-          const c = row[i + 1];
-          const d = row[i];
-          if (!a.wet && !b.wet && !c.wet && !d.wet) continue;
-          pos.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
-          hot.push(a.d, b.d, c.d);
-          pos.push(a.x, a.y, a.z, c.x, c.y, c.z, d.x, d.y, d.z);
-          hot.push(a.d, c.d, d.d);
-        }
-      }
-      prevRow = row;
-    }
-    if (pos.length === 0) return null;
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-    g.setAttribute('aHot', new THREE.Float32BufferAttribute(hot, 1));
-    const mesh = new THREE.Mesh(g, this.material);
-    mesh.frustumCulled = true;
-    return mesh;
-  }
-
-  private buildLake(
-    l: Lake,
-    ground: (x: number, z: number) => number,
-    toWorldX: (u: number, z: number) => number
-  ): THREE.Mesh | null {
-    // ★ РЕЛЬЕФ СПРАШИВАЕМ РЕДКО. Выборка высоты стоит 9.5 мкс, а сетка озера
-    // радиусом полсотни метров — под две тысячи узлов: замер поймал постройку
-    // в 31 мс, то есть два пропущенных кадра на одно озеро. Узлы считаем по
-    // строкам (раньше каждый брался дважды), а землю — вчетверо реже с
-    // билинейной растяжкой: она меняется плавно, урез от этого не страдает.
-    const S = 4;
-    const n = Math.ceil((l.r * 2) / S);
-    // ★ РЕЛЬЕФ ПОД ОЗЕРОМ СПРАШИВАЕМ ТОЧНО. Разреженная сетка сглаживала
-    // колодец (он всего десяток метров радиусом), и зеркало накрывало провал
-    // плитой — замер ловил вершины на 157 м выше земли. Сетка озера мала,
-    // точная выборка тут по карману.
-    const GS = 1;
-    const gn = Math.ceil(n / GS) + 1;
-    const gGrid = new Float32Array(gn * gn);
-    for (let j = 0; j < gn; j++) {
-      const z = l.z - l.r + j * GS * S;
-      for (let i = 0; i < gn; i++) {
-        const u = l.u - l.r + i * GS * S;
-        gGrid[j * gn + i] = ground(toWorldX(u, z), z);
-      }
-    }
-    const groundAt = (i: number, j: number): number => {
-      const fi = Math.min(gn - 1.001, i / GS);
-      const fj = Math.min(gn - 1.001, j / GS);
-      const i0 = Math.floor(fi);
-      const j0 = Math.floor(fj);
-      const ti = fi - i0;
-      const tj = fj - j0;
-      const a0 = gGrid[j0 * gn + i0];
-      const b0 = gGrid[j0 * gn + i0 + 1];
-      const c0 = gGrid[(j0 + 1) * gn + i0];
-      const d0 = gGrid[(j0 + 1) * gn + i0 + 1];
-      const top = a0 + (b0 - a0) * ti;
-      return top + (c0 + (d0 - c0) * ti - top) * tj;
-    };
-
-    const pos: number[] = [];
-    const hot: number[] = [];
-    type P = {
-      x: number; z: number; y: number; g: number; wet: boolean; d: number;
-      // почему узел сухой — от этого зависит, можно ли резать по нему ячейку
-      inC: boolean;   // внутри круга озера
-      deep: boolean;  // ниже дна чаши (колодец слива)
-    };
-    const node = (i: number, j: number): P => {
-      const u = l.u - l.r + i * S;
-      const z = l.z - l.r + j * S;
-      const x = toWorldX(u, z);
-      const g = groundAt(i, j);
-      const inside = (u - l.u) ** 2 + (z - l.z) ** 2 <= l.r * l.r;
-      const raw = l.y - g;
-      // ★ ГЛУБЖЕ СОБСТВЕННОЙ ЧАШИ РАСПЛАВА НЕТ. Без этого предела зеркало
-      // перекрывало плитой и колодец, и весь уходящий вниз склон: замер давал
-      // вершины на 157 м выше земли. Там, где дно проваливается глубже чаши
-      // (это и есть слив), ячейка не рисуется — получается дыра, куда лава
-      // и стекает.
-      const wet = inside && raw > 0 && raw <= l.depth + 1.5;
-      // ★ СУХОЙ УГОЛ САДИТСЯ НА ЗЕМЛЮ. Ячейка рисуется, если залит хотя бы
-      // один её угол, а остальные три оставались на уровне зеркала — и висели
-      // над уходящей землёй на всю её глубину (замер: до 160 м над грунтом,
-      // ровно над колодцем). Теперь незалитый угол прижат к грунту, и ячейка
-      // становится клином от зеркала к берегу.
-      return {
-        x,
-        z,
-        y: wet ? l.y : Math.min(l.y, g + 0.15),
-        g,
-        wet,
-        inC: inside,
-        deep: raw > l.depth + 1.5,
-        // ★ ОЗЕРО РАСПЛАВЛЕНО ЦЕЛИКОМ. Жар вершины падал к нулю на мелководье,
-        // и по краю зеркала шла тёмная остывшая кайма — она и читалась как
-        // «переход от лавы к обычной поверхности» внутри чаши. Никакого перехода
-        // там нет: в котловине всё расплав, глубина лишь чуть подсвечивает
-        // середину.
-        d: wet ? 0.88 + 0.12 * Math.min(1, raw / Math.max(1, l.depth)) : 0,
-      };
-    };
-    // ★ НИКАКИХ ПЕРЕХОДОВ У БЕРЕГА. Раньше узлы у самого уреза садились на
-    // грунт, и зеркало сходило к берегу пологим клином — в чаше это читалось
-    // рампой из лавы в породу, которой там взяться неоткуда. Озеро — это
-    // ровное зеркало, обрезанное по урезу: рисуются только те ячейки, у
-    // которых залиты ВСЕ четыре угла. Ступенька у берега при шаге сетки в
-    // четыре метра меньше самого берега и прячется в его склоне.
-    const grid: P[][] = [];
-    for (let j = 0; j <= n; j++) {
-      const row: P[] = [];
-      for (let i = 0; i <= n; i++) row.push(node(i, j));
-      grid.push(row);
-    }
-    // ★ КРАЙ РЕЖЕТСЯ ПО УРЕЗУ, А НЕ ПО ЯЧЕЙКЕ. Правило «ячейка либо есть, либо
-    // нет» даёт по берегу лесенку из четырёхметровых квадратов — те самые
-    // прямоугольные зубцы. Граничную ячейку строим как многоугольник: берём её
-    // залитые углы, а на рёбрах, где расплав кончается, ставим точку РОВНО
-    // там, где земля пересекает зеркало. Линия берега получается ломаной по
-    // самому урезу, и на глаз она гладкая.
-    const cut = (p1: P, p2: P): P => {
-      // доля до пересечения: raw = уровень − земля, меняет знак на урезе
-      const r1 = l.y - p1.g;
-      const r2 = l.y - p2.g;
-      let t = r1 / (r1 - r2);
-      if (!isFinite(t)) t = 0.5;
-      // край не подводим вплотную к узлу: вырожденные лоскуты дают те же иглы
-      t = Math.max(0.18, Math.min(0.82, t));
-      return {
-        x: p1.x + (p2.x - p1.x) * t,
-        z: p1.z + (p2.z - p1.z) * t,
-        y: l.y,
-        g: l.y,
-        wet: true,
-        d: p1.d,
-        inC: true,
-        deep: false,
-      };
-    };
-    for (let j = 1; j <= n; j++) {
-      for (let i = 0; i < n; i++) {
-        const quad = [grid[j - 1][i], grid[j - 1][i + 1], grid[j][i + 1], grid[j][i]];
-        let nWet = 0;
-        for (const q of quad) if (q.wet) nWet++;
-        // ★ ОДИНОКИЙ ЗАЛИТЫЙ УГОЛ — ЭТО ЗУБЕЦ. Ячейка, у которой под расплавом
-        // только один угол, даёт узкий треугольник, торчащий из берега остриём;
-        // именно из них складывались «острые артефакты» по краю. Такую ячейку
-        // не рисуем вовсе: потеря — уголок в пару метров, зато берег ровный.
-        if (nWet <= 1) continue;
-        let poly: P[];
-        if (nWet === 4) {
-          poly = quad;
-        } else if (quad.some((q) => !q.inC || q.deep)) {
-          // ★ РЕЖЕМ ТОЛЬКО ПО УРЕЗУ. Если угол сухой не потому, что там берег, а
-          // потому, что он вышел за круг озера или попал в колодец слива, то
-          // интерполяция «где земля пересекает зеркало» считает по одну сторону
-          // мусор: у соседних ячеек он получается разный, и на стыке вылезают
-          // иглы. Такую ячейку просто не рисуем.
-          continue;
-        } else {
-          poly = [];
-          for (let e = 0; e < 4; e++) {
-            const p1 = quad[e];
-            const p2 = quad[(e + 1) % 4];
-            if (p1.wet) poly.push(p1);
-            if (p1.wet !== p2.wet) poly.push(cut(p1, p2));
-          }
-        }
-        if (poly.length < 3) continue;
-        for (let k = 1; k + 1 < poly.length; k++) {
-          const p0 = poly[0];
-          const p1 = poly[k];
-          const p2 = poly[k + 1];
-          pos.push(p0.x, p0.y, p0.z, p1.x, p1.y, p1.z, p2.x, p2.y, p2.z);
-          hot.push(p0.d, p1.d, p2.d);
-        }
-      }
-    }
-    if (pos.length === 0) return null;
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-    g.setAttribute('aHot', new THREE.Float32BufferAttribute(hot, 1));
-    const mesh = new THREE.Mesh(g, this.material);
-    mesh.frustumCulled = true;
-    return mesh;
-  }
-
-}

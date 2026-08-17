@@ -1,6 +1,9 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { spriteCloud, SpriteCloud } from './sprites';
+import { vec3, vec4, pow, max, min, sqrt } from 'three/tsl';
+import { lambert, line } from '../core/mat';
 import { bombList, impactList, type Bomb } from '../world/lava';
-import { addCrater, ageCraters, craterData } from './craters';
+import { addCrater } from './craters';
 
 /**
  * ★ ФАЕРБОЛ — ЭТО СОБЫТИЕ, А НЕ ТОЧКА. Раньше снаряд был одним пикселем
@@ -31,19 +34,16 @@ const MARK_SEG = 20;
  */
 const BLAST_K = 4.6;
 
-const HEAD_FRAG = /* glsl */ `
-varying vec3 vCol;
-void main() {
-  vec2 p = gl_PointCoord * 2.0 - 1.0;
-  float r = length(p);
-  if (r > 1.0) discard;
-  // белое ядро → оранжевая корона → рваный край
-  float core = pow(max(0.0, 1.0 - r), 2.2);
-  float halo = pow(max(0.0, 1.0 - r), 0.6);
-  vec3 c = vCol * halo + vec3(1.6, 1.2, 0.7) * core;
-  gl_FragColor = vec4(c, min(1.0, halo * 1.4));
-}
-`;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type Nd = any;
+/** голова снаряда: белое ядро → оранжевая корона → рваный край */
+const headFrag = (col: Nd, r2: Nd): Nd => {
+  const r = sqrt(r2);
+  const core = pow(max(0.0, r.oneMinus()), 2.2);
+  const halo = pow(max(0.0, r.oneMinus()), 0.6);
+  const c = col.mul(halo).add(vec3(1.6, 1.2, 0.7).mul(core));
+  return vec4(c, min(1.0, halo.mul(1.4)));
+};
 
 export class Fireballs {
   readonly group = new THREE.Group();
@@ -58,14 +58,14 @@ export class Fireballs {
   private life = new Float32Array(MAX);
   private next = 0;
 
-  private geo = new THREE.BufferGeometry();
-  private pts: THREE.Points;
+  private cloud: SpriteCloud;
+  private pts: THREE.Sprite;
 
-  private headGeo = new THREE.BufferGeometry();
+  private headCloud: SpriteCloud;
   private headPos = new Float32Array(HEADS * 3);
   private headCol = new Float32Array(HEADS * 3);
   private headSize = new Float32Array(HEADS);
-  private heads: THREE.Points;
+  private heads: THREE.Sprite;
 
   /**
    * ★ У СНАРЯДА ЕСТЬ ТЕЛО. Один только огонь читался пятном света без веса —
@@ -99,71 +99,25 @@ export class Fireballs {
    */
   blasts: Array<{ power: number; x: number; z: number; dist: number }> = [];
 
-  /** свежие воронки для шейдера рельефа */
-  get craterData(): Float32Array {
-    return craterData();
-  }
-
   constructor() {
     // общий буфер частиц: и хвосты, и разлёт от взрыва
-    this.geo.setAttribute('position', new THREE.BufferAttribute(this.pos, 3));
-    this.geo.setAttribute('color', new THREE.BufferAttribute(this.col, 3));
-    this.geo.setAttribute('size', new THREE.BufferAttribute(this.size, 1));
-    this.pts = new THREE.Points(
-      this.geo,
-      new THREE.ShaderMaterial({
-        vertexShader: /* glsl */ `
-          attribute float size;
-          varying vec3 vCol;
-          void main() {
-            vCol = color;
-            vec4 mv = modelViewMatrix * vec4(position, 1.0);
-            gl_PointSize = size * 320.0 / max(1.0, -mv.z);
-            gl_Position = projectionMatrix * mv;
-          }
-        `,
-        fragmentShader: /* glsl */ `
-          varying vec3 vCol;
-          void main() {
-            vec2 p = gl_PointCoord * 2.0 - 1.0;
-            float r = length(p);
-            if (r > 1.0) discard;
-            gl_FragColor = vec4(vCol, pow(max(0.0, 1.0 - r), 1.6));
-          }
-        `,
-        vertexColors: true,
-        transparent: true,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-      })
-    );
-    this.pts.frustumCulled = false;
+    // ★ WebGPU: точки со своим размером — инстансированные спрайты (sprites.ts)
+    this.cloud = spriteCloud({
+      count: MAX, pos: this.pos, col: this.col, size: this.size,
+      k: 320, minPx: 0, maxPx: 1e4,
+      blending: THREE.AdditiveBlending,
+      alpha: (r2) => pow(max(0.0, sqrt(r2).oneMinus()), 1.6),
+    });
+    this.pts = this.cloud.sprite;
     this.group.add(this.pts);
 
-    this.headGeo.setAttribute('position', new THREE.BufferAttribute(this.headPos, 3));
-    this.headGeo.setAttribute('color', new THREE.BufferAttribute(this.headCol, 3));
-    this.headGeo.setAttribute('size', new THREE.BufferAttribute(this.headSize, 1));
-    this.heads = new THREE.Points(
-      this.headGeo,
-      new THREE.ShaderMaterial({
-        vertexShader: /* glsl */ `
-          attribute float size;
-          varying vec3 vCol;
-          void main() {
-            vCol = color;
-            vec4 mv = modelViewMatrix * vec4(position, 1.0);
-            gl_PointSize = size * 420.0 / max(1.0, -mv.z);
-            gl_Position = projectionMatrix * mv;
-          }
-        `,
-        fragmentShader: HEAD_FRAG,
-        vertexColors: true,
-        transparent: true,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-      })
-    );
-    this.heads.frustumCulled = false;
+    this.headCloud = spriteCloud({
+      count: HEADS, pos: this.headPos, col: this.headCol, size: this.headSize,
+      k: 420, minPx: 0, maxPx: 1e4,
+      blending: THREE.AdditiveBlending,
+      frag: headFrag,
+    });
+    this.heads = this.headCloud.sprite;
     this.group.add(this.heads);
 
     // обломок: икосаэдр с рваными вершинами, грани плоские
@@ -176,7 +130,7 @@ export class Fireballs {
     rg.computeVertexNormals();
     this.rocks = new THREE.InstancedMesh(
       rg,
-      new THREE.MeshLambertMaterial({
+      lambert({
         color: 0x241c20,
         emissive: new THREE.Color(0.55, 0.13, 0.02),
         flatShading: true,
@@ -191,7 +145,7 @@ export class Fireballs {
     this.markGeo.setAttribute('color', new THREE.BufferAttribute(this.markCol, 3));
     this.marks = new THREE.LineSegments(
       this.markGeo,
-      new THREE.LineBasicMaterial({
+      line({
         vertexColors: true,
         transparent: true,
         opacity: 0.9,
@@ -302,7 +256,6 @@ export class Fireballs {
       const d = Math.hypot(im.x - px, im.z - pz);
       this.blasts.push({ power: im.r * 0.4 * Math.max(0, 1 - d / 260), x: im.x, z: im.z, dist: d });
     }
-    ageCraters(dt);
     this.flash = Math.max(0, this.flash - dt * 2.6);
     this.light.intensity = this.flash * this.flash * 320;
 
@@ -336,9 +289,7 @@ export class Fireballs {
       this.blasts.sort((a, b) => b.power - a.power);
       this.blasts.length = 3;
     }
-    this.geo.attributes.position.needsUpdate = true;
-    this.geo.attributes.color.needsUpdate = true;
-    this.geo.attributes.size.needsUpdate = true;
+    this.cloud.touch();
 
     // --- ядра ---
     let n = 0;
@@ -373,9 +324,7 @@ export class Fireballs {
     }
     this.rocks.count = m;
     this.rocks.instanceMatrix.needsUpdate = true;
-    this.headGeo.attributes.position.needsUpdate = true;
-    this.headGeo.attributes.color.needsUpdate = true;
-    this.headGeo.attributes.size.needsUpdate = true;
+    this.headCloud.touch();
 
     // --- метки падения ---
     // ★ РИСУЕМ ТОЛЬКО БЛИЖНИЕ. Каждый узел кольца — вызов сэмплера высоты;

@@ -1,4 +1,4 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { Player } from './player/player';
 import { terrainHeight } from './world/terrain';
 import { groundDip } from './fx/ground';

@@ -1,15 +1,20 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import {
+  Fn, If, Loop, float, vec2, vec3, vec4, uniform, uv, texture,
+  dot, cos, sin, max, min, mix, length, floor, fract, pow,
+} from 'three/tsl';
 
 // PSX-слой рендера: сцена рисуется в низком разрешении, затем растягивается
 // без сглаживания с дизерингом Байера и квантованием цвета до 15 бит.
+//
+// ★ WebGPU: те же три прохода, но на RenderTarget + QuadMesh с TSL-узлами.
+// Полноэкранные материалы НЕ идут через фабрику psx(): у них нет ни глубины,
+// ни тумана, ни дрожания. Гамму по-прежнему кладём сами в последнем проходе,
+// поэтому рендерер отдаёт кадр линейным (outputColorSpace = Linear): иначе
+// three добавил бы своё преобразование поверх нашего, и картинка выцвела бы.
 
-const VERT = /* glsl */ `
-varying vec2 vUv;
-void main() {
-  vUv = position.xy * 0.5 + 0.5;
-  gl_Position = vec4(position.xy, 0.0, 1.0);
-}
-`;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type N = any;
 
 // ЭФФЕКТЫ ИДУТ ДО РЕТРО-ПРОХОДА и до HUD. Порядок принципиален: дизеринг и
 // квантование должны ложиться на уже готовую картинку (иначе блюр размажет
@@ -19,166 +24,144 @@ void main() {
 // Все три эффекта — радиальные выборки, поэтому считаются в одном проходе по
 // буферу 426×240: там сто тысяч пикселей, тридцать отсчётов на каждый почти
 // ничего не стоят.
-const FX_FRAG = /* glsl */ `
-uniform sampler2D tDiffuse;
-uniform vec2 uSunUV;    // солнце в координатах экрана
-uniform float uSunAmt;  // 0 — солнце вне кадра/за спиной
-uniform float uSpeed;   // 0..1 — сила радиального смаза
-varying vec2 vUv;
+function buildFx(tDiffuse: THREE.Texture, uSunUV: N, uSunAmt: N, uSpeed: N): N {
+  const tex = (p: N): N => texture(tDiffuse, p);
+  return Fn(() => {
+    const vUv = uv();
+    const rad = vUv.sub(vec2(0.5));
+    const r2 = dot(rad, rad);
 
-float luma(vec3 c) { return dot(c, vec3(0.3, 0.6, 0.1)); }
+    // --- ХРОМАТИЧЕСКАЯ АБЕРРАЦИЯ. Каналы расходятся ТОЛЬКО к краям кадра
+    // (в центре смещение нулевое) — так ведёт себя дешёвая оптика, и так эффект
+    // не мешает смотреть туда, куда едешь. На скорости расходятся сильнее.
+    // 0.006 подобрано по РАСХОЖДЕНИЮ КАНАЛОВ В ПИКСЕЛЯХ: предел около полутора
+    // пикселей буфера — дальше это уже не оптика, а брак печати.
+    const ca = uSpeed.mul(1.6).add(0.9).mul(r2).mul(0.006);
+    const base = vec3(
+      tex(vUv.add(rad.mul(ca))).r,
+      tex(vUv).g,
+      tex(vUv.sub(rad.mul(ca))).b
+    ).toVar();
 
-void main() {
-  vec2 rad = vUv - vec2(0.5);
-  float r2 = dot(rad, rad);
+    // --- РАДИАЛЬНЫЙ СМАЗ ОТ ЦЕНТРА. Скорость в игре не имеет потолка, но на
+    // экране 250 км/ч почти неотличимы от 120: кадр одинаково резкий. Смаз
+    // растёт от центра к краям — в середине картинка остаётся читаемой.
+    If(uSpeed.greaterThan(0.01), () => {
+      const acc = base.toVar();
+      Loop({ start: 1, end: 7, type: 'int', condition: '<' }, ({ i }: { i: N }) => {
+        const t = float(i).div(6.0);
+        acc.addAssign(tex(vUv.sub(rad.mul(t).mul(0.055).mul(uSpeed))).rgb);
+      });
+      // На полной силе кадр на 176 км/ч превращался в кашу: препятствие
+      // впереди уже не прочитать, а именно на такой скорости оно и опасно.
+      base.assign(mix(base, acc.div(7.0), min(1.0, uSpeed.mul(0.75))));
+    });
 
-  // --- ХРОМАТИЧЕСКАЯ АБЕРРАЦИЯ. Каналы расходятся ТОЛЬКО к краям кадра
-  // (в центре смещение нулевое) — так ведёт себя дешёвая оптика, и так эффект
-  // не мешает смотреть туда, куда едешь. На скорости расходятся сильнее.
-  // 0.006 подобрано по РАСХОЖДЕНИЮ КАНАЛОВ В ПИКСЕЛЯХ: при 0.022 края
-  // расходились на четыре пикселя буфера (двенадцать экранных) — это уже не
-  // оптика, а брак печати. Здесь предел около полутора пикселей буфера.
-  float ca = (0.9 + uSpeed * 1.6) * r2 * 0.006;
-  vec3 base;
-  base.r = texture2D(tDiffuse, vUv + rad * ca).r;
-  base.g = texture2D(tDiffuse, vUv).g;
-  base.b = texture2D(tDiffuse, vUv - rad * ca).b;
+    // --- БЛУМ. Квантование в 15 бит съедает мягкое свечение, а на закате оно
+    // и есть половина картинки. Берём яркое сверх порога восемью широкими
+    // отсчётами — на таком разрешении этого достаточно для ореола.
+    // Порог 0.72 — это 97-й процентиль замеренной яркости кадра: при 0.55 за
+    // него уходила пятая часть экрана и блум просто задирал весь снег.
+    const bl = vec3(0.0).toVar();
+    Loop({ start: 0, end: 8, type: 'int', condition: '<' }, ({ i }: { i: N }) => {
+      const a = float(i).mul(0.7854);
+      const o = vec2(cos(a), sin(a)).mul(0.012);
+      bl.addAssign(max(tex(vUv.add(o)).rgb.sub(0.72), 0.0));
+    });
+    base.addAssign(bl.mul(0.34));
 
-  // --- РАДИАЛЬНЫЙ СМАЗ ОТ ЦЕНТРА. Скорость в игре не имеет потолка, но на
-  // экране 250 км/ч почти неотличимы от 120: кадр одинаково резкий. Смаз
-  // растёт от центра к краям — в середине картинка остаётся читаемой.
-  if (uSpeed > 0.01) {
-    vec2 d = vUv - vec2(0.5);
-    vec3 acc = base;
-    for (int i = 1; i <= 6; i++) {
-      float t = float(i) / 6.0;
-      acc += texture2D(tDiffuse, vUv - d * t * 0.055 * uSpeed).rgb;
-    }
-    // На полной силе 0.095 кадр на 176 км/ч превращался в кашу: препятствие
-    // впереди уже не прочитать, а именно на такой скорости оно и опасно.
-    base = mix(base, acc / 7.0, min(1.0, uSpeed * 0.75));
-  }
+    // --- СОЛНЕЧНЫЕ ЛУЧИ. Идём отсчётами К СОЛНЦУ и копим яркое: там, где путь
+    // перекрыт гребнем или деревом, копить нечего — оттого лучи и рисуются
+    // сами, без всякой геометрии.
+    If(uSunAmt.greaterThan(0.001), () => {
+      // марш ограничен по длине: солнце часто выше кадра, и без ограничения
+      // отсчёты сразу улетают за край, где текстура зажимается в кромку —
+      // получалась ровная засветка вместо лучей.
+      const toSun = uSunUV.sub(vUv);
+      const dist = max(length(toSun), 1e-4);
+      const dir = toSun.div(dist).mul(min(dist, 0.42)).div(14.0);
+      const p = vUv.toVar();
+      const w = float(1.0).toVar();
+      const rays = vec3(0.0).toVar();
+      Loop({ start: 0, end: 14, type: 'int', condition: '<' }, () => {
+        p.addAssign(dir);
+        rays.addAssign(max(tex(p).rgb.sub(0.72), 0.0).mul(w));
+        w.mulAssign(0.86);
+      });
+      // ближе к солнцу — плотнее; на краю кадра лучи не должны забивать мир
+      const fall = min(1.0, length(vUv.sub(uSunUV)).mul(0.9)).oneMinus();
+      base.addAssign(rays.mul(uSunAmt.mul(0.11).mul(fall.mul(0.65).add(0.35))));
+    });
 
-  // --- БЛУМ. Квантование в 15 бит съедает мягкое свечение, а на закате оно
-  // и есть половина картинки. Берём яркое сверх порога восемью широкими
-  // отсчётами — на таком разрешении этого достаточно для ореола.
-  // Порог 0.72 — это 97-й процентиль замеренной яркости кадра: при 0.55 за
-  // него уходила пятая часть экрана и блум просто задирал весь снег.
-  vec3 bl = vec3(0.0);
-  for (int i = 0; i < 8; i++) {
-    float a = float(i) * 0.7854;
-    vec2 o = vec2(cos(a), sin(a)) * 0.012;
-    bl += max(texture2D(tDiffuse, vUv + o).rgb - 0.72, 0.0);
-  }
-  base += bl * 0.34;
+    // --- ВИНЬЕТКА. Кладётся ПОСЛЕДНЕЙ и до квантования: если затемнять уже
+    // квантованный кадр, по углам вылезают ступеньки. Буфер линейный, поэтому
+    // на экране (после гаммы) падение мягче, чем выглядит в числах.
+    base.mulAssign(mix(1.0, r2.mul(1.15).oneMinus(), 0.55));
 
-  // --- СОЛНЕЧНЫЕ ЛУЧИ. Идём отсчётами К СОЛНЦУ и копим яркое: там, где путь
-  // перекрыт гребнем или деревом, копить нечего — оттого лучи и рисуются
-  // сами, без всякой геометрии.
-  if (uSunAmt > 0.001) {
-    // марш ограничен по длине: солнце часто выше кадра, и без ограничения
-    // отсчёты сразу улетают за край, где текстура зажимается в кромку —
-    // получалась ровная засветка вместо лучей.
-    vec2 toSun = uSunUV - vUv;
-    float dist = max(length(toSun), 1e-4);
-    vec2 dir = toSun / dist * min(dist, 0.42) / 14.0;
-    vec2 uv = vUv;
-    float w = 1.0;
-    vec3 rays = vec3(0.0);
-    for (int i = 0; i < 14; i++) {
-      uv += dir;
-      vec3 s = texture2D(tDiffuse, uv).rgb;
-      rays += max(s - 0.72, 0.0) * w;
-      w *= 0.86;
-    }
-    // ближе к солнцу — плотнее; на краю кадра лучи не должны забивать мир
-    float fall = 1.0 - min(1.0, length(vUv - uSunUV) * 0.9);
-    base += rays * (0.11 * uSunAmt * (0.35 + 0.65 * fall));
-  }
-
-  // --- ВИНЬЕТКА. Кладётся ПОСЛЕДНЕЙ и до квантования: если затемнять уже
-  // квантованный кадр, по углам вылезают ступеньки. Буфер линейный, поэтому
-  // на экране (после гаммы) падение мягче, чем выглядит в числах.
-  base *= mix(1.0, 1.0 - r2 * 1.15, 0.55);
-
-  gl_FragColor = vec4(base, 1.0);
-}
-`;
-
-const FRAG = /* glsl */ `
-uniform sampler2D tDiffuse;
-uniform vec2 uRes;
-varying vec2 vUv;
-
-float bayer2(vec2 a) {
-  a = floor(a);
-  return fract(a.x / 2.0 + a.y * a.y * 0.75);
+    return vec4(base, 1.0);
+  })();
 }
 
-void main() {
-  vec2 pix = floor(vUv * uRes);
-  vec3 c = texture2D(tDiffuse, vUv).rgb;
-  c = pow(max(c, 0.0), vec3(0.4545));
-  float d = (bayer2(0.5 * pix) * 0.25 + bayer2(pix)) - 0.5;
-  c += d * (1.0 / 24.0);
-  c = floor(c * 31.0 + 0.5) / 31.0;
-  gl_FragColor = vec4(c, 1.0);
+const bayer2 = Fn(([a0]: [N]) => {
+  const a: N = floor(a0);
+  return fract(a.x.div(2.0).add(a.y.mul(a.y).mul(0.75)));
+});
+
+/** ретро-проход: гамма → дизер Байера → квантование до 5 бит на канал */
+function buildRetro(tDiffuse: THREE.Texture, uRes: N): N {
+  return Fn(() => {
+    const vUv = uv();
+    const pix = floor(vUv.mul(uRes));
+    const c = pow(max(texture(tDiffuse, vUv).rgb, 0.0), vec3(0.4545)).toVar();
+    const d = bayer2(pix.mul(0.5)).mul(0.25).add(bayer2(pix)).sub(0.5);
+    c.addAssign(d.mul(1.0 / 24.0));
+    c.assign(floor(c.mul(31.0).add(0.5)).div(31.0));
+    return vec4(c, 1.0);
+  })();
 }
-`;
 
 export class RetroPipeline {
-  private rt: THREE.WebGLRenderTarget;
+  /** мир в низком разрешении (читается DEV-хуками для замеров) */
+  rt: THREE.RenderTarget;
   /** второй таргет: сюда ложатся эффекты, а поверх — HUD */
-  private rtFx: THREE.WebGLRenderTarget;
-  private fxMat: THREE.ShaderMaterial;
-  private fxScene = new THREE.Scene();
-  private postScene = new THREE.Scene();
-  private postCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-  private material: THREE.ShaderMaterial;
+  private rtFx: THREE.RenderTarget;
+  private fxQuad: THREE.QuadMesh;
+  private postQuad: THREE.QuadMesh;
+  private uSunUV = uniform(new THREE.Vector2(0.5, 0.8));
+  private uSunAmt = uniform(0);
+  private uSpeed = uniform(0);
+  private uRes = uniform(new THREE.Vector2(1, 1));
   lowWidth = 1;
   lowHeight = 1;
 
   /** pixelScale: во сколько раз занижаем внутреннее разрешение */
-  constructor(private renderer: THREE.WebGLRenderer, public pixelScale = 3) {
-    this.rt = new THREE.WebGLRenderTarget(1, 1, {
+  constructor(private renderer: THREE.WebGPURenderer, public pixelScale = 3) {
+    // гамму кладём сами — рендерер отдаёт линейный кадр без своего вывода
+    renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+    renderer.toneMapping = THREE.NoToneMapping;
+
+    this.rt = new THREE.RenderTarget(1, 1, {
       minFilter: THREE.NearestFilter,
       magFilter: THREE.NearestFilter,
       depthBuffer: true,
     });
-    this.rtFx = new THREE.WebGLRenderTarget(1, 1, {
+    this.rtFx = new THREE.RenderTarget(1, 1, {
       minFilter: THREE.NearestFilter,
       magFilter: THREE.NearestFilter,
       depthBuffer: false,
     });
-    this.fxMat = new THREE.ShaderMaterial({
-      vertexShader: VERT,
-      fragmentShader: FX_FRAG,
-      uniforms: {
-        tDiffuse: { value: this.rt.texture },
-        uSunUV: { value: new THREE.Vector2(0.5, 0.8) },
-        uSunAmt: { value: 0 },
-        uSpeed: { value: 0 },
-      },
-      depthTest: false,
-      depthWrite: false,
-    });
-    this.material = new THREE.ShaderMaterial({
-      vertexShader: VERT,
-      fragmentShader: FRAG,
-      uniforms: {
-        tDiffuse: { value: this.rtFx.texture },
-        uRes: { value: new THREE.Vector2(1, 1) },
-      },
-      depthTest: false,
-      depthWrite: false,
-    });
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute(
-      'position',
-      new THREE.BufferAttribute(new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]), 3)
-    );
-    this.postScene.add(new THREE.Mesh(geo, this.material));
-    this.fxScene.add(new THREE.Mesh(geo, this.fxMat));
+    const fxMat = new THREE.NodeMaterial();
+    fxMat.fragmentNode = buildFx(this.rt.texture, this.uSunUV, this.uSunAmt, this.uSpeed);
+    fxMat.depthTest = false;
+    fxMat.depthWrite = false;
+    this.fxQuad = new THREE.QuadMesh(fxMat);
+
+    const postMat = new THREE.NodeMaterial();
+    postMat.fragmentNode = buildRetro(this.rtFx.texture, this.uRes);
+    postMat.depthTest = false;
+    postMat.depthWrite = false;
+    this.postQuad = new THREE.QuadMesh(postMat);
+
     this.setSize(window.innerWidth, window.innerHeight);
   }
 
@@ -190,7 +173,7 @@ export class RetroPipeline {
     this.lowHeight = lh;
     this.rt.setSize(lw, lh);
     this.rtFx.setSize(lw, lh);
-    this.material.uniforms.uRes.value.set(lw, lh);
+    this.uRes.value.set(lw, lh);
   }
 
   /**
@@ -199,9 +182,9 @@ export class RetroPipeline {
    * speedN — 0..1 для радиального смаза.
    */
   setEffects(sunX: number, sunY: number, sunAmt: number, speedN: number): void {
-    this.fxMat.uniforms.uSunUV.value.set(sunX, sunY);
-    this.fxMat.uniforms.uSunAmt.value = sunAmt;
-    this.fxMat.uniforms.uSpeed.value = speedN;
+    this.uSunUV.value.set(sunX, sunY);
+    this.uSunAmt.value = sunAmt;
+    this.uSpeed.value = speedN;
   }
 
   /** uiScene/uiCamera — оверлей (HUD), рисуется поверх эффектов */
@@ -216,7 +199,7 @@ export class RetroPipeline {
     this.renderer.render(scene, camera);
     // 2. эффекты rt → rtFx
     this.renderer.setRenderTarget(this.rtFx);
-    this.renderer.render(this.fxScene, this.postCam);
+    this.fxQuad.render(this.renderer);
     // 3. HUD поверх эффектов — он обязан остаться резким
     if (uiScene && uiCamera) {
       this.renderer.autoClear = false;
@@ -225,6 +208,6 @@ export class RetroPipeline {
     }
     // 4. ретро-проход на экран
     this.renderer.setRenderTarget(null);
-    this.renderer.render(this.postScene, this.postCam);
+    this.postQuad.render(this.renderer);
   }
 }

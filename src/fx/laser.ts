@@ -23,99 +23,37 @@
  * terrain.ts — там стоит парная пометка).
  */
 
-/** сколько звеньев следа держим одновременно */
-export const MARKS = 24;
+import { damage, CUT_R, CUT_DEPTH, MOLTEN, COOL, CUT_LIFE } from './damage';
+
 /** как часто ставится звено, с */
 export const STAMP = 0.25;
-/** полуширина борозды, м */
-export const CUT_R = 5.5;
-/** глубина борозды, м */
-export const DEPTH = 2.2;
 /**
- * Сколько расплав в звене остаётся смертельным, с.
- * ★ СОГЛАСОВАНО С ФОРОЙ И ПЕРИОДОМ КАЧАНИЯ. Луч режет за AIM_LEAD секунд до
- * игрока: остынь борозда быстрее — и он всегда приезжает на готовое, атака
- * становится безвредной. Гореть она должна ещё и когда он доедет. С другой
- * стороны, если расплав живёт дольше полупериода качания, ноги перекрывают
- * друг друга и зона превращается в сплошную стену без прохода (замер такой
- * версии: одинаковые пять смертей и при бездействии, и при попытке уйти).
- * Отсюда порядок величин: фора ≈ 2 с, полупериод 2.5 с, расплав 2.9 с —
- * борозда обязана ещё гореть, когда игрок до неё доедет.
+ * Полуширина борозды, м.
+ * ★ РЕЗ ДОЛЖЕН ЧИТАТЬСЯ ПРЕПЯТСТВИЕМ, А НЕ ЦАРАПИНОЙ. На 140 км/ч борозда в
+ * одиннадцать метров поперёк пересекается за треть секунды — её можно было
+ * проскочить, даже не заметив. Полоса поражения обязана быть шире, чем
+ * расстояние, которое доска проходит за время реакции.
  */
-export const MOLTEN = 2.9;
-/** и сколько потом стынет до безопасного, с */
-export const COOL = 1.4;
+export { CUT_R, MOLTEN, COOL };
+/** глубина борозды, м */
+export const DEPTH = CUT_DEPTH;
 /** сколько живёт звено, с */
-export const LIFE = MARKS * STAMP;
+export const LIFE = CUT_LIFE;
 
-/** [ax, az, bx, bz] — отрезок, который прожгла точка касания */
-const A = new Float32Array(MARKS * 4);
-/** [возраст, живучесть 0..1, 0, 0] */
-const B = new Float32Array(MARKS * 4);
-let next = 0;
-
-export function laserA(): Float32Array {
-  return A;
-}
-export function laserB(): Float32Array {
-  return B;
-}
+/**
+ * ★ СЛЕД ТЕПЕРЬ — КАРТА, А НЕ КОЛЬЦО ЗВЕНЬЕВ (см. fx/damage.ts). Звено
+ * вписывается в карту один раз; доска, камера, колея, урон и шейдер рельефа
+ * читают одни и те же тексели. Ограничения на число звеньев нет.
+ */
 
 /** Прожечь очередное звено: от точки, где луч был, к точке, где он стал. */
 export function stampCut(ax: number, az: number, bx: number, bz: number): void {
-  const i = next % MARKS;
-  next++;
-  A[i * 4] = ax;
-  A[i * 4 + 1] = az;
-  A[i * 4 + 2] = bx;
-  A[i * 4 + 3] = bz;
-  B[i * 4] = 0;
-  B[i * 4 + 1] = 1;
-}
-
-export function ageCuts(dt: number): void {
-  for (let i = 0; i < MARKS; i++) {
-    if (B[i * 4 + 1] <= 0) continue;
-    const age = (B[i * 4] += dt);
-    // борозда держится, пока звено «живое», под конец склон её затягивает
-    const over = age - LIFE * 0.7;
-    B[i * 4 + 1] = over <= 0 ? 1 : Math.max(0, 1 - over / (LIFE * 0.3));
-  }
-}
-
-/** Профиль поперёк борозды в точке: 0 — мимо, 1 — по оси. */
-function edge(i: number, x: number, z: number): number {
-  const ax = A[i * 4];
-  const az = A[i * 4 + 1];
-  let ux = A[i * 4 + 2] - ax;
-  let uz = A[i * 4 + 3] - az;
-  const l2 = ux * ux + uz * uz;
-  let h = 0;
-  if (l2 > 1e-4) {
-    h = ((x - ax) * ux + (z - az) * uz) / l2;
-    h = h < 0 ? 0 : h > 1 ? 1 : h;
-  }
-  const dx = x - ax - ux * h;
-  const dz = z - az - uz * h;
-  const d = Math.sqrt(dx * dx + dz * dz);
-  if (d >= CUT_R) return 0;
-  const k = 1 - d / CUT_R;
-  return k * k;
+  damage.paintCut(ax, az, bx, bz);
 }
 
 /** насколько просела земля в точке — борозда от луча */
 export function laserDip(x: number, z: number): number {
-  let d = 0;
-  for (let i = 0; i < MARKS; i++) {
-    const f = B[i * 4 + 1];
-    if (f <= 0.002) continue;
-    const k = edge(i, x, z);
-    // ★ БЕРЁМ МАКСИМУМ, А НЕ СУММУ. Звенья идут внахлёст, и на стыке сумма
-    // давала двойную яму — ступеньку поперёк борозды на каждом стыке.
-    const v = DEPTH * k * f;
-    if (v > d) d = v;
-  }
-  return d;
+  return damage.cutDip(x, z);
 }
 
 /**
@@ -125,16 +63,5 @@ export function laserDip(x: number, z: number): number {
  * стеной поперёк трассы.
  */
 export function laserHeat(x: number, z: number): number {
-  let h = 0;
-  for (let i = 0; i < MARKS; i++) {
-    const f = B[i * 4 + 1];
-    if (f <= 0.002) continue;
-    const k = edge(i, x, z);
-    if (k <= 0) continue;
-    const age = B[i * 4];
-    const m = age <= MOLTEN ? 1 : Math.max(0, 1 - (age - MOLTEN) / COOL);
-    const v = m * k * f;
-    if (v > h) h = v;
-  }
-  return h;
+  return damage.cutHeat(x, z);
 }

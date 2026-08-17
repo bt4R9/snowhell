@@ -1,4 +1,6 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { spriteCloud, SpriteCloud } from './sprites';
+import { pow } from 'three/tsl';
 
 /**
  * ★ ИСКРЫ ИЗ-ПОД ЛУЧА. Точка касания — единственное место, где рез виден
@@ -18,8 +20,8 @@ const RATE = 420;
 const GRAV = 42;
 
 export class CutSparks {
-  readonly points: THREE.Points;
-  private geo = new THREE.BufferGeometry();
+  readonly points: THREE.Sprite;
+  private cloud: SpriteCloud;
   private pos = new Float32Array(N * 3);
   private col = new Float32Array(N * 3);
   private size = new Float32Array(N);
@@ -33,40 +35,14 @@ export class CutSparks {
 
   constructor() {
     for (let i = 0; i < N; i++) this.life[i] = -1;
-    this.geo.setAttribute('position', new THREE.BufferAttribute(this.pos, 3));
-    this.geo.setAttribute('color', new THREE.BufferAttribute(this.col, 3));
-    this.geo.setAttribute('size', new THREE.BufferAttribute(this.size, 1));
-    this.points = new THREE.Points(
-      this.geo,
-      new THREE.ShaderMaterial({
-        vertexShader: /* glsl */ `
-          attribute float size;
-          varying vec3 vCol;
-          void main() {
-            vCol = color;
-            vec4 mv = modelViewMatrix * vec4(position, 1.0);
-            // нижний порог в пикселях: иначе дальние искры уходят в доли
-            // пикселя и рой пропадает как раз тогда, когда он и нужен
-            gl_PointSize = clamp(size * 300.0 / max(1.0, -mv.z), 1.3, 22.0);
-            gl_Position = projectionMatrix * mv;
-          }
-        `,
-        fragmentShader: /* glsl */ `
-          varying vec3 vCol;
-          void main() {
-            vec2 p = gl_PointCoord * 2.0 - 1.0;
-            float r = dot(p, p);
-            if (r > 1.0) discard;
-            gl_FragColor = vec4(vCol, (1.0 - r) * 0.85 + pow(1.0 - r, 3.0) * 0.7);
-          }
-        `,
-        vertexColors: true,
-        transparent: true,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-      })
-    );
-    this.points.frustumCulled = false;
+    // ★ WebGPU: точки со своим размером — инстансированные спрайты (см. sprites.ts)
+    this.cloud = spriteCloud({
+      count: N, pos: this.pos, col: this.col, size: this.size,
+      k: 300, minPx: 1.3, maxPx: 22,
+      blending: THREE.AdditiveBlending,
+      alpha: (r) => r.oneMinus().mul(0.85).add(pow(r.oneMinus(), 3.0).mul(0.7)),
+    });
+    this.points = this.cloud.sprite;
   }
 
   /**
@@ -139,8 +115,6 @@ export class CutSparks {
       this.col[i * 3 + 2] = 0.06 + hot * hot * hot * 1.1;
     }
     if (alive === 0 && !on) return;
-    this.geo.attributes.position.needsUpdate = true;
-    this.geo.attributes.color.needsUpdate = true;
-    this.geo.attributes.size.needsUpdate = true;
+    this.cloud.touch();
   }
 }

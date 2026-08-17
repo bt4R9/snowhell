@@ -1,4 +1,5 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { spriteCloud, SpriteCloud } from './sprites';
 import { obstaclesInChunk, CHUNK, volcanoWeight, toValleyU } from '../world/features';
 import { hash2 } from '../world/noise';
 import { terrainHeight } from '../world/terrain';
@@ -18,8 +19,9 @@ const MAX = 1800;
 const SPAWN_R = 130; // дальше пламя не читается, а частицы стоят денег
 
 export class TreeFire {
-  readonly points: THREE.Points;
-  readonly light = new THREE.PointLight(0xff7a2a, 0, 90, 1.6);
+  readonly points: THREE.Sprite;
+  private cloud: SpriteCloud;
+  readonly light = new THREE.PointLight(0xff3a12, 0, 90, 1.8);
 
   private pos = new Float32Array(MAX * 3);
   private vel = new Float32Array(MAX * 3);
@@ -27,45 +29,19 @@ export class TreeFire {
   private life = new Float32Array(MAX);
   private col = new Float32Array(MAX * 3);
   private psize = new Float32Array(MAX);
-  private geo = new THREE.BufferGeometry();
   private trees: Array<{ x: number; z: number; y: number; h: number }> = [];
   private scanT = 0;
   private emitAcc = 0;
 
   constructor() {
-    this.geo.setAttribute('position', new THREE.BufferAttribute(this.pos, 3));
-    this.geo.setAttribute('color', new THREE.BufferAttribute(this.col, 3));
-    this.geo.setAttribute('size', new THREE.BufferAttribute(this.psize, 1));
-    // круглая частица со своим размером: PointsMaterial без текстуры даёт квадрат
-    this.points = new THREE.Points(
-      this.geo,
-      new THREE.ShaderMaterial({
-        vertexShader: /* glsl */ `
-          attribute float size;
-          varying vec3 vCol;
-          void main() {
-            vCol = color;
-            vec4 mv = modelViewMatrix * vec4(position, 1.0);
-            gl_PointSize = max(1.4, size * 300.0 / max(1.0, -mv.z));
-            gl_Position = projectionMatrix * mv;
-          }
-        `,
-        fragmentShader: /* glsl */ `
-          varying vec3 vCol;
-          void main() {
-            vec2 p = gl_PointCoord * 2.0 - 1.0;
-            float r = dot(p, p);
-            if (r > 1.0) discard;
-            gl_FragColor = vec4(vCol, (1.0 - r) * (1.0 - r) * 0.9);
-          }
-        `,
-        vertexColors: true,
-        transparent: true,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-      })
-    );
-    this.points.frustumCulled = false;
+    // ★ WebGPU: круглая частица со своим размером — инстансированные спрайты
+    this.cloud = spriteCloud({
+      count: MAX, pos: this.pos, col: this.col, size: this.psize,
+      k: 300, minPx: 1.4, maxPx: 1e4,
+      blending: THREE.AdditiveBlending,
+      alpha: (r) => r.oneMinus().mul(r.oneMinus()).mul(0.9),
+    });
+    this.points = this.cloud.sprite;
     for (let i = 0; i < MAX; i++) this.life[i] = -1;
   }
 
@@ -175,8 +151,6 @@ export class TreeFire {
       this.col[i * 3 + 1] = 1.5 * kk * k + 0.1;
       this.col[i * 3 + 2] = 0.3 * kk * kk + 0.09;
     }
-    this.geo.attributes.position.needsUpdate = true;
-    this.geo.attributes.color.needsUpdate = true;
-    this.geo.attributes.size.needsUpdate = true;
+    this.cloud.touch();
   }
 }

@@ -1,4 +1,10 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { basic, withUniforms, ShaderLike } from '../core/mat';
+import {
+  Fn, If, Discard, uniform, uv, vec2, vec3, vec4, select, frontFacing,
+  positionGeometry, positionView, normalView, modelViewMatrix,
+  floor, fract, sin, cos, dot, mix, abs, length, atan, pow, max, min, smoothstep, normalize,
+} from 'three/tsl';
 import { noise2 } from './noise';
 import {
   BIOME_LEN,
@@ -59,8 +65,33 @@ const SWEEP = 10;
 const SPOT_R = 21;
 /** сколько держаться в луче, прежде чем прилетит */
 const LOCK_FIRE = 0.6;
+/**
+ * ★ УДАРНАЯ ВОЛНА — третий приём башни. Око коротко втягивает энергию
+ * (WAVE_TELE), башня ухает, и от точки впереди по ходу игрока по склону бежит
+ * кольцо-вал (WAVE_SPEED м/с до WAVE_RMAX). На земле вал сбивает с ног и
+ * тормозит; в воздухе выше гребня — пролетаешь. Это про ПРЫЖОК: единственный
+ * приём, который отвечает не рулением и не таймингом пересечения, а высотой.
+ */
+// ★ ЧИТАЕМОСТЬ: (1) башня заряжается ОТДЕЛЬНОЙ анимацией (пульсирует и
+// хмурится, без красного — красное значит луч), в это время не атакует;
+// (2) на земле проступают КОЛЬЦА-МЕТКИ в нескольких местах вокруг игрока и
+// сужаются в точку; (3) когда сузились — из каждой точки бежит волна, и вместе
+// с волнами снова включаются фаерболы.
+/** ★ УДАРНЫЕ ВОЛНЫ ВЫКЛЮЧЕНЫ (2026-08-17, «пока уберём») — код на месте, флаг вернёт */
+const WAVES_ON = false;
+const WAVE_GAP = 40;      // между сериями, с — волны редкое событие, база — обстрел
+const LOST_FOR_WAVE = 3.5;  // столько секунд без ведения — и башня бьёт по земле (6 с не набиралось никогда: луч теряет ненадолго)
+const WAVE_TELE = 4.5;    // зарядка башни, с — долго и читаемо
+export const MARK_T = 3.6;       // сколько кольцо сужается в точку, с
+export const MARK_R0 = 60;  // с какого радиуса сужается
+export const WAVE_SPEED = 26;
+export const WAVE_RMAX = 130;
+export const MAX_WAVES = 4;
+/** метка захвата: сколько луч мигает красным и сколько держится ровно над игроком, с */
+const BLINK_T = 1.5;
+const STICK_T = 1.8;
 /** сколько луч не отпускает место, где потерял игрока, с */
-const HOLD = 1.6;
+const HOLD = 2.4;
 /**
  * ★ ЗАХВАТ НЕ МГНОВЕННЫЙ. Раньше прицел прилипал к игроку в тот же кадр, как
  * тот попал в пятно: пересёк луч на скорости — и всё, ведёт. Оку нужно время,
@@ -91,16 +122,20 @@ const LEAD_T = 0.9;
 const COMMIT = 0.85;
 /** дальше этого упреждение не уводит прицел, м */
 const LEAD_MAX = 70;
-/** насколько быстро прицел доворачивает за целью, м/с */
-const TRACK_RATE = 12;
+/** насколько быстро прицел доворачивает за целью, м/с
+ * ★ 12 → 18: на 12 м/с луч отставал от обычного карва (замер: боковая скорость
+ * игрока в дуге 15–25 м/с) и терял цель без всякого укрытия. Резкий уход
+ * вбок по-прежнему быстрее — им и отрываются. */
+const TRACK_RATE = 18;
 /**
  * ★ ПОИСК НЕ ПРИКЛЕЕН К ИГРОКУ. Качание вокруг его ТЕКУЩЕГО места означало, что
  * луч проходит через тебя каждые полпериода и находит почти всегда (замер:
  * пассивная езда — 73% кадров под лучом). Центр зоны поиска тянется следом
  * медленно: уехал вбок — ищут там, где ты был.
  */
-const SEARCH_DRIFT = 28;   // м/с
+const SEARCH_DRIFT = 22;   // м/с — центр поиска чуть отстаёт: после потери надо поискать, но недолго
 /** сколько око не берёт след после того, как упустило, с */
+// ★ ПОТЕРЯЛ — ИЩЕТ, А НЕ НАХОДИТ СРАЗУ: две секунды луч шарит, не беря след
 const REST = 1.2;
 /**
  * Насколько быстро игрок способен уводить линию вбок, м/с. По этому числу око
@@ -124,7 +159,9 @@ const CHARGE_T = 7;
  * ★ ДЕВЯТИ СЕКУНД МАЛО. За это время игрок успевает встретить полосу два раза,
  * и рез читается одиночным событием, а не отрезком боя, в котором надо жить.
  */
-const FIRE_T = 18;
+// 18 → 14: с резом по ходу движения приёмы стали попадать чаще, и три полных
+// приёма по шесть секунд не давали передышки
+const FIRE_T = 14;
 /**
  * Сколько длится гибель башни целиком, с — от подрыва до последнего обломка.
  * ★ ЭТО ЧИСЛО ЗНАЕТ И РЕЖИССЁР ДЕМО. Титр ждал развязку по своему круглому
@@ -193,7 +230,9 @@ const SWEEP_P = 3.4;
  * самом качании и в остывании борозды, а не в том, что оружие промахивается
  * мимо цели по построению.
  */
-const SWEEP_FOLLOW = 30;
+// 30 → 24: центр приёма чуть отстаёт от резкого руления — так у смены линии
+// появляется цена в секунду свободы
+const SWEEP_FOLLOW = 24;
 
 /**
  * ★ ОТЛАДОЧНЫЙ РЕЖИМ: ТОЛЬКО РЕЗ. Обкатывать вторую атаку под обстрелом
@@ -369,9 +408,254 @@ void main() {
 }
 `;
 
+
+// ─── Шейдеры ока (TSL) ───────────────────────────────────────────────────────
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type N = any;
+
+const eh1 = Fn(([p0]: [N]) => {
+  const p: N = floor(p0);
+  return fract(sin(dot(p, vec2(127.1, 311.7))).mul(43758.5453));
+});
+const en1 = Fn(([p]: [N]) => {
+  const i: N = floor(p);
+  const f0: N = fract(p);
+  const f = f0.mul(f0).mul(f0.mul(-2.0).add(3.0));
+  return mix(
+    mix(eh1(i), eh1(i.add(vec2(1, 0))), f.x),
+    mix(eh1(i.add(vec2(0, 1))), eh1(i.add(vec2(1, 1))), f.x),
+    f.y
+  );
+});
+
+/** само око: миндаль, брови, радужка, зрачок-щель, пламя по краю */
+function buildEyeMaterial(): ShaderLike<THREE.MeshBasicNodeMaterial> {
+  const uTime = uniform(0);
+  const uLock = uniform(0); // 0..1 — насколько игрок на оси взгляда
+  const uBrow = uniform(0); // 0..1 — брови встают в ярость
+  const uRed = uniform(0); // 0..1 — око наливается красным
+  const uHaze = uniform(0.3);
+  const uHazeCol = uniform(new THREE.Color(0x5d443e));
+  const m = withUniforms(
+    new THREE.MeshBasicNodeMaterial({ transparent: true, depthWrite: false, fog: false }),
+    { uTime, uLock, uBrow, uRed, uHaze, uHazeCol }
+  );
+  m.colorNode = Fn(() => {
+    const p: N = uv().mul(2.0).sub(1.0);
+    // МИНДАЛЬ: пересечение двух дуг, а не эллипс — у эллипса нет уголков, и
+    // он читается монеткой, а не глазом.
+    const lid = abs(p.x).oneMinus();
+    // ★ НАШЁЛ — РАСПАХИВАЕТСЯ. В покое веки прикрыты, взяв игрока — раскрывается.
+    const open = mix(0.34, 0.68, uLock).mul(lid).mul(lid);
+    const body = smoothstep(open.mul(0.82), open, abs(p.y)).oneMinus();
+
+    // ★ БРОВИ ГОВОРЯТ, ВИДЯТ ЛИ ТЕБЯ. Бровь не вращается, она ОПУСКАЕТСЯ:
+    // нависающий карниз, а перед резом ВСТАЁТ КОСО (наружный конец вверх).
+    const bx = abs(p.x);
+    const by = mix(0.88, 0.6, uLock).sub(uBrow.mul(0.06));
+    const q0 = vec2(bx.sub(0.36), p.y.sub(by));
+    const rot = uBrow.mul(0.62); // до ~35°
+    const q = vec2(
+      q0.x.mul(cos(rot)).add(q0.y.mul(sin(rot))),
+      q0.x.negate().mul(sin(rot)).add(q0.y.mul(cos(rot)))
+    );
+    const brow = smoothstep(0.06, 0.14, abs(q.y)).oneMinus().mul(smoothstep(0.2, 0.28, abs(q.x)).oneMinus());
+
+    If(body.lessThanEqual(0.001).and(brow.lessThanEqual(0.01)), () => Discard());
+    const out = vec4(0.0).toVar();
+    If(body.lessThanEqual(0.001), () => {
+      // ★ БРОВЬ ЖИВЁТ СИЛУЭТОМ: тление едва заметное, чёрный контур важнее
+      const bc = vec3(0.05, 0.035, 0.04).add(vec3(0.5, 0.11, 0.02).mul(uLock).mul(0.09));
+      out.assign(vec4(mix(bc, uHazeCol, uHaze), brow));
+    }).Else(() => {
+      // радужка: тянутые к центру волокна, всё это медленно кипит
+      const ang = atan(p.y.mul(2.4), p.x);
+      const rad = length(vec2(p.x, p.y.mul(2.4)));
+      const fib = en1(vec2(ang.mul(5.0), rad.mul(6.0).sub(uTime.mul(0.5))));
+      const iris = smoothstep(1.05, 0.15, rad).mul(fib.mul(0.75).add(0.55));
+      // зрачок — вертикальная щель; чем прямее смотришь, тем он у́же
+      const pw = mix(0.30, 0.12, uLock).mul(uRed.mul(0.45).oneMinus());
+      const pupil = smoothstep(pw.mul(0.6), pw, abs(p.x).add(abs(p.y).mul(0.22))).oneMinus();
+      const col: N = mix(vec3(1.7, 0.42, 0.05), vec3(3.4, 1.6, 0.35), iris.mul(iris)).toVar();
+      // ★ НАЛИВАЕТСЯ КРАСНЫМ тем сильнее, чем ближе рез
+      col.assign(mix(col, vec3(4.6, 0.16, 0.04).mul(iris.mul(0.9).add(0.55)), uRed.mul(0.92)));
+      col.assign(mix(col, vec3(0.02, 0.01, 0.01), pupil));
+      // кайма век: почти чёрная, чтобы миндаль читался формой
+      col.mulAssign(smoothstep(0.0, 0.22, body));
+      // языки пламени по краю
+      const flame = en1(vec2(ang.mul(3.0).add(uTime.mul(0.8)), rad.mul(4.0))).mul(smoothstep(0.6, 1.0, rad));
+      col.addAssign(vec3(1.4, 0.45, 0.08).mul(flame).mul(0.6));
+      // дыхание
+      col.mulAssign(sin(uTime.mul(1.7)).mul(0.15).add(0.85).add(uLock.mul(0.35)));
+      out.assign(vec4(mix(col, uHazeCol, uHaze), body));
+    });
+    return out;
+  })();
+  return m;
+}
+
+/**
+ * ★ СИЯНИЕ САМОГО ОКА. Луч, наведённый на игрока, идёт ПРЯМО В КАМЕРУ и
+ * проецируется кольцом; полосу света показать нельзя — зато можно показать
+ * источник: око разгорается ореолом и лучиками тем сильнее, чем крепче держит.
+ */
+function buildEyeGlowMaterial(): ShaderLike<THREE.MeshBasicNodeMaterial> {
+  const uLock = uniform(0);
+  const uTime = uniform(0);
+  const uCol = uniform(new THREE.Color(1.9, 0.5, 0.1));
+  const m = withUniforms(
+    new THREE.MeshBasicNodeMaterial({ transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false }),
+    { uLock, uTime, uCol }
+  );
+  m.colorNode = Fn(() => {
+    const p: N = uv().mul(2.0).sub(1.0);
+    const r = length(p);
+    If(r.greaterThan(1.0), () => Discard());
+    // мягкое ядро
+    const core = pow(max(0.0, r.oneMinus()), 3.4);
+    // лучики: четыре длинных и восемь коротких, чуть дышат
+    const a = atan(p.y, p.x);
+    const spikes = pow(abs(cos(a.mul(2.0))), 14.0).mul(0.7).add(pow(abs(cos(a.mul(4.0).add(0.4))), 22.0).mul(0.3));
+    const ray = spikes.mul(pow(max(0.0, r.oneMinus()), 1.1));
+    const k = uLock.mul(0.9).add(0.35).mul(sin(uTime.mul(2.3)).mul(0.1).add(0.9));
+    return vec4(uCol, core.mul(0.85).add(ray.mul(0.5)).mul(k));
+  })();
+  return m;
+}
+
+/**
+ * ★ СТЯГИВАНИЕ ЭНЕРГИИ — ПОСЛЕДНИЙ ЭТАП ПРЕДУПРЕЖДЕНИЯ. Спицы, сбегающиеся к
+ * зрачку по кругу, дают направление и скорость: видно, как заряд собирается.
+ */
+function buildGatherMaterial(): ShaderLike<THREE.MeshBasicNodeMaterial> {
+  const uT = uniform(0);
+  const uK = uniform(0);
+  const m = withUniforms(
+    new THREE.MeshBasicNodeMaterial({ transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false }),
+    { uT, uK }
+  );
+  m.colorNode = Fn(() => {
+    If(uK.lessThanEqual(0.002), () => Discard());
+    const p: N = uv().mul(2.0).sub(1.0);
+    const r = length(p);
+    If(r.greaterThan(1.0), () => Discard());
+    const a = atan(p.y, p.x).div(6.28318).add(0.5);
+    const NN = 16.0;
+    const idx = floor(a.mul(NN));
+    // у каждой спицы своя фаза — иначе они идут строем и читаются кольцом
+    const seed = fract(sin(idx.mul(127.1)).mul(43758.5453));
+    const ph = fract(uT.mul(0.85).add(seed));
+    const head = ph.oneMinus(); // голова штриха бежит к центру
+    const streak = smoothstep(0.15, 0.0, abs(r.sub(head))).toVar();
+    // угловая узость: спица, а не сектор
+    streak.mulAssign(smoothstep(0.36, 0.06, abs(fract(a.mul(NN)).sub(0.5))));
+    // у центра ярче: заряд «впитывается»
+    streak.mulAssign(head.oneMinus().mul(1.1).add(0.3).mul(smoothstep(0.0, 0.16, r)));
+    return vec4(vec3(3.4, 0.34, 0.1).mul(streak), streak.mul(uK).mul(0.85));
+  })();
+  return m;
+}
+
+/**
+ * Столб прожектора. ★ РАДИУСЫ ЖИВУТ В ШЕЙДЕРЕ: радиус у глаза растёт с дальностью
+ * до башни — столб держит угловую толщину по всей длине, а нижний конец
+ * остаётся размером с пятно. ★ ИЗНУТРИ ЛУЧ ТОЖЕ ВИДЕН (модуль косинуса), но
+ * только лёгкой взвесью.
+ */
+function buildBeamMaterial(): ShaderLike<THREE.MeshBasicNodeMaterial> {
+  const uOp = uniform(0.14);
+  const uCol = uniform(new THREE.Color(1.7, 0.42, 0.07));
+  const uR0 = uniform(10);
+  const uR1 = uniform(25);
+  const m = withUniforms(
+    new THREE.MeshBasicNodeMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, fog: false,
+    }),
+    { uOp, uCol, uR0, uR1 }
+  );
+  const vT: N = uv().y; // 0 у глаза, 1 у земли
+  m.positionNode = Fn(() => {
+    const p = positionGeometry.toVar();
+    p.xz.mulAssign(mix(uR0, uR1, vT));
+    return p;
+  })();
+  m.colorNode = Fn(() => {
+    const face = abs(dot(normalize(normalView), normalize(positionView.negate())));
+    // ★ У ГЛАЗА ТРУБА ВИДНА ПОЧТИ ВДОЛЬ ОСИ — у плотности есть базовая доля,
+    // не зависящая от ракурса, а силуэтная лишь добавляется.
+    const shape = pow(face, 1.15).mul(0.75).add(pow(face, 4.0).mul(0.45)).div(1.2);
+    const a = uOp.mul(shape.mul(0.7).add(0.3)).mul(select(frontFacing, 1.0, 0.24)).toVar();
+    // у земли гаснет только самый кончик — иначе край читается как срез
+    a.mulAssign(smoothstep(0.97, 1.0, vT).oneMinus());
+    // у самого ока луч не начинается ступенькой
+    a.mulAssign(smoothstep(0.0, 0.02, vT));
+    return vec4(uCol.mul(vT.mul(0.6).add(0.7)), a);
+  })();
+  return m;
+}
+
+/**
+ * ★ ЛУЧ РЕЗА — плотный шнур: узкий, с добела раскалённой сердцевиной и жёстким
+ * красным ореолом. ★ ЛАЗЕР УЗНАЮТ ПО ПОСТОЯННОЙ ТОЛЩИНЕ: радиус задан УГЛОВЫМ —
+ * каждая точка трубы раздувается пропорционально своей дальности от камеры.
+ */
+function angularTube(uAng: N): N {
+  return Fn(() => {
+    // дальность до ОСИ луча в этой точке — по ней и считается толщина
+    const axis: N = modelViewMatrix.mul(vec4(0.0, positionGeometry.y, 0.0, 1.0));
+    const p = positionGeometry.toVar();
+    p.xz.mulAssign(length(axis.xyz).mul(uAng));
+    return p;
+  })();
+}
+
+function buildLaserMaterial(): ShaderLike<THREE.MeshBasicNodeMaterial> {
+  const uT = uniform(0);
+  const uAng = uniform(0.013);
+  const uOp = uniform(1);
+  const m = withUniforms(
+    new THREE.MeshBasicNodeMaterial({ transparent: true, depthWrite: false, side: THREE.DoubleSide, fog: false }),
+    { uT, uAng, uOp }
+  );
+  m.positionNode = angularTube(uAng);
+  m.colorNode = Fn(() => {
+    const vT: N = uv().y;
+    const face = abs(dot(normalize(normalView), normalize(positionView.negate())));
+    // ★ КРАЙ ЖЁСТКИЙ: у лазера край режущий, а внутри ровное тело
+    const body = smoothstep(0.0, 0.22, face);
+    const core = pow(face, 9.0); // тонкая добела раскалённая жила
+    const col = mix(vec3(0.92, 0.05, 0.06), vec3(1.0, 0.94, 0.9), core);
+    // ровный луч, лишь чуть пульсирующий — мерцание тоже читается пламенем
+    const pulse = sin(uT.mul(38.0).add(vT.mul(9.0))).mul(0.05).add(0.95);
+    return vec4(col.mul(pulse), min(1.0, uOp.mul(body).mul(pulse)));
+  })();
+  return m;
+}
+
+/** ★ ОРЕОЛ ОТДЕЛЬНЫМ СЛОЕМ: втрое шире тела луча, аддитивно и слабо — он же
+ * поджигает блум в пост-обработке */
+function buildLaserGlowMaterial(): ShaderLike<THREE.MeshBasicNodeMaterial> {
+  const uT = uniform(0);
+  const uAng = uniform(0.036);
+  const m = withUniforms(
+    new THREE.MeshBasicNodeMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, fog: false,
+    }),
+    { uT, uAng }
+  );
+  m.positionNode = angularTube(uAng);
+  m.colorNode = Fn(() => {
+    const face = abs(dot(normalize(normalView), normalize(positionView.negate())));
+    const k = pow(face, 2.6);
+    return vec4(vec3(2.0, 0.14, 0.05).mul(k), k.mul(0.34));
+  })();
+  return m;
+}
+
 export class Eye {
   readonly group = new THREE.Group();
-  readonly light = new THREE.PointLight(0xff5a18, 0, 260, 1.4);
+  // прожектор тоже красный: жёлтый луч красил всё вокруг в песок
+  readonly light = new THREE.PointLight(0xff3210, 0, 240, 1.7);
 
   private built = -1;
   private groundY = 0;
@@ -385,28 +669,9 @@ export class Eye {
    * он ставится в точку ока и разворачивается вместе с ним.
    */
   private frame: THREE.Mesh | null = null;
-  private mat = new THREE.ShaderMaterial({
-    uniforms: {
-      uTime: { value: 0 },
-      uLock: { value: 0 },
-      uBrow: { value: 0 },
-      uRed: { value: 0 },
-      uHaze: { value: 0.3 },
-      uHazeCol: { value: new THREE.Color(0x5d443e) },
-    },
-    vertexShader: `
-      varying vec2 vUv;
-      void main() {
-        vUv = uv;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }
-    `,
-    fragmentShader: EYE_FRAG,
-    transparent: true,
-    depthWrite: false,
-  });
+  private mat = buildEyeMaterial();
 
-  private towerMat = new THREE.MeshBasicMaterial({ vertexColors: true, fog: false });
+  private towerMat = basic({ vertexColors: true, fog: false });
   /**
    * Камень обрамления.
    * ★ ЧИСТО ТЁМНЫЙ КАМЕНЬ ЗДЕСЬ НЕ ЧИТАЕТСЯ. Обрамление стоит вплотную к оку,
@@ -418,7 +683,7 @@ export class Eye {
   // по часовой — отбраковка задних граней съедала весь меш целиком (замер:
   // око даёт 183 пикселя, обрамление ровно 0). Плоской детали, которую
   // разворачивают к игроку, сторона всё равно безразлична.
-  private frameMat = new THREE.MeshBasicMaterial({
+  private frameMat = basic({
     vertexColors: true,
     fog: false,
     side: THREE.DoubleSide,
@@ -432,39 +697,7 @@ export class Eye {
    * показать источник: око разгорается ореолом и лучиками тем сильнее, чем крепче
    * держит. Это и читается как «светит на меня».
    */
-  private glowMat = new THREE.ShaderMaterial({
-    uniforms: { uLock: { value: 0 }, uTime: { value: 0 }, uCol: { value: new THREE.Color(1.9, 0.5, 0.1) } },
-    vertexShader: `
-      varying vec2 vUv;
-      void main() {
-        vUv = uv;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }
-    `,
-    fragmentShader: /* glsl */ `
-      uniform float uLock;
-      uniform float uTime;
-      uniform vec3 uCol;
-      varying vec2 vUv;
-      void main() {
-        vec2 p = vUv * 2.0 - 1.0;
-        float r = length(p);
-        if (r > 1.0) discard;
-        // мягкое ядро
-        float core = pow(max(0.0, 1.0 - r), 3.4);
-        // лучики: четыре длинных и восемь коротких, чуть дышат
-        float a = atan(p.y, p.x);
-        float spikes = pow(abs(cos(a * 2.0)), 14.0) * 0.7
-                     + pow(abs(cos(a * 4.0 + 0.4)), 22.0) * 0.3;
-        float ray = spikes * pow(max(0.0, 1.0 - r), 1.1);
-        float k = (0.35 + uLock * 0.9) * (0.9 + 0.1 * sin(uTime * 2.3));
-        gl_FragColor = vec4(uCol, (core * 0.85 + ray * 0.5) * k);
-      }
-    `,
-    transparent: true,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
-  });
+  private glowMat = buildEyeGlowMaterial();
   private glow: THREE.Mesh | null = null;
 
   /**
@@ -473,43 +706,7 @@ export class Eye {
    * сбегающиеся к зрачку по кругу, дают направление и скорость: видно, как
    * заряд собирается, и понятно, что дальше будет выстрел.
    */
-  private gatherMat = new THREE.ShaderMaterial({
-    uniforms: { uT: { value: 0 }, uK: { value: 0 } },
-    vertexShader: `
-      varying vec2 vUv;
-      void main() {
-        vUv = uv;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }
-    `,
-    fragmentShader: /* glsl */ `
-      uniform float uT;
-      uniform float uK;
-      varying vec2 vUv;
-      void main() {
-        if (uK <= 0.002) discard;
-        vec2 p = vUv * 2.0 - 1.0;
-        float r = length(p);
-        if (r > 1.0) discard;
-        float a = atan(p.y, p.x) / 6.28318 + 0.5;
-        const float N = 16.0;
-        float idx = floor(a * N);
-        // у каждой спицы своя фаза — иначе они идут строем и читаются кольцом
-        float seed = fract(sin(idx * 127.1) * 43758.5453);
-        float ph = fract(uT * 0.85 + seed);
-        float head = 1.0 - ph;                     // голова штриха бежит к центру
-        float streak = smoothstep(0.15, 0.0, abs(r - head));
-        // угловая узость: спица, а не сектор
-        streak *= smoothstep(0.36, 0.06, abs(fract(a * N) - 0.5));
-        // у центра ярче: заряд «впитывается»
-        streak *= (0.3 + 1.1 * (1.0 - head)) * smoothstep(0.0, 0.16, r);
-        gl_FragColor = vec4(vec3(3.4, 0.34, 0.1) * streak, streak * uK * 0.85);
-      }
-    `,
-    transparent: true,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
-  });
+  private gatherMat = buildGatherMaterial();
   private gather: THREE.Mesh | null = null;
 
   /** Тёмный зазубренный шпиль — только силуэт, деталей на такой дали не видно */
@@ -646,120 +843,14 @@ export class Eye {
   // столба занимала доли пикселя, и её не было видно вовсе. Радиус у глаза
   // растёт с дальностью до башни — столб держит угловую толщину по всей длине,
   // а нижний конец остаётся размером с пятно.
-  private beamMat = new THREE.ShaderMaterial({
-    uniforms: {
-      uOp: { value: 0.14 },
-      uCol: { value: new THREE.Color(1.7, 0.42, 0.07) },
-      uR0: { value: 10 },
-      uR1: { value: 25 },
-    },
-    vertexShader: /* glsl */ `
-      uniform float uR0;
-      uniform float uR1;
-      varying vec3 vN;
-      varying vec3 vV;
-      varying float vT;
-      void main() {
-        vT = uv.y;              // 0 у глаза, 1 у земли
-        vec3 p = position;
-        p.xz *= mix(uR0, uR1, vT);
-        vec4 mv = modelViewMatrix * vec4(p, 1.0);
-        vN = normalMatrix * normal;
-        vV = -mv.xyz;
-        gl_Position = projectionMatrix * mv;
-      }
-    `,
-    fragmentShader: /* glsl */ `
-      uniform float uOp;
-      uniform vec3 uCol;
-      varying vec3 vN;
-      varying vec3 vV;
-      varying float vT;
-      void main() {
-        // ★ ИЗНУТРИ ЛУЧ ТОЖЕ ВИДЕН. С отсечением по знаку (max(0, dot)) грани,
-        // повёрнутые от камеры, не давали ничего — а когда прожектор наведён
-        // на тебя, камера оказывается ВНУТРИ столба, и он пропадал целиком
-        // ровно в тот момент, когда важнее всего. Берём модуль: снаружи это
-        // силуэт трубы, изнутри — тёплая взвесь вокруг.
-        float face = abs(dot(normalize(vN), normalize(vV)));
-        // ★ У ГЛАЗА ТРУБА ВИДНА ПОЧТИ ВДОЛЬ ОСИ — И ГАШЕНИЕ ПО НОРМАЛИ ЕЁ УБИВАЛО.
-        // Стенки там стоят к взгляду ребром, dot(нормаль, взгляд) → 0, и весь
-        // исток луча становился полностью прозрачным: из ока не выходило ничего.
-        // Между тем физически всё наоборот — глядя ВДОЛЬ луча, свет проходишь
-        // насквозь и видеть должен больше. Поэтому у плотности есть базовая
-        // доля, не зависящая от ракурса, а силуэтная лишь добавляется.
-        float shape = (pow(face, 1.15) * 0.75 + pow(face, 4.0) * 0.45) / 1.2;
-        // ★ ИЗНУТРИ — ТОЛЬКО ЛЁГКАЯ ВЗВЕСЬ. На полную силу дальняя стенка трубы
-        // накрывает полкадра вместе с небом, и вместо столба выходит общая
-        // тёплая муть.
-        float a = uOp * (0.3 + 0.7 * shape) * (gl_FrontFacing ? 1.0 : 0.24);
-        // у земли гаснет только самый кончик — иначе край читается как срез
-        a *= 1.0 - smoothstep(0.97, 1.0, vT);
-        // у самого ока луч не начинается ступенькой — первые проценты длины
-        // разгораются, зато сразу за ними идёт самая широкая часть факела
-        a *= smoothstep(0.0, 0.02, vT);
-        gl_FragColor = vec4(uCol * (0.7 + vT * 0.6), a);
-      }
-    `,
-    transparent: true,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
-    side: THREE.DoubleSide,
-  });
+  private beamMat = buildBeamMaterial();
   /**
    * ★ ЛУЧ РЕЗА — НЕ ТОТ ЖЕ ПРОЖЕКТОР ПОЯРЧЕ. У поискового луча задача обратная:
    * он должен читаться взвесью, мягко, не забивая кадр. Рез — плотный шнур:
    * узкий, с добела раскалённой сердцевиной и жёстким красным ореолом, и он
    * заметно дрожит — так видно, что через него идёт мощность.
    */
-  private laserMat = new THREE.ShaderMaterial({
-    uniforms: { uT: { value: 0 }, uAng: { value: 0.013 }, uOp: { value: 1 } },
-    // ★ ЛАЗЕР УЗНАЮТ ПО ПОСТОЯННОЙ ТОЛЩИНЕ, А НЕ ПО ЦВЕТУ. Красный конус,
-    // расширяющийся к источнику, читается прожектором с красным светофильтром —
-    // именно это и получалось. У луча оружия стенки ПАРАЛЛЕЛЬНЫ: он не
-    // расходится, у него нет объёма, и на экране он остаётся полосой одной
-    // ширины по всей длине. Поэтому радиус здесь задаётся не мировым числом, а
-    // УГЛОВЫМ: каждая точка трубы раздувается пропорционально своей дальности
-    // от камеры, и полоса выходит ровной от ока до земли.
-    vertexShader: /* glsl */ `
-      uniform float uAng;
-      varying vec3 vN;
-      varying vec3 vV;
-      varying float vT;
-      void main() {
-        vT = uv.y;
-        // дальность до ОСИ луча в этой точке — по ней и считается толщина
-        vec4 axis = modelViewMatrix * vec4(0.0, position.y, 0.0, 1.0);
-        vec3 p = position;
-        p.xz *= length(axis.xyz) * uAng;
-        vec4 mv = modelViewMatrix * vec4(p, 1.0);
-        vN = normalMatrix * normal;
-        vV = -mv.xyz;
-        gl_Position = projectionMatrix * mv;
-      }
-    `,
-    fragmentShader: /* glsl */ `
-      uniform float uT;
-      uniform float uOp;
-      varying vec3 vN;
-      varying vec3 vV;
-      varying float vT;
-      void main() {
-        float face = abs(dot(normalize(vN), normalize(vV)));
-        // ★ КРАЙ ЖЁСТКИЙ. Мягкое затухание к силуэту — это признак объёма, то
-        // есть светящейся взвеси. У лазера край режущий, а внутри ровное тело.
-        float body = smoothstep(0.0, 0.22, face);
-        float core = pow(face, 9.0);        // тонкая добела раскалённая жила
-        vec3 col = mix(vec3(0.92, 0.05, 0.06), vec3(1.0, 0.94, 0.9), core);
-        // ровный луч, лишь чуть пульсирующий — мерцание тоже читается пламенем
-        float pulse = 0.95 + 0.05 * sin(uT * 38.0 + vT * 9.0);
-        gl_FragColor = vec4(col * pulse, min(1.0, uOp * body * pulse));
-      }
-    `,
-    transparent: true,
-    depthWrite: false,
-    side: THREE.DoubleSide,
-  });
+  private laserMat = buildLaserMaterial();
   private laser: THREE.Mesh | null = null;
 
   /**
@@ -769,40 +860,7 @@ export class Eye {
    * в пост-обработке, порог которого 0.72. Толщина у него тоже угловая, иначе
    * ореол разъехался бы с телом луча.
    */
-  private glowMat2 = new THREE.ShaderMaterial({
-    uniforms: { uT: { value: 0 }, uAng: { value: 0.036 } },
-    vertexShader: /* glsl */ `
-      uniform float uAng;
-      varying vec3 vN;
-      varying vec3 vV;
-      varying float vT;
-      void main() {
-        vT = uv.y;
-        vec4 axis = modelViewMatrix * vec4(0.0, position.y, 0.0, 1.0);
-        vec3 p = position;
-        p.xz *= length(axis.xyz) * uAng;
-        vec4 mv = modelViewMatrix * vec4(p, 1.0);
-        vN = normalMatrix * normal;
-        vV = -mv.xyz;
-        gl_Position = projectionMatrix * mv;
-      }
-    `,
-    fragmentShader: /* glsl */ `
-      uniform float uT;
-      varying vec3 vN;
-      varying vec3 vV;
-      varying float vT;
-      void main() {
-        float face = abs(dot(normalize(vN), normalize(vV)));
-        float k = pow(face, 2.6);
-        gl_FragColor = vec4(vec3(2.0, 0.14, 0.05) * k, k * 0.34);
-      }
-    `,
-    transparent: true,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
-    side: THREE.DoubleSide,
-  });
+  private glowMat2 = buildLaserGlowMaterial();
   private laserGlow: THREE.Mesh | null = null;
   /** свет от точки реза — она ярче всего на склоне */
   readonly cutLight = new THREE.PointLight(0xff3a10, 0, 200, 1.5);
@@ -837,6 +895,32 @@ export class Eye {
   private commitT = 0;
   /** видно ли игрока лучом прямо сейчас (для HUD и звука) */
   caught = false;
+  /** сколько подряд линия взгляда перекрыта */
+  private hiddenT = 0;
+  /** сколько подряд око НЕ ведёт цель (для волн) и видело ли её вообще */
+  private lostT = 0;
+  private seen = false;
+  /** ударные волны: 0 — нет, 1 — зарядка башни, 2 — метки сужаются; списки */
+  wavePhase = 0;
+  private waveT = 0;
+  private sinceWave = 12;
+  /** метки-кольца: где ударит; t0 — когда начали сужаться */
+  readonly marks: Array<{ x: number; z: number; t0: number }> = [];
+  readonly waves: Array<{ x: number; z: number; t0: number }> = [];
+  /** событие кадра: башня ударила (для камеры и звука) */
+  justSlammed: { x: number; z: number } | null = null;
+  /** ★ ЗАХВАТ: lock перевалил порог огня. justLocked — событие кадра для HUD */
+  locked = false;
+  justLocked = false;
+  /** ★ МЕТКА ЗАХВАТА ЛУЧОМ: полторы секунды луч мигает красным и держится
+   * ровно над игроком (без упреждения и качания) — «тебя увидели». */
+  private blinkT = 0;
+  private stickT = 0;
+  /** сглаженное «ведёт цель» 0..1 — по нему красится луч */
+  private trackK = 0;
+  private lockFlash = 0;
+  /** цвет пятна прожектора на рельефе: поиск — янтарь, захват — красный */
+  onSpotCol: ((r: number, g: number, b: number) => void) | null = null;
   private fireT = 0;
   /** прошлое положение по склону — из него берётся скорость для упреждения */
   private lastPz = 0;
@@ -877,6 +961,9 @@ export class Eye {
    * ровной ездой нет.
    */
   private sweepX = 0;
+  /** центр приёма реза в мировых координатах (тянется за игроком) */
+  private sweepCX = 0;
+  private sweepCZ = 0;
   /**
    * ★ У АТАКИ ТРИ РАЗНЫХ ПРИЁМА, А НЕ ОДИН СИНУС. Ровное качание работает, но
    * читается метрономом: увидел период — и дальше едешь на автопилоте. Внутри
@@ -1104,12 +1191,17 @@ export class Eye {
     const nx = dx / len;
     const nz = dz / len;
     const far = Math.min(len, 420);
-    for (let t = 14; t < far; t += 13) {
+    // ★ БУГОР НИЖЕ ДВУХ МЕТРОВ — НЕ УКРЫТИЕ. Око стоит в километрах, луч к нему
+    // идёт полого, и валы озёр (2–3 м, теперь через каждые сто метров) резали
+    // линию взгляда на каждом шагу — луч «терял» игрока посреди открытого
+    // склона. Укрытие — это гребень или борт, за которым скрывается ВЕСЬ
+    // райдер, а не кромка, над которой торчит голова.
+    for (let t = 20; t < far; t += 13) {
       const x = px + nx * t;
       const z = pz + nz * t;
       // высота луча над игроком растёт линейно к оку
       const ly = py + (ey - py) * (t / len);
-      if (ground(x, z) > ly + 0.6) return true;
+      if (ground(x, z) > ly + 2.2) return true;
     }
     return false;
   }
@@ -1410,21 +1502,36 @@ export class Eye {
       this.commitT = COMMIT;
       this.commitU = playerU + lead;
     }
+    // ★ ПОСЛЕ ЗАХВАТА ЛУЧ ЗАДЕРЖИВАЕТСЯ НА ИГРОКЕ: пока идёт метка, прицел
+    // стоит ровно над ним — без упреждения и рывков, иначе метка мигает мимо
+    // ★ ПОТЕРЯЛ — ДОГОНЯЕТ, А НЕ ШАРИТ. Пока идёт удержание после потери,
+    // прицел идёт прямо на игрока (без упреждения и качания): один поворот
+    // даёт секунду-другую свободы — лагом ведения, — но не отрыв насовсем.
+    // Отрыв — это либо укрытие, либо резкий уход быстрее доворота.
     const aim = hunting
       ? this.searchU + Math.cos((time / SWEEP) * Math.PI * 2) * 95
-      : this.commitU + (this.heldCaught ? 0 : Math.sin(time * 5.1) * 14);
+      : this.stickT > 0 || !this.heldCaught
+        ? playerU
+        : this.commitU;
     // при поиске луч ходит своим ходом, при ведении — доворачивает медленно
-    const rate = (hunting ? 90 : TRACK_RATE) * dt;
+    // догоняя потерянного, доворачивает бодрее, чем ведёт
+    const rate = (hunting ? 90 : this.stickT > 0 ? Math.max(TRACK_RATE, 60) : TRACK_RATE) * dt;
     this.aimU += Math.max(-rate, Math.min(rate, aim - this.aimU));
     const spotX = toWorldX(pisteCenterX(scanZ) + this.aimU, scanZ);
     const spotY = ground(spotX, scanZ);
 
     // попался: в пятне и не за укрытием
     const inSpot = Math.hypot(px - spotX, pz - scanZ) < SPOT_R;
-    const hidden =
+    const blocked =
       inSpot &&
       (this.hitDist(px, py, pz, eyePos.x, eyePos.y, eyePos.z, ground) >= 0 ||
         this.terrainBlocked(px, py + 1.6, pz, eyePos.x, eyePos.y, eyePos.z, ground));
+    // ★ УКРЫТИЕ ДОЛЖНО ПОДЕРЖАТЬСЯ. Мелькнувший на треть секунды бугор — не
+    // укрытие; иначе луч отпускал цель на каждой кочке, и это читалось как
+    // «теряет ни с чего». Прячешься всерьёз — за камнем или гребнем — и око
+    // отпускает так же, как раньше.
+    this.hiddenT = blocked ? this.hiddenT + dt : 0;
+    const hidden = blocked && this.hiddenT > 0.35;
     this.caught = inSpot && !hidden;
     this.heldCaught = this.caught;
     // ★ СНАЧАЛА РАЗГЛЯДЕТЬ, ПОТОМ ВЕСТИ. Счётчик набирается, пока игрок в
@@ -1442,6 +1549,26 @@ export class Eye {
     else this.holdT = Math.max(0, this.holdT - dt);
     if (wasTracking && this.holdT <= 0) this.rest = REST;
     this.lock = Math.max(0, Math.min(1.6, this.lock + (this.caught ? dt : -dt * 1.4)));
+    // ★ ЗАХВАТ — СОБЫТИЕ. В этот момент прожектор и око краснеют, HUD пишет
+    // LOCKED, и первый снаряд летит НЕ СРАЗУ: две-три секунды на то, чтобы
+    // прочитать сигнал (1–1.5 с). Иначе первое попадание читалось как
+    // случайность — анимацию глаза на скорости не разглядеть.
+    const nowLocked = this.lock > LOCK_FIRE;
+    this.justLocked = false;
+    if (nowLocked && !this.locked) {
+      this.justLocked = true;
+      this.blinkT = BLINK_T;
+      this.stickT = STICK_T;
+      this.fireT = Math.max(this.fireT, 1.0 + Math.random() * 0.5);
+    }
+    this.locked = nowLocked;
+    if (nowLocked) this.seen = true;
+    const trackNow = this.holdT > 0 && !this.quiet ? 1 : 0;
+    this.trackK += (trackNow - this.trackK) * Math.min(1, dt * (trackNow ? 6 : 3));
+    this.blinkT = Math.max(0, this.blinkT - dt);
+    this.stickT = Math.max(0, this.stickT - dt);
+    // три красных вспышки за полторы секунды, потом ровный слабый красный тон
+    this.lockFlash = this.blinkT > 0 ? (Math.floor(this.blinkT * (3 / BLINK_T) * 2) % 2 === 1 ? 1 : 0.15) : 0;
 
     // ★ ЕСЛИ ДЕРЖИТ — БЬЁТ. Не мгновенно: сначала надо продержать игрока в
     // луче, и только потом прилетает. Иначе попадание неизбежно и читается
@@ -1455,7 +1582,9 @@ export class Eye {
     if (this.lastPz !== 0 && Math.abs(pz - this.lastPz) > 40) {
       const npu = toValleyU(px, pz);
       this.sweepX = npu;
-      this.stabU = npu;
+      this.sweepCX = px;
+      this.sweepCZ = pz;
+      this.stabU = 0;
       this.markX = px;
       this.markZ = pz;
       this.stampT = 0;
@@ -1547,9 +1676,17 @@ export class Eye {
         this.phase = 2;
         this.phaseT = 0;
         this.sweepX = toValleyU(px, pz);
-        this.stabU = this.sweepX;
+        this.sweepCX = px;
+        this.sweepCZ = pz;
+        this.stabU = 0;
         this.cutU = this.sweepX;
-        this.cutZ = pz + AIM_LEAD * this.vDown;
+        // стартовая точка реза — впереди ПО ХОДУ, а не вниз по долине
+        const sp0 = Math.hypot(this.vSide, this.vDown);
+        const f0x = sp0 > 4 ? this.vSide / sp0 : 0;
+        const f0z = sp0 > 4 ? this.vDown / sp0 : 1;
+        const ld0 = Math.max(38, sp0 * AIM_LEAD);
+        this.cutU = toValleyU(px + f0x * ld0, pz + f0z * ld0);
+        this.cutZ = pz + f0z * ld0;
         this.cutClip = 1;
         this.cutY = ground(px, pz);
         // порядок приёмов свой на каждую атаку
@@ -1564,8 +1701,8 @@ export class Eye {
         this.moveT = 0;
         this.movePhase = Math.random() * Math.PI * 2;
         this.stampT = 0;
-        this.markX = px;
-        this.markZ = pz + AIM_LEAD * this.vDown;
+        this.markX = px + f0x * ld0;
+        this.markZ = pz + f0z * ld0;
         this.markLands = true;
       } else if (this.phase === 2) {
         if (this.phaseT >= FIRE_T) {
@@ -1584,7 +1721,94 @@ export class Eye {
     // двух, и глушить обстрел ещё и в них нельзя: замер полного проезда по
     // биому показал 83% времени под лазером и НОЛЬ выпущенных снарядов —
     // основное оружие переставало существовать. Молчит око только на резе.
-    const charging = this.phase === 2;
+    // --- ударная волна: телеграф → удар → кольцо бежит само ---
+    this.sinceWave += dt;
+    this.justSlammed = null;
+    if (this.quiet) {
+      this.wavePhase = 0;
+      this.waveT = 0;
+      this.marks.length = 0;
+    }
+    // ★ ВОЛНЫ — КОГДА ЛУЧ ДОЛГО НЕ МОЖЕТ НАЙТИ. Это не наказание за захват, а
+    // способ ВЫКУРИТЬ: игрок ушёл из луча и прячется — башня бьёт по земле по
+    // всей округе. Считаем, сколько подряд око не ведёт цель.
+    this.lostT = this.holdT > 0 ? 0 : this.lostT + dt;
+    if (WAVES_ON && !this.quiet && this.wavePhase === 0 && this.phase === 0 && !dbg) {
+      const readyW =
+        this.sinceWave > WAVE_GAP &&
+        this.sinceCut > 5 &&
+        this.lostT > LOST_FOR_WAVE &&
+        this.seen &&
+        mob > 0.2;
+      if (readyW) {
+        this.wavePhase = 1;
+        this.waveT = 0;
+      }
+    } else if (!this.quiet && this.wavePhase === 1) {
+      this.waveT += dt;
+      if (this.waveT >= WAVE_TELE) {
+        // ★ МЕТКИ РАССЫПАЮТСЯ ПО КАРТЕ ВОКРУГ ИГРОКА: впереди по ходу и по
+        // бокам, случайно — какие-то придётся перепрыгнуть, какие-то объехать
+        this.wavePhase = 2;
+        this.waveT = 0;
+        const spw = Math.hypot(this.vSide, this.vDown);
+        const fx = spw > 4 ? this.vSide / spw : 0;
+        const fz = spw > 4 ? this.vDown / spw : 1;
+        const rxv = fz;
+        const rzv = -fx;
+        // ★ ДАЛЕКО ДРУГ ОТ ДРУГА: точки разнесены (не ближе 80 м), стоят
+        // впереди на 50–200 м и по бокам — волны приходят с разных сторон и в
+        // разное время, а не бьют разом в упор
+        // ★ МЕТКИ СТАВЯТСЯ ТУДА, ГДЕ ИГРОК БУДЕТ, КОГДА ВОЛНА ПОЙДЁТ. Пока
+        // кольцо сужается (MARK_T + разбег), на 30 м/с он проезжает полторы
+        // сотни метров — метки у ног он давно миновал бы. Упреждаем по скорости
+        // и добавляем разброс вперёд и вбок.
+        const n = 3 + (this.rage > 0.6 ? 1 : 0);
+        this.marks.length = 0;
+        for (let i = 0; i < n; i++) {
+          const delay = i * 0.9 + Math.random() * 0.6;
+          const travel = spw * (MARK_T + delay);
+          let mx = px, mz = pz;
+          for (let tries = 0; tries < 12; tries++) {
+            const ahead = travel + 20 + Math.random() * 140;
+            const across = (Math.random() - 0.5) * 200;
+            mx = px + fx * ahead + rxv * across;
+            mz = pz + fz * ahead + rzv * across;
+            const ok = this.marks.every((m) => Math.hypot(m.x - mx, m.z - mz) > 80);
+            if (ok) break;
+          }
+          this.marks.push({ x: mx, z: mz, t0: time + delay });
+        }
+      }
+    } else if (!this.quiet && this.wavePhase === 2) {
+      this.waveT += dt;
+      // каждая метка, сузившись, становится волной
+      for (let i = this.marks.length - 1; i >= 0; i--) {
+        const m = this.marks[i];
+        if (time - m.t0 >= MARK_T) {
+          this.marks.splice(i, 1);
+          this.waves.push({ x: m.x, z: m.z, t0: time });
+          if (this.waves.length > MAX_WAVES) this.waves.shift();
+          this.justSlammed = { x: m.x, z: m.z };
+          // с первой волной снова просыпается обстрел
+          this.fireT = Math.min(this.fireT, 0.3);
+        }
+      }
+      if (this.marks.length === 0) {
+        this.wavePhase = 0;
+        this.sinceWave = 0;
+      }
+    }
+    for (let i = this.waves.length - 1; i >= 0; i--) {
+      if (time - this.waves[i].t0 > WAVE_RMAX / WAVE_SPEED + 0.4) this.waves.splice(i, 1);
+    }
+    const waveTele = this.wavePhase === 1 ? Math.min(1, this.waveT / WAVE_TELE) : 0;
+    const waveMark = this.wavePhase === 2 ? 1 : 0;
+
+    // ★ И НА НАКОПЛЕНИИ ТОЖЕ МОЛЧИТ («во время активации лазера не стрелять
+    // фаерболами»): око заряжает луч — снаряды поверх этого путали, откуда
+    // ждать удара. И на телеграфе волны — тоже.
+    const charging = this.phase === 1 || this.phase === 2 || this.wavePhase !== 0;
     /**
      * ★ НАКОПЛЕНИЕ — ЭТО ПОСЛЕДОВАТЕЛЬНОСТЬ, А НЕ ОДИН ПОЛЗУНОК. Раньше всё
      * (дрожь, брови, краснота, размер) ехало от одного числа и включалось
@@ -1600,8 +1824,14 @@ export class Eye {
     const back = this.phase === 3 ? Math.max(0, 1 - this.phaseT / 1.4) : 0;
     const stage = (a: number, b: number): number =>
       this.phase === 1 ? at(a, b) : this.phase === 2 ? done : back;
-    const twitch = stage(0.0, 0.18);   // 0%  — око начинает дёргаться
-    const browAmt = stage(0.2, 0.34);  // 20% — брови встают в ярость
+    // ★ ЗАРЯДКА ВОЛНЫ ВЫГЛЯДИТ ИНАЧЕ, ЧЕМ ЗАРЯДКА ЛУЧА: без красного и без
+    // спиц — око ХМУРИТСЯ и ПУЛЬСИРУЕТ, набухая всё чаще; на метках держит
+    // брови и мелко дрожит. Красное — значит луч, пульс — значит земля.
+    const wavePulse = waveTele > 0
+      ? (0.5 + 0.5 * Math.sin(this.waveT * (6 + waveTele * 14))) * (0.35 + 0.65 * waveTele)
+      : 0;
+    const twitch = Math.max(stage(0.0, 0.18), waveTele * 0.35 + waveMark * 0.25);   // 0%  — око начинает дёргаться
+    const browAmt = Math.max(stage(0.2, 0.34), Math.min(1, waveTele * 3), waveMark);  // 20% — брови встают в ярость
     // 30% — наливается красным, в паузе перед ударом добирает до предела
     const redAmt =
       this.phase === 1
@@ -1609,7 +1839,7 @@ export class Eye {
         : this.phase === 2
           ? 1
           : back;
-    const growAmt = stage(0.4, 0.62);  // 40% — раздаётся в размере
+    const growAmt = Math.max(stage(0.4, 0.62), wavePulse * 0.8);  // 40% — раздаётся в размере
     // 60% — стягивает энергию к себе; к 86% набрало и ГАСНЕТ
     // ★ ПЕРЕД УДАРОМ ЕСТЬ ПАУЗА. Без неё спицы работали до последнего кадра, и
     // выстрел сливался с накоплением — не было мгновения, в котором понятно,
@@ -1630,7 +1860,16 @@ export class Eye {
             : 0;
 
     this.fireT -= dt;
-    if (!charging && !dbg && !this.quiet && this.lock > LOCK_FIRE && mob > 0.2 && this.fireT <= 0) {
+    // ★ ПОСЛЕ РЕЗА ОКО ОТДЫХАЕТ ЦЕЛИКОМ. Обстрел был завязан только на «сейчас
+    // не заряжаюсь», поэтому едва луч гас — снаряды летели снова, без паузы:
+    // передышки между атаками у игрока не было вовсе. Теперь молчит вся фаза
+    // остывания (phase 3), и право искать и стрелять возвращается ровно тогда,
+    // когда возвращается прожектор.
+    const resting = this.phase === 3;
+    if (
+      !charging && !resting && !dbg && !this.quiet &&
+      this.lock > LOCK_FIRE && mob > 0.2 && this.fireT <= 0
+    ) {
       this.fireT = (0.95 - fire * 0.6) * (0.85 + Math.random() * 0.3);
       const salvo = 1 + (fire > 0.3 ? 1 : 0) + (fire > 0.62 ? 1 : 0) + (fire > 0.88 ? 1 : 0);
       for (let i = 0; i < salvo; i++) {
@@ -1742,12 +1981,28 @@ export class Eye {
     this.cutting = cutting;
     this.chargeAmt = Math.max(twitch, Math.max(redAmt, Math.max(gather, hold)));
     this.beam.visible = !busy;
-    this.beamMat.uniforms.uOp.value = 0.26 + this.lock * 0.16;
+    this.beamMat.uniforms.uOp.value = 0.26 + this.lock * 0.16 + this.lockFlash * 0.3;
+    // ★ ЗАХВАТ ВИДЕН ПО ЦВЕТУ. Поисковый луч и пятно — янтарные; как только око
+    // держит цель, они наливаются красным (плюс вспышка в момент захвата).
+    // Это читается краем глаза даже когда сам глаз в кадре не виден.
+    // ищет — янтарный, держит — КРАСНЫЙ, потерял — снова янтарный.
+    // ★ ЦВЕТ ИДЁТ ЗА ВЕДЕНИЕМ (holdT), А НЕ ЗА МГНОВЕННЫМ «В ПЯТНЕ». Счётчик
+    // lock тает за доли секунды на любом выезде из пятна, и луч мигал жёлтым
+    // при каждом коротком проскоке — читалось как «постоянно теряет». Ведение
+    // же держится ещё HOLD после потери — это и есть честное «нашёл/потерял».
+    const lockK = this.trackK;
+    const fl = this.lockFlash;
+    const beamC = this.beamMat.uniforms.uCol.value as THREE.Color;
+    // вспышка: чисто красный луч, ярче обычного
+    beamC.setRGB(1.7 + 0.6 * lockK + 0.9 * fl, 0.42 - 0.36 * lockK, 0.07 - 0.05 * lockK);
     if (this.onSpotDir) {
       this.onSpotDir(eyePos.x - spotX, eyePos.y - spotY, eyePos.z - scanZ);
     }
+    if (this.onSpotCol) {
+      this.onSpotCol(1.7 + 0.7 * lockK + 1.1 * fl, 0.30 - 0.26 * lockK, 0.06 - 0.045 * lockK);
+    }
     if (this.onSpot) {
-      const s = busy ? 0 : lands ? 0.4 + this.lock * 0.24 + (this.caught ? 0.1 : 0) : 0;
+      const s = busy ? 0 : lands ? 0.4 + this.lock * 0.24 + (this.caught ? 0.1 : 0) + fl * 0.6 : 0;
       this.onSpot(spotX, scanZ, SPOT_R, s);
     }
 
@@ -1775,18 +2030,31 @@ export class Eye {
           this.moveT = 0;
           this.movePhase = Math.random() * Math.PI * 2;
         }
-        const pu = toValleyU(px, pz);
+        // ★ «ВПЕРЕДИ» — ЭТО КУДА ЕДЕШЬ, А НЕ ВНИЗ ПО ТРАССЕ. Все приёмы клались
+        // на pz + фора, то есть строго вниз по долине: стоило ехать поперёк
+        // склона — и рез никогда не оказывался перед доской (замер: траверс —
+        // ноль пересечений). Теперь фора и качание строятся вдоль ВЕКТОРА
+        // СКОРОСТИ игрока (f — вперёд, r — вправо), в мировых координатах;
+        // на малом ходу вперёд = вниз по склону, как раньше.
+        const spd = Math.hypot(this.vSide, this.vDown);
+        const fx = spd > 4 ? this.vSide / spd : 0;
+        const fz = spd > 4 ? this.vDown / spd : 1;
+        const rx = fz;
+        const rz = -fx;
+        // центр приёма тянется за игроком с ограниченной скоростью — рулением
+        // от него можно уйти, сносом долины — нет
         const rate = SWEEP_FOLLOW * dt;
-        this.sweepX += Math.max(-rate, Math.min(rate, pu - this.sweepX));
+        this.sweepCX += Math.max(-rate, Math.min(rate, px - this.sweepCX));
+        this.sweepCZ += Math.max(-rate, Math.min(rate, pz - this.sweepCZ));
         // нижний предел форы: на малой скорости она иначе схлопывается в
         // считаные метры, и реагировать снова не на что
-        const lead = Math.max(38, this.vDown * AIM_LEAD);
-        let wu: number;
-        let wz: number;
+        const lead = Math.max(38, spd * AIM_LEAD);
+        let ahead: number; // вдоль f от центра
+        let across: number; // вдоль r от центра
         if (this.moveKind === 0) {
           // КОСА: луч метёт поперёк, проходя через центр дважды за период
-          wu = this.sweepX + SWEEP_A * Math.sin((this.moveT * Math.PI * 2) / SWEEP_P + this.movePhase);
-          wz = pz + lead;
+          across = SWEEP_A * Math.sin((this.moveT * Math.PI * 2) / SWEEP_P + this.movePhase);
+          ahead = lead;
         } else if (this.moveKind === 1) {
           // ПЕТЛЯ: рез обводит игрока кольцом. Выйти можно только через ту его
           // часть, которую луч прожёг раньше всего и она успела схватиться.
@@ -1794,18 +2062,23 @@ export class Eye {
           // ★ КОЛЬЦО ОБВОДИТ ТОЧКУ ВПЕРЕДИ, А НЕ САМУ ДОСКУ. С центром на
           // 0.7 форы ближняя дуга кольца проходила у игрока за спиной (замер:
           // p10 форы 15 м, местами отрицательная) — реагировать было не на что.
-          wu = this.sweepX + LOOP_R * Math.cos(a);
-          wz = pz + lead * 1.05 + LOOP_R * Math.sin(a);
+          across = LOOP_R * Math.cos(a);
+          ahead = lead * 1.05 + LOOP_R * Math.sin(a);
         } else {
           // ВЫПАДЫ: рывок в точку, куда игрок ЕДЕТ, и отскок вбок. Целятся с
           // упреждением, поэтому спасает не скорость, а смена линии.
           const k = (this.moveT % STAB_P) / STAB_P;
           const side = Math.floor(this.moveT / STAB_P) % 2 === 0 ? 1 : -1;
-          const want = k < 0.4 ? pu + vLat * 0.55 : this.sweepX + side * STAB_A;
+          const want = k < 0.4 ? 0 : side * STAB_A;
           this.stabU += (want - this.stabU) * Math.min(1, dt * 6);
-          wu = this.stabU;
-          wz = pz + lead * (k < 0.4 ? 0.9 : 1.35);
+          across = this.stabU;
+          ahead = lead * (k < 0.4 ? 0.9 : 1.35);
         }
+        const tx = this.sweepCX + fx * ahead + rx * across;
+        const tz = this.sweepCZ + fz * ahead + rz * across;
+        const wu = toValleyU(tx, tz);
+        const wz = tz;
+        void vLat;
         // ★ ЕДИНОЕ СГЛАЖИВАНИЕ НА ВЫХОДЕ. Гасит и рывки выпадов, и скачок цели
         // на стыке приёмов: луч всегда идёт к новой точке, а не появляется в ней.
         const sm = 1 - Math.exp(-AIM_SMOOTH * dt);
@@ -1926,13 +2199,15 @@ export class Eye {
     if (this.glow) {
       this.glow.position.copy(eyePos);
       this.glow.quaternion.copy(this.quad.quaternion);
-      this.glow.scale.setScalar(qs * (0.62 + this.lock * 0.28 + growAmt * 1.4));
+      this.glow.scale.setScalar(qs * (0.62 + this.lock * 0.28 + growAmt * 1.4 + this.lockFlash * 0.9));
       this.glowMat.uniforms.uLock.value = Math.min(1, this.lock / LOCK_FIRE + redAmt);
       this.glowMat.uniforms.uTime.value = time;
+      // краснеет и на захвате, не только на накоплении луча
+      const rk = Math.max(redAmt, Math.max(lockK, this.lockFlash));
       this.glowMat.uniforms.uCol.value.setRGB(
-        1.9 + redAmt * 1.6,
-        0.5 - redAmt * 0.36,
-        0.1 - redAmt * 0.07
+        1.9 + rk * 1.6,
+        0.5 - rk * 0.36,
+        0.1 - rk * 0.07
       );
     }
     // ★ ОКО ДЁРГАЕТСЯ, ПОКА КОПИТ. Ровно наливающийся красным круг читается
@@ -1968,7 +2243,10 @@ export class Eye {
     // ровным заревом, и было не понять, куда именно смотрит луч. Свет живёт
     // там, где луч упирается в землю: игрок видит, что надо объехать.
     this.light.position.set(spotX, spotY + 26, scanZ);
-    this.light.intensity = !busy && lands ? 48 * (0.6 + this.lock * 0.9) : 0;
+    // ★ НА СНЕГУ ЛАМПА ПЯТНА ВТРОЕ СЛАБЕЕ: сила подобрана под тёмный пепел; на
+    // снегу с альбедо 0.9 она заливала десятки метров вокруг пятна в белый.
+    const snowK = 0.35 + 0.65 * volcanoWeight(scanZ);
+    this.light.intensity = !busy && lands ? 30 * (0.6 + this.lock * 0.9) * snowK : 0;
 
     if (this.doomT >= 0) this.applyDoom(dt, qs);
   }

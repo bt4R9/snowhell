@@ -1,10 +1,11 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { Input } from './core/input';
 import { RetroPipeline } from './core/retro';
 import { PALETTE, SUN_DIR, FOG_NEAR, FOG_FAR, AMBIENT_COLOR } from './world/palette';
 import { createSky } from './world/sky';
 import { Peaks } from './world/peaks';
-import { Terrain, terrainHeight, terrainNormal } from './world/terrain';
+import { Terrain, terrainHeight, terrainNormal, WAVES, WAVE_W, WAVE_H } from './world/terrain';
+import { ChunkShader } from './world/chunkshade';
 import { Player } from './player/player';
 import { FollowCamera } from './camera';
 import { Spray, Snowfall } from './fx/snow';
@@ -14,13 +15,16 @@ import { Fireballs } from './fx/fireball';
 import { groundDip } from './fx/ground';
 import { CutSparks } from './fx/cutsparks';
 import { Demo, Stage } from './demo';
-import { ageCuts, laserA, laserB } from './fx/laser';
-import { Eye } from './world/eye';
+import { damage } from './fx/damage';
+import { Eye, WAVE_SPEED, WAVE_RMAX, MARK_R0, MARK_T } from './world/eye';
+import { WaveDust } from './fx/wavedust';
 import { BiomeManager } from './world/biomes';
 import { Backdrop } from './world/backdrop';
-import { installHeightFog } from './world/fog';
-import { installVertexSnap } from './world/vertexsnap';
-import { LavaField, Volcanoes, setLavaTime } from './world/lava';
+import { installHeightFog, syncFog } from './world/fog';
+import { basic } from './core/mat';
+import { Volcanoes, setLavaTime } from './world/lava';
+import { Pools } from './world/pools';
+import { Boulders } from './world/boulders';
 import { FarField } from './world/farfield';
 import { Hud } from './ui/hud';
 import { Sound } from './audio/sound';
@@ -48,7 +52,7 @@ export class Game {
   readonly terrain = new Terrain();
   readonly followCam: FollowCamera;
 
-  private renderer: THREE.WebGLRenderer;
+  private renderer: THREE.WebGPURenderer;
   private retro: RetroPipeline;
   private scene = new THREE.Scene();
   private sky = createSky();
@@ -63,7 +67,8 @@ export class Game {
   /** око: ориентир, который смотрит в ответ */
   readonly eye = new Eye();
   private snowfall: Snowfall;
-  private lava = new LavaField();
+  private lava!: Pools;
+  private boulders!: Boulders;
   private volcanoes = new Volcanoes();
   private fireballs = new Fireballs();
   private worldTime = 0;
@@ -89,15 +94,40 @@ export class Game {
   // очки
   totalScore = 0;
   comboMult = 1;
+  /** точка отрыва текущего прыжка — для дальности в HUD */
+  private airStart: THREE.Vector3 | null = null;
+  private lastAirDist = '';
+  private waveBuf = new Float32Array(WAVES * 4);
+  private markBuf = new Float32Array(WAVES * 4);
+  private waveDust = new WaveDust();
 
-  constructor() {
-    installHeightFog();
-    installVertexSnap();
-    this.renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
-    this.renderer.setPixelRatio(1);
+  /** рендерер создаётся снаружи (core/gpu.ts): его инициализация асинхронная */
+  constructor(renderer: THREE.WebGPURenderer) {
+    this.renderer = renderer;
     document.body.appendChild(this.renderer.domElement);
+    // раскраска чанков рельефа — compute-ядро, ему нужен рендерер
+    this.terrain.setShader(new ChunkShader(renderer, Terrain.VERTS_PER_CHUNK, Terrain.LATTICE_PER_CHUNK));
+    // лава: чаши, языки, провалы, пузыри и пар — всё живое на GPU (world/pools.ts)
+    this.lava = new Pools(renderer);
+    this.player.setPools(this.lava);
+    // ★ горящие глыбы из извержений: физика по рельефу, огненный след
+    this.boulders = new Boulders(terrainHeight, terrainNormal);
+    this.scene.add(this.boulders.group);
+    this.boulders.onTrail = (ax, az, bx, bz, r, depth) => damage.paintCut(ax, az, bx, bz, r, depth);
+    this.lava.onBoulder = (x, y, z) => {
+      // цель — куда игрок едет: позиция через ~3 с плюс разброс
+      const p = this.player;
+      const tx = p.pos.x + p.velH.x * 3 + (Math.random() - 0.5) * 30;
+      const tz = p.pos.z + p.velH.z * 3 + (Math.random() - 0.5) * 30;
+      this.boulders.launch(x, y, z, tx, tz);
+      const d = Math.hypot(x - this.player.pos.x, z - this.player.pos.z);
+      this.sound.blast(0.6, Math.max(-1, Math.min(1, (x - this.player.pos.x) / 80)), d);
+    };
 
+    // scene.fog остаётся носителем параметров (его крутит BiomeManager), а
+    // рисует дымку узел psxFog — см. world/fog.ts
     this.scene.fog = new THREE.Fog(PALETTE.fog, FOG_NEAR, FOG_FAR);
+    installHeightFog(this.scene);
     this.scene.add(this.sky.mesh);
     this.scene.add(this.peaks.group);
     this.scene.add(this.backdrop.group);
@@ -114,7 +144,9 @@ export class Game {
     // проваливались в чёрную дыру. Но он обязан быть СЛАБЫМ и ХОЛОДНЫМ:
     // на 1.1 тёплого цвета тумана вся гора становилась песочной — уходили
     // и белизна снега, и тени разом.
-    this.scene.add(new THREE.AmbientLight(AMBIENT_COLOR, 0.32));
+    // подсвет переключается вместе с биомом (см. BiomeManager)
+    const ambient = new THREE.AmbientLight(AMBIENT_COLOR, 0.32);
+    this.scene.add(ambient);
     this.scene.add(hemi);
     this.sun = new THREE.DirectionalLight(PALETTE.sun, 2.0);
     this.sun.position.copy(SUN_DIR).multiplyScalar(100);
@@ -123,12 +155,12 @@ export class Game {
     this.scene.add(this.terrain.group);
     this.scene.add(this.lava.group);
     // лампы от лавы: рельеф светится своим шейдером, а скалы и деревья — этими
-    for (const l of this.lava.lavaLights) this.scene.add(l);
     this.scene.add(this.volcanoes.group);
     this.scene.add(this.fireballs.group);
     this.scene.add(this.fireballs.light);
     this.scene.add(this.player.rig.root);
     this.scene.add(this.spray.points);
+    this.scene.add(this.waveDust.sprite);
     this.scene.add(this.treeFire.points);
     this.scene.add(this.eye.group);
     this.scene.add(this.eye.light);
@@ -138,6 +170,7 @@ export class Game {
     // пятно прожектора рисует сам рельеф — так оно точно повторяет его форму
     this.eye.onSpot = (x, z, r, s) => this.terrain.setSpot(x, z, r, s);
     this.eye.onSpotDir = (x, y, z) => this.terrain.setSpotDir(x, y, z);
+    this.eye.onSpotCol = (r, g, b) => this.terrain.setSpotCol(r, g, b);
     this.scene.add(this.treeFire.light);
     this.scene.add(this.trail.mesh);
 
@@ -146,7 +179,7 @@ export class Game {
     shadowGeo.rotateX(-Math.PI / 2);
     this.shadow = new THREE.Mesh(
       shadowGeo,
-      new THREE.MeshBasicMaterial({
+      basic({
         color: 0x1c1e2c,
         transparent: true,
         opacity: 0.3,
@@ -161,13 +194,14 @@ export class Game {
     this.retro = new RetroPipeline(this.renderer, 3);
     this.hud.layout(this.retro.lowWidth, this.retro.lowHeight);
 
-    this.snowfall = new Snowfall(this.followCam.camera.position);
+    this.snowfall = new Snowfall(this.followCam.camera.position, this.renderer);
     this.scene.add(this.snowfall.points);
 
     this.biomes = new BiomeManager(
       this.scene.fog as THREE.Fog,
       this.sun,
       hemi,
+      ambient,
       this.terrain.snowMaterial,
       this.terrain.pineMaterial,
       this.farField.material,
@@ -273,7 +307,9 @@ export class Game {
     this.terrain.update(player.pos.x, player.pos.z);
     if (!this.warmed) {
       this.warmed = true;
-      this.renderer.compile(this.scene, this.followCam.camera);
+      // ★ WebGPU: конвейеры собираются асинхронно, синхронного compile нет.
+      // Первый кадр может рисоваться без части объектов — это лучше рывка.
+      void this.renderer.compileAsync(this.scene, this.followCam.camera);
     }
     // ★ ВО ВСТАВКЕ ПОГОДУ ВЕДЁТ РЕЖИССЁР. Палитра, туман и свет считаются по
     // положению игрока, а он на завязке стоит — значит небо само не потемнеет.
@@ -283,6 +319,7 @@ export class Game {
         ? Math.max(this.demo.weatherZ, player.pos.z)
         : player.pos.z
     );
+    syncFog(this.scene.fog as THREE.Fog);
     this.eye.cine = this.demo.towerRise;
     // во вставках око не стреляет: игрок там всё равно не управляет
     this.eye.quiet = this.demo.frozen;
@@ -297,14 +334,20 @@ export class Game {
     // пересобирается вокруг игрока, а не запекается в чанк.
     this.worldTime += dt;
     setLavaTime(this.worldTime);
-    const lu = this.lava.material.uniforms;
-    lu.uFogColor.value = (this.scene.fog as THREE.Fog).color;
-    lu.uFogNear.value = (this.scene.fog as THREE.Fog).near;
-    lu.uFogFar.value = (this.scene.fog as THREE.Fog).far;
-    this.lava.update(
-      player.pos.x, player.pos.z, this.worldTime,
-      toValleyU, toWorldX, terrainHeight, volcanoWeight
-    );
+    {
+      const f = this.scene.fog as THREE.Fog;
+      this.lava.setFog(f.color, f.near, f.far);
+    }
+    this.lava.update(player.pos.x, player.pos.z, this.worldTime, dt);
+    this.boulders.update(dt);
+    {
+      const hit = this.boulders.hitPlayer(player.pos.x, player.pos.y, player.pos.z);
+      if (hit && player.boulderHit(hit.push, hit.dx, hit.dz, hit.heat)) {
+        this.followCam.impact(0.6 + hit.push * 0.4, hit.push > 0.5);
+        this.sound.crash();
+        this.spray.burst(player.pos, player.velH, 30);
+      }
+    }
     this.volcanoes.update(player.pos.z, dt, terrainHeight, toWorldX, volcanoWeight);
     this.volcanoes.updateSteam(
       player.pos.z, toValleyU(player.pos.x, player.pos.z), this.worldTime,
@@ -316,11 +359,9 @@ export class Game {
     );
     // снаряды рисует отдельная система: ядро, огненный хвост, метка и взрыв
     this.fireballs.update(dt, player.pos.x, player.pos.z, terrainHeight);
-    // воронки от взрывов рисует сам рельеф — они держатся дольше вспышки
-    this.terrain.setCraters(this.fireballs.craterData);
-    // полосы реза: стынут сами по себе, независимо от того, жив ли ещё глаз
-    ageCuts(dt);
-    this.terrain.setLaser(laserA(), laserB());
+    // ★ следы ударов и реза живут в карте повреждений (fx/damage.ts): её читают
+    // и физика, и шейдер рельефа; текстура заливается только после ударов
+    damage.update(this.worldTime);
     this.terrain.setGlows(this.lava.glowData);
     this.sound.shells(this.fireballs.live);
     // панорама: сносим точку в систему камеры и берём поперечную составляющую
@@ -402,23 +443,20 @@ export class Game {
       volcanoWeight(player.pos.z),
       player.crackHot
     );
-    // ★ ИСКРЫ ИЗ-ПОД КАНТА. По раскалённому шву доска идёт как по точилу:
-    // сноп искр назад. Частота растёт со скоростью и жаром шва.
-    this.sound.sparks(
-      player.grounded && player.speed > 6
-        ? Math.min(1, player.crackHot * 1.6) * Math.min(1, player.speed / 16)
-        : 0
-    );
-    if (player.grounded && player.crackHot > 0.12 && player.speed > 6) {
-      this.emberAcc += dt * (34 + player.speed * 9) * player.crackHot;
-      while (this.emberAcc >= 1) {
-        this.emberAcc -= 1;
-        this.lava.emberBurst(
-          visPos.x, visPos.y, visPos.z,
-          player.velH.x, player.velH.z, 2
-        );
-      }
-    }
+    // ★ ИСКР ОТ ГОРЯЧЕЙ ЗЕМЛИ ЗДЕСЬ БОЛЬШЕ НЕТ (снято 2026-08-17).
+    // Задумка была хорошая — доска идёт по раскалённому шву как по точилу, — но
+    // в игре это читалось СЛУЧАЙНЫМИ искрами и раздражало. Причина системная:
+    // на вулкане светятся сразу несколько независимых вещей (сеть швов, блики
+    // обсидиана, корка потока, прокал у лавы), физика знала лишь часть из них,
+    // а видимое свечение вдобавок расплывается блумом шире своего ядра. Шесть
+    // заходов подряд давали то искры на пустом месте, то тишину на светящемся.
+    // ВОЗВРАЩАТЬ НЕ В ПРЕЖНЕМ ВИДЕ, а вместе с переделкой: узор и жар должны
+    // приходить из ОДНОГО источника с шейдером (общая формула или чтение из
+    // маленького render target), иначе двойник снова разъедется. Полный разбор
+    // с замерами — в памяти проекта.
+    this.sound.sparks(0);
+    // порог — по ВИДИМОМУ свечению (замер долей площади: >0.05 — 4.7%),
+    // чтобы «летят искры» и «под доской светится» совпадали один в один
     // брызги перекрашиваются вместе с биомом: на вулкане из-под доски летит
     // пепел, а не снег
     {
@@ -435,7 +473,7 @@ export class Game {
     terrainNormal(player.pos.x, player.pos.z, this.shadowNormal);
     this.shadow.quaternion.setFromUnitVectors(this.worldUp, this.shadowNormal);
     this.shadow.scale.setScalar(1 + hAbove * 0.05);
-    (this.shadow.material as THREE.MeshBasicMaterial).opacity = Math.max(
+    (this.shadow.material as THREE.MeshBasicNodeMaterial).opacity = Math.max(
       0.12,
       0.3 - hAbove * 0.012
     );
@@ -505,6 +543,9 @@ export class Game {
         this.hud.landing(describeTrick(landing), pts, mult, 'clean', bonus.label);
         this.sound.clean(this.comboMult);
         this.comboMult = Math.min(this.comboMult + 1, 9);
+      } else if (landing.quality === 'clean' && landing.airTime > 0.6 && this.lastAirDist) {
+        // чистый прыжок без трюка: очков нет, но дальность показать стоит
+        this.hud.notice(this.lastAirDist, 0xcfe6ff);
       } else if (landing.quality !== 'clean') {
         this.comboMult = 1;
         this.hud.landing(describeTrick(landing), 0, 1, landing.quality);
@@ -535,9 +576,18 @@ export class Game {
       const live = grindScore(player.grindDuration) * this.comboMult;
       this.hud.airTrick('GRIND ' + live);
     } else if (!player.grounded) {
+      // ★ В ПОЛЁТЕ ПИШЕМ ДАЛЬНОСТЬ: сколько метров по горизонтали от точки
+      // отрыва и сколько по вертикали (↑ выше точки отрыва / ↓ ниже).
+      if (!this.airStart) this.airStart = player.pos.clone();
+      const dh = Math.hypot(player.pos.x - this.airStart.x, player.pos.z - this.airStart.z);
+      const dv = player.pos.y - this.airStart.y;
+      const dist = '→' + Math.round(dh) + 'M ' + (dv >= 0 ? '↑' : '↓') + Math.round(Math.abs(dv)) + 'M';
       const spinDeg = THREE.MathUtils.radToDeg(player.trickYaw);
-      this.hud.airTrick(describeLive(spinDeg, player.trickFlip / (Math.PI * 2), player.grabTime));
+      const live = describeLive(spinDeg, player.trickFlip / (Math.PI * 2), player.grabTime);
+      this.lastAirDist = dist;
+      this.hud.airTrick(live ? live + '  ' + dist : dist);
     } else {
+      this.airStart = null;
       this.hud.airTrick('');
     }
 
@@ -547,6 +597,64 @@ export class Game {
       player.pos.x, player.pos.y, player.pos.z, this.worldTime, dt,
       terrainHeight, (this.scene.fog as THREE.Fog).color
     );
+    // ★ УДАРНЫЕ ВОЛНЫ БАШНИ: кольцо бежит по земле — рельефу отдаём радиусы,
+    // игрока проверяем по фронту (ширина WAVE_W), на удар — тряска и «бух»
+    if (this.eye.justSlammed) {
+      const sl = this.eye.justSlammed;
+      const d = Math.hypot(sl.x - player.pos.x, sl.z - player.pos.z);
+      this.followCam.impact(0.9, false);
+      this.sound.blast(1, Math.max(-1, Math.min(1, (sl.x - player.pos.x) / 60)), d);
+    }
+    for (let i = 0; i < WAVES; i++) {
+      const wv = this.eye.waves[i];
+      if (!wv) { this.waveBuf.fill(0, i * 4, i * 4 + 4); continue; }
+      const age = this.worldTime - wv.t0;
+      const r = age * WAVE_SPEED;
+      // сила: короткий разгон и затухание к краю
+      const str = Math.min(1, age * 4) * Math.max(0, 1 - r / WAVE_RMAX);
+      this.waveBuf[i * 4] = wv.x;
+      this.waveBuf[i * 4 + 1] = wv.z;
+      this.waveBuf[i * 4 + 2] = r;
+      this.waveBuf[i * 4 + 3] = str;
+      const d = Math.hypot(player.pos.x - wv.x, player.pos.z - wv.z);
+      // ★ ПЫЛЬ С ГРЕБНЯ. Сам вал на плоской заливке читался слабо; завеса пепла,
+      // летящая вверх по фронту, видна с любого ракурса и показывает движение.
+      // Сыплем только на дуге, что в полутора сотнях метров от игрока.
+      if (str > 0.1) {
+        const a0 = Math.atan2(player.pos.z - wv.z, player.pos.x - wv.x);
+        const span = Math.min(Math.PI, 150 / Math.max(1, r));
+        for (let k = 0; k < 10; k++) {
+          const a = a0 + (Math.random() - 0.5) * 2 * span;
+          const rr = r + (Math.random() - 0.5) * WAVE_W * 0.5;
+          const x = wv.x + Math.cos(a) * rr;
+          const z = wv.z + Math.sin(a) * rr;
+          const y = terrainHeight(x, z) + WAVE_H * str * 0.6 + Math.random() * 1.5;
+          this.waveDust.puff(
+            x, y, z,
+            Math.cos(a) * 7 + (Math.random() - 0.5) * 4, 7 + Math.random() * 8 * str, Math.sin(a) * 7 + (Math.random() - 0.5) * 4,
+            0.8 + Math.random() * 0.8, 1.6 + Math.random() * 1.6
+          );
+        }
+      }
+      if (str > 0.15 && Math.abs(d - r) < WAVE_W * 0.5 && player.shockHit(WAVE_H * str)) {
+        this.followCam.impact(1, true);
+        this.sound.crash();
+        this.spray.burst(visPos, player.velH, 40);
+      }
+    }
+    this.terrain.setWaves(this.waveBuf);
+    this.waveDust.update(dt);
+    // метки: кольцо сужается от MARK_R0 к нулю за время метки
+    for (let i = 0; i < WAVES; i++) {
+      const mk = this.eye.marks[i];
+      if (!mk) { this.markBuf.fill(0, i * 4, i * 4 + 4); continue; }
+      const k = Math.max(0, Math.min(1, (this.worldTime - mk.t0) / MARK_T));
+      this.markBuf[i * 4] = mk.x;
+      this.markBuf[i * 4 + 1] = mk.z;
+      this.markBuf[i * 4 + 2] = MARK_R0 * (1 - k) * (1 - k * 0.15);
+      this.markBuf[i * 4 + 3] = k < 0 ? 0 : 0.6 + 0.4 * k;
+    }
+    this.terrain.setMarks(this.markBuf);
     this.snowfall.update(dt, camPos);
     this.hud.update(dt);
     // кадровые цифры считаем по РЕАЛЬНОМУ времени кадра, а не по шагу физики:

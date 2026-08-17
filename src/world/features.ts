@@ -1,4 +1,5 @@
 import { hash2, noise2, seedPhase } from './noise';
+import { recipe, actAt } from './recipe';
 
 // Детерминированное размещение игровых объектов: деревья, камни, кикеры, рейлы.
 // И физика, и рендер читают одни и те же данные, поэтому коллизии всегда
@@ -14,9 +15,11 @@ export const CHUNK = 48;
 // Сдвиг задан аналитически, поэтому преобразование в обе стороны — бесплатное.
 
 export function valleyX(v: number): number {
+  // размах виляния оси — из рецепта мира: от почти прямой долины до змеи
+  const k = recipe().valley;
   return (
-    Math.sin(v * 0.0018 + seedPhase(0)) * 430 +
-    Math.sin(v * 0.0044 + 1.7 + seedPhase(1)) * 195
+    Math.sin(v * 0.0018 + seedPhase(0)) * 430 * k +
+    Math.sin(v * 0.0044 + 1.7 + seedPhase(1)) * 195 * k
   );
 }
 
@@ -115,6 +118,11 @@ export interface Obstacle {
   zMul?: number;    // сжатие скалы по своей оси Z
   leg?: number;     // какая нога арки (0 — левая, 1 — правая)
   topY?: number;    // высота верхушки над землёй — выше неё столкновения нет
+  lay?: number;     // валун ЛЕЖИТ: угол завала набок, рад (см. rockRadiusToward)
+  /** ★ ПОСЛОЙНЫЙ ХИТБОКС (скалы, ноги арок): мировая высота начала модели и
+   * метров на единицу её высоты — по ним доска находит СВОЙ слой силуэта */
+  baseY?: number;
+  hUnit?: number;
 }
 
 // --- Биомы: зоны по дистанции с плавным перетеканием ---
@@ -467,6 +475,7 @@ const BANK_MAX = 4.2;
 /** Ось трассы: X центра коридора на данной глубине спуска */
 // Ось трассы: длинные сносы + настоящие S-повороты каждые 200–400 м.
 // Без коротких волн трасса ощущается прямой, как бы далеко она ни сносилась.
+// амплитуды множатся на recipe().piste — см. pisteCenterX
 const PISTE_WAVES: Array<[number, number, number]> = [
   // [амплитуда, частота, фаза]
   [190, 0.0011, 2.1],
@@ -476,30 +485,34 @@ const PISTE_WAVES: Array<[number, number, number]> = [
 ];
 
 export function pisteCenterX(z: number): number {
+  const k = recipe().piste; // насколько круто змеится трасса в этом мире
   let s = 0;
   for (let i = 0; i < PISTE_WAVES.length; i++) {
     const [a, f, p] = PISTE_WAVES[i];
-    s += Math.sin(z * f + p + seedPhase(2 + i)) * a;
+    s += Math.sin(z * f + p + seedPhase(2 + i)) * a * k;
   }
   return s;
 }
 
 /** Наклон оси (dX/dZ) — куда трасса поворачивает */
 export function pisteSlopeX(z: number): number {
+  const k = recipe().piste; // ТОТ ЖЕ множитель, что в pisteCenterX: иначе
+  // виражи и запреты на постройку разойдутся с самой линией
   let s = 0;
   for (let i = 0; i < PISTE_WAVES.length; i++) {
     const [a, f, p] = PISTE_WAVES[i];
-    s += Math.cos(z * f + p + seedPhase(2 + i)) * a * f;
+    s += Math.cos(z * f + p + seedPhase(2 + i)) * a * f * k;
   }
   return s;
 }
 
 /** Кривизна оси — знак задаёт, какая сторона виража внешняя */
 function pisteCurv(z: number): number {
+  const k = recipe().piste;
   let s = 0;
   for (let i = 0; i < PISTE_WAVES.length; i++) {
     const [a, f, p] = PISTE_WAVES[i];
-    s -= Math.sin(z * f + p + seedPhase(2 + i)) * a * f * f;
+    s -= Math.sin(z * f + p + seedPhase(2 + i)) * a * f * f * k;
   }
   return s;
 }
@@ -531,6 +544,17 @@ const GULLY_LEN = 360;
 const GULLY_FLOOR_W = 11;  // ровное дно: в него надо помещаться на скорости
 const GULLY_WALL_W = 26;   // где стена выходит на уровень склона
 
+/**
+ * Заводится ли кулуар k. Плотность — из рецепта мира и темы акта; в мире без
+ * кулуаров (рулетка присутствия) их нет вовсе.
+ */
+function gullyLives(k: number): boolean {
+  const R = recipe();
+  if (!R.hasGullies) return false;
+  const dens = Math.min(1.6, R.gully * actAt(k * GULLY_PERIOD).gully);
+  return hash2(k * 313 + 5, 77) >= Math.max(0, 1 - 0.88 * dens);
+}
+
 /** Центр кулуара: идёт сбоку от трассы и виляет */
 function gullyCenter(k: number, v: number): number {
   const side = hash2(k * 29, 41) > 0.5 ? 1 : -1;
@@ -545,22 +569,56 @@ function gullyCenter(k: number, v: number): number {
   return pisteCenterX(v) + d;
 }
 
+/**
+ * ★ РАЗВИЛКА. Ниже по спуску кулуар делится: основной рукав идёт своей линией,
+ * второй отваливает В СТОРОНУ ОТ ТРАССЫ (только наружу — иначе клин рукава
+ * прорезал бы коридор, а зажимать его клампом значит склеить рукава обратно
+ * стеной). Пока расхождение меньше двух ширин дна, дно просто шире; дальше
+ * между рукавами вырастает остров, и приходится ВЫБИРАТЬ линию.
+ */
+function gullyFork(k: number, t: number): number {
+  if (hash2(k * 407 + 13, 89) <= 0.58) return 0;
+  const tF = 0.26 + hash2(k * 411, 17) * 0.12;
+  if (t <= tF) return 0;
+  // Расхождение выходит на полное к 0.82 длины, а не к самому концу: иначе
+  // рукава расходятся ровно там, где кулуар уже выкатывается на склон, и
+  // выбирать между ними попросту негде.
+  const s = Math.min(1, (t - tF) / (0.82 - tF));
+  return s * s * (3 - 2 * s) * (30 + hash2(k * 419, 23) * 30);
+}
+
+/** Профиль поперёк рукава: 1 на дне, 0 за бортом */
+function gullyProfile(ax: number): number {
+  if (ax > GULLY_WALL_W) return 0;
+  const w = Math.max(0, Math.min(1, (ax - GULLY_FLOOR_W) / (GULLY_WALL_W - GULLY_FLOOR_W)));
+  return 1 - w * w * (3 - 2 * w);
+}
+
+/** Наибольший из профилей рукавов кулуара k в точке (u, v) */
+function gullyShape(k: number, u: number, v: number, t: number): number {
+  const c = gullyCenter(k, v);
+  const p = gullyProfile(Math.abs(u - c));
+  const sp = gullyFork(k, t);
+  if (sp <= 0) return p;
+  // наружу — туда же, куда смещён сам кулуар от оси трассы
+  const out = c - pisteCenterX(v) >= 0 ? 1 : -1;
+  return Math.max(p, gullyProfile(Math.abs(u - (c + out * sp))));
+}
+
 export function gullyDepth(u: number, v: number): number {
   let d = 0;
   const idx = Math.floor(v / GULLY_PERIOD);
   for (let k = idx - 1; k <= idx; k++) {
     if (k < 1) continue;
-    if (hash2(k * 313 + 5, 77) < 0.12) continue;
+    if (!gullyLives(k)) continue;
     const z0 = k * GULLY_PERIOD + 40 + hash2(k * 11, 3) * 60;
     const t = (v - z0) / GULLY_LEN;
     if (t < 0 || t > 1) continue;
     // плавный вход и выкат: в кулуар вкатываешься, а не падаешь в яму
     const e = Math.min(1, Math.min(t, 1 - t) / 0.14);
     const env = e * e * (3 - 2 * e);
-    const ax = Math.abs(u - gullyCenter(k, v));
-    if (ax > GULLY_WALL_W) continue;
-    const w = Math.max(0, Math.min(1, (ax - GULLY_FLOOR_W) / (GULLY_WALL_W - GULLY_FLOOR_W)));
-    const prof = 1 - w * w * (3 - 2 * w);
+    const prof = gullyShape(k, u, v, t);
+    if (prof <= 0) continue;
     d -= (14 + hash2(k * 17, 23) * 10) * env * prof * WARMUP.hazard(v);
   }
   return d;
@@ -572,14 +630,11 @@ export function gullyInside(u: number, v: number): number {
   let best = 0;
   for (let k = idx - 1; k <= idx; k++) {
     if (k < 1) continue;
-    if (hash2(k * 313 + 5, 77) < 0.12) continue;
+    if (!gullyLives(k)) continue;
     const z0 = k * GULLY_PERIOD + 40 + hash2(k * 11, 3) * 60;
     const t = (v - z0) / GULLY_LEN;
     if (t < 0 || t > 1) continue;
-    const ax = Math.abs(u - gullyCenter(k, v));
-    if (ax > GULLY_WALL_W + 4) continue;
-    const w = Math.max(0, Math.min(1, (ax - GULLY_FLOOR_W) / (GULLY_WALL_W - GULLY_FLOOR_W)));
-    best = Math.max(best, 1 - w * w * (3 - 2 * w));
+    best = Math.max(best, gullyShape(k, u, v, t));
   }
   // тем же множителем, что и глубина в gullyDepth: вырубка леса и сглаживание
   // дна обязаны следовать за реальной формой кулуара, а не за его «чертежом»
@@ -643,6 +698,7 @@ const MESA_SZ = 300;
 const MESA_SX = 260;
 
 export function mesaLift(x: number, z: number): number {
+  if (!recipe().hasMesas) return 0; // в этом мире террас нет вовсе
   let d = 0;
   const cz0 = Math.floor(z / MESA_SZ);
   const cx0 = Math.floor(x / MESA_SX);
@@ -721,6 +777,13 @@ export interface VillageHouse {
   hMul: number;   // вариация высоты корпуса
   chimney: boolean;
   padR: number;   // радиус ровной площадки под домом
+  /**
+   * ★ ДОМ ВКОПАН В СКЛОН. Нагорный карниз выходит вровень с землёй: на крышу
+   * въезжаешь с горы как на продолжение склона, а с конька улетаешь вниз.
+   * Такой дом рельеф вокруг себя НЕ выравнивает и сугробом не обкладывается —
+   * он и так часть горы.
+   */
+  sunk: boolean;
   // готовые габариты (до умножения на scale) — общие для рендера и физики
   wide: number;
   deep: number;
@@ -746,6 +809,13 @@ export function houseRoof(h: VillageHouse): {
  * Конёк идёт вдоль локальной оси Z, скаты падают по X — ровно так построена
  * геометрия крыши, см. buildRoofGeometry.
  */
+let villagePads: ((v: Village, i: number) => number) | null = null;
+
+/** Высоты площадок домов приходят из terrain.ts (см. villageHeights) */
+export function setVillagePads(fn: (v: Village, i: number) => number): void {
+  villagePads = fn;
+}
+
 export function villageRoofAt(
   worldX: number,
   z: number
@@ -754,7 +824,8 @@ export function villageRoofAt(
   const v = villageAt(u, z);
   if (!v) return null;
   let best: { y: number; eave: number; ridge: number } | null = null;
-  for (const h of v.houses) {
+  for (let hi = 0; hi < v.houses.length; hi++) {
+    const h = v.houses[hi];
     const dx = u - h.x;
     const dz = z - h.z;
     if (dx * dx + dz * dz > 400) continue;
@@ -765,8 +836,8 @@ export function villageRoofAt(
     const R = houseRoof(h);
     if (Math.abs(lx) > R.hw || Math.abs(lz) > R.hd) continue;
     // площадка под домом — та же, на которую его ставит рендер
-    if (!sampleHeight) return null;
-    const pad = sampleHeight(h.x, h.z) - 0.15;
+    if (!villagePads) return null;
+    const pad = villagePads(v, hi) - 0.15;
     const y = pad + R.eave + (R.ridge - R.eave) * (1 - Math.abs(lx) / R.hw);
     if (!best || y > best.y) best = { y, eave: pad + R.eave, ridge: pad + R.ridge };
   }
@@ -804,7 +875,8 @@ export function villageInCell(vcx: number, vcz: number): Village | null {
   // деревни теперь по всему спуску (биом один), поэтому клеток занято меньше
   // порог принятия деревни зависит от биома: на вулкане поселений меньше
   // множитель ноль означает «здесь поселений нет вовсе», а не «реже»
-  const vMul = biomeVillageMul(baseZ);
+  const vMul = biomeVillageMul(baseZ) *
+    Math.min(2.2, recipe().villages * actAt(baseZ).villages);
   const vGate = 1 - (1 - 0.62) * vMul;
   if (vcz < 1 || vMul < 0.08 || hash2(S, 97) < vGate || baseZ < 900) {
     villageCache.set(key, null);
@@ -968,6 +1040,12 @@ export function villageInCell(vcx: number, vcz: number): Village | null {
         hMul,
         chimney: hash2(S + 83 + hi, 17) > 0.35 && kind !== HK.CHAPEL,
         padR,
+        // ★ ПОЧТИ ПОЛОВИНА ДОМОВ ВРЕЗАНА В СКЛОН. Дом-препятствие интересен
+        // ровно один раз; дом, по крыше которого едешь, — это уже линия.
+        // Отель и часовня остаются стоять как стояли: у них своя роль в силуэте
+        // деревни, и врезать их значит потерять её.
+        sunk: kind !== HK.HOTEL && kind !== HK.CHAPEL &&
+          hash2(S + 211 + hi * 5, 43) > 0.55,
       });
     }
     side = -side;
@@ -1181,7 +1259,19 @@ export interface Crag {
 // угловых секторах единичной геометрии. Профиль сообщает строитель геометрии
 // (terrain.ts) через впрыск — иначе модули замкнутся в цикл.
 export const CRAG_BINS = 24;
-let cragProf: number[][] = [0, 1, 2, 3].map(() => new Array(CRAG_BINS).fill(0.3));
+/**
+ * ★ СИЛУЭТ ПОСЛОЙНЫЙ. Один профиль на всю глыбу мерил пояс 0.34–0.45 высоты,
+ * а земля режет модель на 0.42/0.56 (sink) плюс холм плюс склон: доска шла
+ * по слою, где камень уже/шире, чем в измеренном, и билась о воздух. Теперь
+ * профиль снят для CRAG_LAYERS слоёв по CRAG_LAYER_H высоты, начиная с
+ * CRAG_LAYER_Y0; при столкновении берётся слой, в котором стоит доска.
+ */
+export const CRAG_LAYER_Y0 = 0.25;
+export const CRAG_LAYER_H = 0.05;
+export const CRAG_LAYERS = 15;
+let cragProf: number[][][] = [0, 1, 2, 3].map(() =>
+  Array.from({ length: CRAG_LAYERS }, () => new Array(CRAG_BINS).fill(0.3))
+);
 let cragHalfW = [0.3, 0.3, 0.3, 0.3];
 /**
  * ★ ХИТБОКС БУЛЫЖНИКА — ЭЛЛИПС ПО ЕГО СОБСТВЕННЫМ ОСЯМ, А НЕ КРУГ.
@@ -1195,14 +1285,51 @@ export function rockRadiusToward(o: Obstacle, dx: number, dz: number): number {
   const a = -(o.rot ?? 0);
   const lx = dx * Math.cos(a) - dz * Math.sin(a);
   const lz = dx * Math.sin(a) + dz * Math.cos(a);
-  const zm = o.zMul ?? 1;
+  // Завал набок на прямой угол просто МЕНЯЕТ ОСИ МЕСТАМИ: в плане у лежачего
+  // камня поперёк лежит его бывшая высота. Хитбокс обязан совпадать с
+  // силуэтом, поэтому пересчёт тут, а не только в рисовании.
+  const zm = o.lay ? (o.hMul ?? 0.7) : (o.zMul ?? 1);
   const ang = Math.atan2(lz / zm, lx);
   return 0.55 * (o.scale ?? 1) * Math.hypot(Math.cos(ang), Math.sin(ang) * zm);
 }
 
-export function setCragProfiles(p: number[][]): void {
+export function setCragProfiles(p: number[][][]): void {
   cragProf = p;
-  cragHalfW = p.map((v) => Math.max(...v));
+  // габарит для расстановки — по слоям у уровня земли (0.35–0.65 высоты)
+  cragHalfW = p.map((layers) => {
+    let m = 0;
+    for (let l = 2; l <= 8 && l < layers.length; l++) m = Math.max(m, ...layers[l]);
+    return m;
+  });
+}
+
+/** профиль в секторе с интерполяцией между соседями */
+function sampleProf(prof: number[], bins: number, ang: number): number {
+  // значения профиля стоят в ЦЕНТРАХ секторов — отсюда сдвиг на полсектора;
+  // без него радиус берётся не из того сектора, и промах доходит до 15°
+  const f = ((ang + Math.PI) / (2 * Math.PI)) * bins - 0.5 + bins;
+  const i0 = Math.floor(f) % bins;
+  const t = f - Math.floor(f);
+  const r0 = prof[i0];
+  const r1 = prof[(i0 + 1) % bins];
+  // хорда между соседними лучами чуть проваливается внутрь контура — 1% назад
+  return (r0 + (r1 - r0) * t) * 1.01;
+}
+
+/**
+ * Максимум профиля по слоям, которые задевает полоса высот [y0, y1] модели.
+ * Ниже первого слоя берём первый; выше последнего — камня нет (0).
+ */
+function layeredProf(layers: number[][], ly0: number, lh: number, bins: number, ang: number, y0: number, y1: number): number {
+  let i0 = Math.floor((y0 - ly0) / lh);
+  let i1 = Math.floor((y1 - ly0) / lh);
+  if (i1 < 0) i1 = 0;
+  if (i0 < 0) i0 = 0;
+  if (i0 >= layers.length) return 0;
+  if (i1 >= layers.length) i1 = layers.length - 1;
+  let r = 0;
+  for (let i = i0; i <= i1; i++) r = Math.max(r, sampleProf(layers[i], bins, ang));
+  return r;
 }
 
 /**
@@ -1210,9 +1337,13 @@ export function setCragProfiles(p: number[][]): void {
  * Разворачиваем смещение в собственные оси глыбы, там берём сектор профиля с
  * линейной интерполяцией между соседями (без неё круг сменился бы шестерёнкой).
  */
-export function cragRadiusToward(o: Obstacle, dx: number, dz: number): number {
-  const prof = cragProf[o.variant ?? 0];
-  if (!prof) return o.r;
+/**
+ * @param yW  мировая высота низа доски; @param hW — высота полосы касания
+ * (доска + райдер), м. Без них берётся пояс у уровня земли (слои 0.34–0.45).
+ */
+export function cragRadiusToward(o: Obstacle, dx: number, dz: number, yW?: number, hW = 1.6): number {
+  const layers = cragProf[o.variant ?? 0];
+  if (!layers) return o.r;
   const a = -(o.rot ?? 0);
   const lx = dx * Math.cos(a) - dz * Math.sin(a);
   const lz = dx * Math.sin(a) + dz * Math.cos(a);
@@ -1220,15 +1351,13 @@ export function cragRadiusToward(o: Obstacle, dx: number, dz: number): number {
   // угол берём в НОРМИРОВАННЫХ осях: по Z глыба сжата, и угол мирового
   // смещения не совпадает с углом в геометрии
   const ang = Math.atan2(lz / zm, lx);
-  // значения профиля стоят в ЦЕНТРАХ секторов — отсюда сдвиг на полсектора;
-  // без него радиус берётся не из того сектора, и промах доходит до 15°
-  const f = ((ang + Math.PI) / (2 * Math.PI)) * CRAG_BINS - 0.5 + CRAG_BINS;
-  const i0 = Math.floor(f) % CRAG_BINS;
-  const t = f - Math.floor(f);
-  const r0 = prof[i0];
-  const r1 = prof[(i0 + 1) % CRAG_BINS];
-  // хорда между соседними лучами чуть проваливается внутрь контура — 1% назад
-  const rn = (r0 + (r1 - r0) * t) * 1.01;
+  let y0 = 0.34;
+  let y1 = 0.45;
+  if (yW !== undefined && o.baseY !== undefined && o.hUnit) {
+    y0 = (yW - o.baseY) / o.hUnit;
+    y1 = y0 + hW / o.hUnit;
+  }
+  const rn = layeredProf(layers, CRAG_LAYER_Y0, CRAG_LAYER_H, CRAG_BINS, ang, y0, y1);
   // обратно в мир: вдоль X масштаб scale, вдоль Z — scale*zMul
   const cx = Math.cos(ang);
   const cz = Math.sin(ang) * zm;
@@ -1243,13 +1372,19 @@ export function cragInRow(k: number): Crag | null {
   if (hit !== undefined) return hit;
   const cz = k * CRAG_ROW;
   let res: Crag | null = null;
-  if (hash2(cz * 733 + 3, 11) > 0.29) {
+  if (recipe().hasCrags && hash2(cz * 733 + 3, 11) > 0.29) {
     const gz = cz * CHUNK + (hash2(cz * 17 + 5, 9) - 0.5) * CHUNK * 0.8;
     const side = hash2(cz * 29, 31) > 0.5 ? 1 : -1;
     // Разброс размера ВДВОЕ поверх прежнего диапазона: от «как было» до вдвое
     // крупнее, чтобы среди скал попадались настоящие доминанты.
-    const scale =
+    let scale =
       (70 + Math.pow(hash2(cz * 53, 59), 1.6) * 85) * (1 + hash2(cz * 61, 67));
+    // ★ ИЗЮМИНКА ЗАЕЗДА. Один останец на весь спуск вырастает втрое — это уже
+    // не «камень на склоне», а ориентир, по которому заезд и запоминается.
+    const R = recipe();
+    if (R.landmark === 1 && Math.abs(gz - R.landmarkZ) < CRAG_ROW * CHUNK * 0.5) {
+      scale *= 2.6;
+    }
     const variant = Math.floor(hash2(cz * 71, 79) * 3.99);
     // чуть ВНУТРИ силуэта: цеплять «воздух» рядом со скалой обиднее, чем
     // проскрести боком по самому камню
@@ -1312,10 +1447,11 @@ export interface Arch {
 // [вариант][нога]: ноги НЕ зеркальны (проём смещён) и не эллиптичны —
 // у каждой свой радиальный профиль, снятый по геометрии (см. arch.ts)
 export const ARCH_BINS = 20;
-type LegProfile = { cx: number; prof: number[] };
+/** ★ ПОСЛОЙНО, как у останцов: layers[l] — профиль слоя высот [y0 + l·dy, +dy) единичной арки */
+type LegProfile = { cx: number; prof: number[]; g0: number; y0: number; dy: number; layers: number[][] };
 const FALLBACK: LegProfile[] = [
-  { cx: -0.36, prof: new Array(ARCH_BINS).fill(0.11) },
-  { cx: 0.36, prof: new Array(ARCH_BINS).fill(0.11) },
+  { cx: -0.36, prof: new Array(ARCH_BINS).fill(0.11), g0: 0, y0: 0, dy: 0.04, layers: [new Array(ARCH_BINS).fill(0.11)] },
+  { cx: 0.36, prof: new Array(ARCH_BINS).fill(0.11), g0: 0, y0: 0, dy: 0.04, layers: [new Array(ARCH_BINS).fill(0.11)] },
 ];
 let archProf: LegProfile[][] = [FALLBACK];
 export function setArchLeg(m: LegProfile[][]): void {
@@ -1362,17 +1498,15 @@ export function houseRadiusToward(o: Obstacle, dx: number, dz: number): number {
  * Радиус ноги В НАПРАВЛЕНИИ (dx, dz) по её профилю. Значения стоят в ЦЕНТРАХ
  * секторов, отсюда сдвиг на полсектора при выборке.
  */
-export function archLegRadius(o: Obstacle, dx: number, dz: number): number {
+export function archLegRadius(o: Obstacle, dx: number, dz: number, yW?: number, hW = 1.6): number {
   const legs = legsOf(o.variant ?? 0);
   const l = legs[o.leg ?? 0] ?? legs[0];
   const ang = Math.atan2(dz, dx);
-  const f = ((ang + Math.PI) / (2 * Math.PI)) * ARCH_BINS - 0.5 + ARCH_BINS;
-  const i0 = Math.floor(f) % ARCH_BINS;
-  const t = f - Math.floor(f);
-  const r0 = l.prof[i0];
-  const r1 = l.prof[(i0 + 1) % ARCH_BINS];
-  // хорда между соседними лучами чуть проваливается внутрь контура — 1% назад
-  return (r0 + (r1 - r0) * t) * 1.01 * o.scale;
+  if (yW !== undefined && o.baseY !== undefined && o.hUnit && l.layers.length > 1) {
+    const y0 = (yW - o.baseY) / o.hUnit;
+    return layeredProf(l.layers, l.y0, l.dy, ARCH_BINS, ang, y0, y0 + hW / o.hUnit) * o.scale;
+  }
+  return sampleProf(l.prof, ARCH_BINS, ang) * o.scale;
 }
 
 const archCache = new Map<number, Arch | null>();
@@ -1383,10 +1517,15 @@ export function archInRow(k: number): Arch | null {
   if (hit !== undefined) return hit;
   const cz = k * ARCH_ROW;
   let res: Arch | null = null;
-  if (hash2(cz * 911 + 7, 23) > 0.45) {
+  if (recipe().hasArches && hash2(cz * 911 + 7, 23) > 0.45) {
     const gz = cz * CHUNK + (hash2(cz * 19 + 11, 29) - 0.5) * CHUNK * 0.7;
     const variant = Math.floor(hash2(cz * 59, 61) * 2.99);
-    const span = 190 + Math.pow(hash2(cz * 37, 41), 1.3) * 140;
+    let span = 190 + Math.pow(hash2(cz * 37, 41), 1.3) * 140;
+    // та же изюминка, второй вариант: одни ворота на заезд втрое шире прочих
+    const RR = recipe();
+    if (RR.landmark === 0 && Math.abs(gz - RR.landmarkZ) < ARCH_ROW * CHUNK * 0.5) {
+      span *= 2.4;
+    }
     // Пролёт задан снизу так, чтобы просвет гарантированно перекрывал трассу
     // с запасом: въезжать в ногу на скорости обиднее всего.
     const need = (PISTE_HALF_W + 16) * 2;
@@ -1483,11 +1622,17 @@ const chunkCache = new Map<string, Obstacle[]>();
  */
 export function forestDensityAt(x: number, z: number): number {
   const n = noise2(x * 0.003 + 40.1, z * 0.003 - 17.6) * 0.5 + 0.5;
-  const m = biomeForestMul(z); // на выжженном склоне леса меньше
+  // густота леса — своя у мира (рецепт) и своя у акта: чаща сменяется голыми
+  // полями, иначе весь спуск одинаково зарос
+  // ★ У ПРОИЗВЕДЕНИЯ ДВУХ МНОЖИТЕЛЕЙ ЕСТЬ ДНО. Мир с редким лесом ПЛЮС акт
+  // «открытые поля» перемножались в 0.045 — на пяти километрах не оставалось
+  // ни дерева, а лес это главный ориентир вертикали. Держим хотя бы четверть.
+  const m = biomeForestMul(z) *
+    Math.max(0.25, Math.min(1.9, recipe().forest * actAt(z).forest));
   if (n < 0.42) return 0;
-  if (n < 0.55) return 0.12 * m;
-  if (n < 0.68) return 0.35 * m;
-  return 0.85 * m;
+  if (n < 0.55) return Math.min(0.95, 0.12 * m);
+  if (n < 0.68) return Math.min(0.95, 0.35 * m);
+  return Math.min(0.95, 0.85 * m);
 }
 
 /** Препятствия чанка (чанк с центром в cx*CHUNK, cz*CHUNK) */
@@ -1541,10 +1686,15 @@ export function obstaclesInChunk(cx: number, cz: number): Obstacle[] {
     const c = cragInRow(Math.round(cz / CRAG_ROW));
     if (c && Math.round(c.x / CHUNK) === cx && Math.round(c.z / CHUNK) === cz) {
       cragHere = c;
+      // ★ модель утоплена ровно так же, как в terrain.buildCrag (sink)
+      const sink = c.mound ? 0.42 : 0.56;
+      const hUnit = c.scale * c.hMul;
       list.push({
         x: c.x, z: c.z, scale: c.scale, r: c.r, kind: 'crag',
         variant: c.variant, hMul: c.hMul, tint: c.tint,
         rot: c.rot, zMul: c.zMul,
+        baseY: sampleHeight ? sampleHeight(c.x, c.z) - hUnit * sink : undefined,
+        hUnit,
       });
     }
   }
@@ -1555,12 +1705,20 @@ export function obstaclesInChunk(cx: number, cz: number): Obstacle[] {
     const a = archInRow(Math.round(cz / 15) + d);
     if (!a) continue;
     if (Math.round(a.z / CHUNK) !== cz) continue;
+    // подошва арки — по нижней из трёх точек, как в terrain.buildArch
+    const g0 = legsOf(a.variant)[0]?.g0 ?? 0;
+    const off = a.span * 0.5;
+    const baseY = sampleHeight
+      ? Math.min(sampleHeight(a.x - off, a.z), sampleHeight(a.x + off, a.z), sampleHeight(a.x, a.z)) -
+        (g0 + 0.03) * a.height
+      : undefined;
     archLegs(a).forEach((leg, li) => {
       if (Math.round(leg.x / CHUNK) !== cx) return;
       // scale здесь — ПРОЛЁТ: профиль ноги хранится в его долях
       list.push({
         x: leg.x, z: a.z, scale: a.span, r: leg.r, kind: 'arch',
         variant: a.variant, leg: li,
+        baseY, hUnit: a.height,
       });
     });
   }
@@ -1687,25 +1845,37 @@ export function obstaclesInChunk(cx: number, cz: number): Obstacle[] {
     // вообще — он только цепляет доску, оставаясь невидимым. Всё, что
     // существует как препятствие, обязано быть заметным.
     const scale = 0.85 + Math.pow(t, 3.2) * 3.2; // 0.85 … 4.05
+    const hMul = 0.45 + hash2(cx * 41 + i, cz * 29 + i * 5) * 0.7;
+    const zMul = 0.85 + hash2(cx * 113 + i * 5, cz * 97 + i * 11) * 0.35;
+    // ★ ЧАСТЬ ВАЛУНОВ ЛЕЖИТ НА БОКУ. Поворот был только вокруг вертикали, и
+    // вытянутая глыба всегда стояла столбом — осыпь из менгиров. Настоящий
+    // курумник наполовину лежачий: плиты завалены, столбы упали. Угол держим
+    // близким к прямому — тогда хитбокс честно получается перестановкой осей
+    // (см. rockRadiusToward), а разброс ±13° убирает выправленность.
+    const lay = hash2(cx * 167 + i * 13, cz * 149 + i * 7) > 0.62
+      ? Math.PI / 2 + (hash2(cx * 173 + i, cz * 181 + i * 3) - 0.5) * 0.45
+      : 0;
     list.push({
       x,
       z,
       scale,
       r: 0.62 * scale,
       kind: 'rock',
+      lay,
       // ★ ПОВОРОТ И РАСТЯЖЕНИЕ ЖИВУТ ЗДЕСЬ, А НЕ В РИСОВАНИИ. Раньше их
       // считал чанк при постройке меша, и физика о них не знала вовсе —
       // хитбокс был кругом вокруг повёрнутой и растянутой глыбы.
       rot: hash2(cx * 91 + i * 7, cz * 83 + i * 3) * Math.PI * 2,
-      zMul: 0.85 + hash2(cx * 113 + i * 5, cz * 97 + i * 11) * 0.35,
+      zMul,
       // ★ ВЫСОТА НАД ЗЕМЛЁЙ — ЧАСТЬ ХИТБОКСА. Мелкий валун торчит из снега на
       // треть метра, а сталкивались с ним как с полноростовым столбом: доска
       // билась о камень, которого под ней уже нет. Геометрия идёт до 0.76 по Y
       // и утоплена на 0.22, значит над землёй остаётся 0.54 её высоты.
-      topY: scale * (0.45 + hash2(cx * 41 + i, cz * 29 + i * 5) * 0.7) * 0.54,
+      // у лежачего вверх смотрит бывшая ось Z — по ней и считается верхушка
+      topY: scale * (lay ? zMul : hMul) * 0.54,
       variant: Math.floor(hash2(cx * 61 + i * 9, cz * 73 + i) * 3.99),
       // от плоских плит до столбов
-      hMul: 0.45 + hash2(cx * 41 + i, cz * 29 + i * 5) * 0.7,
+      hMul,
       tint: 0.78 + hash2(cx * 137 + i * 3, cz * 151 + i) * 0.5,
     });
   }
@@ -1976,7 +2146,8 @@ export function kickerInCell(kcx: number, kcz: number): Kicker | null {
   // не «лёгкий», он просто никакой. Порог 0.55 — это 45% занятых клеток.
   const wk = WARMUP.kicker(z);
   if (wk <= 0) return null;
-  if (hash2(kcx * 5 + 3, kcz * 11 + 7) < 1 - 0.45 * wk) return null;
+  const jump = Math.min(2.0, recipe().jumps * actAt(z).jumps);
+  if (hash2(kcx * 5 + 3, kcz * 11 + 7) < Math.max(0, 1 - 0.45 * wk * jump)) return null;
   const len = 8 + hash2(kcx * 3 + 1, kcz * 13 + 2) * 18;          // 8–26 м
   const halfW = 3 + hash2(kcx * 9 + 4, kcz * 17 + 6) * 6;         // 3–9 м
   // высота ограничена: слишком высокая рампа сзади выглядит как стена

@@ -1,4 +1,8 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import {
+  Fn, If, float, int, uint, vec2, vec3, vec4, uniform, output, positionView, positionWorld,
+  fract, floor, sin, dot, mix, smoothstep, step, pow,
+} from 'three/tsl';
 
 // Дымка на расстоянии — ТОЛЬКО по дистанции, без высотной составляющей.
 //
@@ -9,112 +13,97 @@ import * as THREE from 'three';
 // съеденного тела зияла щель, сквозь которую видно следующий хребет.
 // Слой дымки при этом ездил вместе с игроком, а не лежал в долине.
 //
-// Патчим глобальные шейдерные чанки тумана — это правит РАЗОМ все
-// материалы с fog: true (снег, дальний план, деревья, снегопад, след),
-// поэтому слои гарантированно туманятся одинаково и не расходятся швами.
-// Вызывать до первого рендера.
+// ★ WebGPU: вместо патча глобальных чанков fog_* — один узел `scene.fogNode`.
+// Node-материалы подмешивают его сами (NodeMaterial.setupFog), поэтому снег,
+// дальний план, деревья, снегопад и след туманятся ОДНИМ кодом и не расходятся
+// швами — ровно то, ради чего раньше патчился ShaderChunk.
 
-export function installHeightFog(): void {
-  THREE.ShaderChunk.fog_pars_vertex = /* glsl */ `
-#ifdef USE_FOG
-  varying float vFogDepth;
-  varying vec2 vCloudXZ;
-#endif
-`;
+/** живые параметры дымки; их пишет BiomeManager через syncFog() */
+export const FOG_COLOR = uniform(new THREE.Color(0xc6c7d6));
+export const FOG_NEAR_U = uniform(300);
+export const FOG_FAR_U = uniform(2100);
 
-  THREE.ShaderChunk.fog_vertex = /* glsl */ `
-#ifdef USE_FOG
-  vFogDepth = - mvPosition.z;
-  // мировые XZ для теней облаков (см. fog_fragment). transformed здесь уже
-  // в области видимости, а modelMatrix — встроенный uniform
-  vCloudXZ = (modelMatrix * vec4(transformed, 1.0)).xz;
-#endif
-`;
+/** перенести scene.fog (его крутит BiomeManager) в юниформы узла */
+export function syncFog(fog: THREE.Fog): void {
+  FOG_COLOR.value.copy(fog.color);
+  FOG_NEAR_U.value = fog.near;
+  FOG_FAR_U.value = fog.far;
+}
 
-  THREE.ShaderChunk.fog_pars_fragment = /* glsl */ `
-#ifdef USE_FOG
-  uniform vec3 fogColor;
-  varying float vFogDepth;
-  varying vec2 vCloudXZ;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type N = any;
 
-  float cshHash(vec2 p) {
-    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
-  }
-  float cshNoise(vec2 p) {
-    vec2 i = floor(p);
-    vec2 f = fract(p);
-    vec2 u = f * f * (3.0 - 2.0 * f);
-    return mix(
-      mix(cshHash(i), cshHash(i + vec2(1.0, 0.0)), u.x),
-      mix(cshHash(i + vec2(0.0, 1.0)), cshHash(i + vec2(1.0, 1.0)), u.x),
-      u.y
-    );
-  }
-  #ifdef FOG_EXP2
-    uniform float fogDensity;
-  #else
-    uniform float fogNear;
-    uniform float fogFar;
-  #endif
-#endif
-`;
+// ★ целочисленный хэш (см. core/tslnoise): sin() на мировых XZ давал NaN-искры
+const cshHash = Fn(([p0]: [N]) => {
+  const p: N = floor(p0);
+  const h = uint(int(p.x)).mul(uint(374761393)).add(uint(int(p.y)).mul(uint(668265263))).toVar();
+  h.assign(h.bitXor(h.shiftRight(uint(13))).mul(uint(1274126177)));
+  return float(h.bitXor(h.shiftRight(uint(16)))).div(4294967295.0);
+});
 
-  THREE.ShaderChunk.fog_fragment = /* glsl */ `
-#ifdef USE_FOG
-  // Показатель 1.8 отжимает дымку из СЕРЕДИНЫ дистанции. Замер локального
-  // контраста (сред. |разница| соседних пикселей) показал: при 68% дымки на
-  // 900 м дальняя полоса имела контраст 1.6 против 3.7 у ближней земли —
-  // рельеф там есть, но выглядит гладкой заливкой, то есть «непрорисовкой».
-  // Полное растворение — только у края отрисовки (fogFar < радиуса
-  // дальнего плана 1440 м, см. farfield.ts).
+const cshNoise = Fn(([p]: [N]) => {
+  const i: N = floor(p);
+  const f: N = fract(p);
+  const u = f.mul(f).mul(f.mul(-2).add(3));
+  return mix(
+    mix(cshHash(i), cshHash(i.add(vec2(1, 0))), u.x),
+    mix(cshHash(i.add(vec2(0, 1))), cshHash(i.add(vec2(1, 1))), u.x),
+    u.y
+  );
+});
+
+/**
+ * Узел тумана мира. Читает `output` (цвет фрагмента после освещения) и
+ * возвращает vec4 — три эффекта разом, потому что все они должны ложиться
+ * на ВСЕ слои одинаково:
+ *  1) тени облаков — множитель по мировым XZ;
+ *  2) редкие солнечные искры наста — только на снегу и только в полосе 11–60 м;
+ *  3) сама дымка — mix к цвету тумана с показателем 1.5.
+ */
+export const psxFog = Fn(() => {
+  const col = output.rgb.toVar();
+  const depth = positionView.z.negate();
+  const cloudXZ = positionWorld.xz;
+
   // ТЕНИ ОБЛАКОВ. Огромное снежное поле — это заливка, на которой глазу не
   // за что зацепиться; на реальных горных снимках его лепят как раз пятна
-  // облачной тени. Считаем их ЗДЕСЬ, в общем чанке тумана: так они разом
-  // ложатся на все слои мира (чанки, дальний план, деревья, камни) и не
-  // расходятся швами — ровно по той же причине, по какой здесь живёт туман.
-  //
-  // Времени в шейдере нет намеренно: пятна стоят в МИРОВЫХ координатах, а
-  // игрок несётся сквозь мир на сотне километров в час — они и так плывут
-  // через кадр. Лишний uniform пришлось бы обновлять на каждом материале
-  // отдельно (three клонирует uniforms), а выглядело бы это так же.
-  vec2 cp = vCloudXZ * 0.0046;
-  float csh = cshNoise(cp) * 0.62 + cshNoise(cp * 2.7 + 11.3) * 0.38;
-  float cshK = smoothstep(0.40, 0.70, csh);
+  // облачной тени. Времени здесь нет намеренно: пятна стоят в МИРОВЫХ
+  // координатах, а игрок несётся сквозь мир — они и так плывут через кадр.
+  const cp = cloudXZ.mul(0.0046);
+  const csh = cshNoise(cp).mul(0.62).add(cshNoise(cp.mul(2.7).add(11.3)).mul(0.38));
+  const cshK = smoothstep(0.40, 0.70, csh);
   // тень холоднее, а не просто темнее: у снега в тени синий подсвет неба
-  gl_FragColor.rgb *= vec3(1.0 - cshK * 0.26, 1.0 - cshK * 0.23, 1.0 - cshK * 0.16);
+  col.mulAssign(vec3(
+    cshK.mul(0.26).oneMinus(),
+    cshK.mul(0.23).oneMinus(),
+    cshK.mul(0.16).oneMinus()
+  ));
 
   // РЕДКИЕ СОЛНЕЧНЫЕ ИСКРЫ. Наст — это миллионы ледяных граней, и раз в
   // несколько метров одна из них ловит солнце ровно в глаз. Эффект держится
-  // на РЕДКОСТИ: сплошная блёстка читается как шум на текстуре, а одиночная
-  // вспышка — как настоящий снег.
-  //
-  // Мерцание берём из vFogDepth, а не из времени: для точки, стоящей в мире,
-  // расстояние до камеры меняется на каждом кадре, пока игрок едет, — то есть
-  // угол «взгляд-грань» и правда гуляет, и вспышка гаснет и зажигается сама.
-  // Заодно это снова обходит проблему с uniform времени на каждом материале.
-  // ПОЛОСА, А НЕ «ВСЁ БЛИЖЕ N». Снизу отрезаем не просто так: сам райдер
-  // висит в пяти метрах от камеры и ЕДЕТ сквозь мировые ячейки искр, то есть
-  // получал бы случайное мерцание прямо по куртке. Ниже 11 м искр нет вовсе.
-  float sparkNear = smoothstep(11.0, 19.0, vFogDepth)
-    * (1.0 - smoothstep(22.0, 60.0, vFogDepth));
-  if (sparkNear > 0.0) {
-    float sHash = cshHash(floor(vCloudXZ * 5.5));
-    // Искры только на СНЕГУ: хвоя и порода темнее, и блёстки на них выглядят
-    // как грязь на линзе. Порог по яркости самого фрагмента — самый дешёвый
-    // способ отличить снег от всего остального прямо здесь.
-    float lum = dot(gl_FragColor.rgb, vec3(0.3, 0.6, 0.1));
-    float tw = 0.5 + 0.5 * sin(sHash * 437.0 + vFogDepth * 2.3);
-    // ВНИМАНИЕ: цель кадра ЛИНЕЙНАЯ (гамму накладывает ретро-проход), поэтому
-    // яркость снега здесь всего 0.25–0.40, а не 0.8, как кажется на экране.
-    // Порог, взятый «по картинке», гасил искры полностью — замер гистограммы
-    // светимости кадра показал максимум 219/255 при снеге около 60–100.
-    float spark = step(0.995, sHash) * pow(tw, 5.0)
-      * sparkNear * smoothstep(0.12, 0.28, lum);
-    gl_FragColor.rgb += vec3(0.75, 0.68, 0.5) * spark;
-  }
+  // на РЕДКОСТИ. Мерцание берём из глубины, а не из времени: пока игрок едет,
+  // расстояние до точки меняется каждый кадр — угол «взгляд-грань» гуляет сам.
+  // Ниже 11 м искр нет вовсе: райдер висит в пяти метрах от камеры и получал
+  // бы мерцание прямо по куртке.
+  const sparkNear = smoothstep(11.0, 19.0, depth).mul(smoothstep(22.0, 60.0, depth).oneMinus());
+  If(sparkNear.greaterThan(0.0), () => {
+    const sHash = cshHash(floor(cloudXZ.mul(5.5)));
+    // искры только на СНЕГУ: порог по яркости фрагмента — самый дешёвый способ
+    // отличить снег от хвои и породы. Цель кадра ЛИНЕЙНАЯ (гамму накладывает
+    // ретро-проход), поэтому яркость снега здесь всего 0.25–0.40.
+    const lum = dot(col, vec3(0.3, 0.6, 0.1));
+    const tw = sin(sHash.mul(437.0).add(depth.mul(2.3))).mul(0.5).add(0.5);
+    const spark = step(0.995, sHash).mul(pow(tw, 5.0)).mul(sparkNear).mul(smoothstep(0.12, 0.28, lum));
+    col.addAssign(vec3(0.75, 0.68, 0.5).mul(spark));
+  });
 
-  float fogFactor = pow(smoothstep(fogNear, fogFar, vFogDepth), 1.5);
-  gl_FragColor.rgb = mix(gl_FragColor.rgb, fogColor, fogFactor);
-#endif
-`;
+  // Показатель 1.5 отжимает дымку из СЕРЕДИНЫ дистанции: при линейной дымке
+  // дальняя полоса теряла локальный контраст вдвое и читалась «непрорисовкой».
+  const fogFactor = pow(smoothstep(FOG_NEAR_U, FOG_FAR_U, depth), 1.5);
+  return vec4(mix(col, FOG_COLOR, fogFactor), output.a);
+})();
+
+/** повесить узел на сцену — вызвать один раз при сборке мира */
+export function installHeightFog(scene: THREE.Scene): void {
+  scene.fogNode = psxFog;
 }

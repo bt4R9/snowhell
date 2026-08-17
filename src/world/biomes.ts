@@ -1,4 +1,5 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import type { ShaderLike } from '../core/mat';
 import { PALETTE, SUN_DIR } from './palette';
 import { biomeInfoAt } from './features';
 
@@ -28,11 +29,26 @@ export interface BiomeDef {
   hemiGround: THREE.Color;
   sunDir: THREE.Vector3;
   sunIntensity: number;
+  /** яркость солнечного ореола в куполе неба, 1 — обычное ясное солнце */
+  skyHalo: number;
+  /** общая яркость купола неба */
+  skyDim?: number;
   hemiIntensity: number;
+  /**
+   * ★ ОБЩИЙ ПОДСВЕТ ТОЖЕ БИОМНЫЙ. Он жил константой со времён снега — холодный
+   * голубой, — и на вулкане подмешивал синеву в каждый пиксель, мешая биому
+   * быть чёрно-красным. У вулкана это отсвет расплава: тёмный и красный.
+   */
+  ambient: THREE.Color;
+  ambientIntensity: number;
   fogNear: number;
   fogFar: number;
   /** сколько снега на дальних кулисах: 0 — голая порода */
   backdropSnow?: number;
+  /** снег на дальней цепи пиков: 0 — голая порода */
+  peakSnow?: number;
+  /** порода дальних кулис */
+  backdropRock?: THREE.Color;
 }
 
 const c = (hex: number) => new THREE.Color(hex);
@@ -51,32 +67,72 @@ export const BIOMES: BiomeDef[] = [
     // освещает мир, — это лава, поэтому солнце и полусфера прижаты почти в
     // ноль, а нижняя составляющая заполнения тёплая: это отсвет расплава,
     // бьющий в пепел снизу.
-    skyZenith: c(0x2b2136),
-    skyHorizon: c(0x93502f),
-    sun: c(0xc06a3a),
-    fog: c(0x5d443e), // пепельная мгла
-    snowTint: c(0x6f6874),
-    // даль почти чёрная: её вытаскивает только зарево над руслом
-    distTint: c(0x877678),
-    airColor: c(0x1a1418),
-    airOpacity: 0.5,
-    pine: c(0x4a4340), // обугленный сухостой
-    hemiSky: c(0x6a6076),
-    // низ заполнения — отсвет лавы: он и лепит рельеф вместо солнца
-    hemiGround: c(0xd07a42),
+    // ★★★★ РАЗВОРОТ ПО РЕФЕРЕНСУ. Мы строили вулкан как «чёрное и красное» и
+    // раз за разом получали две жалобы сразу: вблизи пустыня, вдали чернота.
+    // Причина в самой посылке. На референсе вулканический биом СВЕТЛЫЙ: небо и
+    // мгла — бледный коралл, даль не темнеет, а ВЫцветает в него, и объекты
+    // читаются силуэтом на светлом фоне. Мы же гасили землю почти в ноль — и
+    // тогда читать нечем: даль без света проваливается в чёрный, а вблизи
+    // картинку вытаскивают только аддитивные подмешки зарева, которые сами
+    // красные и дают ту самую охру. Поэтому: земля получает НАСТОЯЩЕЕ альбедо,
+    // а глубину даёт светлая мгла, а не темнота.
+    // ★ НЕБО ТЁМНОЕ, СВЕТИТСЯ ТОЛЬКО ПОЛОСА У ГОРИЗОНТА. Градиент идёт
+    // pow(t, 0.75) — зенитный цвет занимает почти весь купол, поэтому небо
+    // задаётся именно им. Тёплая полоса внизу остаётся: это зарево над руслом,
+    // и на ней же читаются силуэты дальних гор.
+    skyZenith: c(0x140a0d),
+    skyHorizon: c(0x6a2a1a),
+    sun: c(0xd8ab8c),
+    // ★ СВЕТЛО, НО НЕ ПЕРЕСВЕЧЕНО. Первый заход по референсу вытащил биом из
+    // черноты, но задрал экспозицию — стало «слишком всё светлое». Гасим ВЕСЬ
+    // набор разом, сохраняя главное соотношение: мгла остаётся светлее земли,
+    // поэтому даль по-прежнему выцветает, а не проваливается.
+    // мгла светлая — это и есть «воздух» референса: даль тонет в ней, а не в ночи
+    // ★ ВТОРОЙ ШАГ ВНИЗ (2026-08-17, «тон вулкана ещё темнее»): весь набор
+    // — мгла, тон земли, даль, полусфера, подсвет, солнце, горизонт — гашен
+    // ещё на ~20–25% с теми же соотношениями; третьим шагом — ещё на ~25%.
+    fog: c(0x2e1a16),
+    // ★ ТЕМНОТУ ЗАДАЁТ ПЕПЕЛ, А НЕ ТОН МАТЕРИАЛА. Тон умножается на цвет
+    // вершины, а вершина на вулкане и так тёмная. Замер альбедо под ногами при
+    // тоне 0x5c5763 давал 0.016 — в полсотни раз темнее снега. Тон держим
+    // почти белым, а характер породы задаём цветом вершины в terrain.ts.
+    snowTint: c(0x5a5250),
+    // даль чуть глуше и холоднее — воздушная перспектива, а не провал в ноль
+    // ★ ТОН ДАЛЬНИХ СЛОЁВ ОБЩИЙ: им красятся и кулисы, и цепь пиков. Почти
+    // белый тон держал на горизонте бледную гряду — она читалась заснеженной и
+    // светила ярче неба. Тёплый и тёмный ставит дальний план в палитру биома.
+    distTint: c(0x3a2c28),
+    airColor: c(0x3a2a26),
+    airOpacity: 0.6,
+    pine: c(0x6b5a52), // обугленный сухостой
+    // отсвет неба — тёплый коралл, отсвет снизу — расплав, но уже не чёрно-красный
+    hemiSky: c(0x4a3a36),
+    hemiGround: c(0x6a2a1e),
     sunDir: new THREE.Vector3(0.62, 0.18, 0.75).normalize(),
-    sunIntensity: 1.35,
-    hemiIntensity: 1.5,
-    // ★ МГЛА НЕ ДОЛЖНА СЪЕДАТЬ ГЛАВНЫЙ ОРИЕНТИР. При дальности 2100 м вершины
-    // конусов (они в 1.6–1.8 км) растворялись на 77–85% — вулкана попросту не
-    // было видно. Ближний план оставляем задымлённым, а даль открываем.
+    sunIntensity: 0.8,
+    // солнце сквозь пепел: диска почти нет
+    skyHalo: 0.16,
+    skyDim: 0.3,
+    ambient: c(0x4e3630),
+    ambientIntensity: 0.26,
+    // ★ ЗАПОЛНЕНИЕ БОЛЬШЕ НЕ ЕДИНСТВЕННЫЙ СВЕТ. Раньше оно было задрано до 2.05,
+    // чтобы вытащить теневые борта ущелий из чистого чёрного — при альбедо 0.016
+    // другого выхода не было. Теперь у породы есть свой цвет, и задранное
+    // заполнение только плющило рельеф.
+    hemiIntensity: 0.8,
+    // ★ МГЛА НЕ ДОЛЖНА СЪЕДАТЬ ГЛАВНЫЙ ОРИЕНТИР, но и открытая до 4600 м даль
+    // ломала воздушную перспективу: дальний план оставался неосвещённым и
+    // читался чёрной стеной. Со светлой мглой даль честно выцветает.
+    // ближний план мгла трогать не должна: при 120 м земля под ногами уже
+    // подмывалась светлым и снова читалась песком
     fogNear: 260,
-    // ★ ДАЛЬНОСТЬ ТУМАНА ПРИВЯЗАНА К РАДИУСУ ЗЕМЛИ (4800 м). Если туман
-    // уходит дальше земли, её край не растворяется и виден обрезом, а за
-    // обрезом просвечивает задник — те самые щели.
-    fogFar: 4600,
+    fogFar: 2600,
     // на вулканических кулисах снега нет — там та же порода, что вблизи
     backdropSnow: 0,
+    // на вулкане снега нет и в дальней цепи
+    peakSnow: 0,
+    // базальт, а не холодный гранит
+    backdropRock: c(0x221410),
   },
   {
     name: 'alpine-sunset',
@@ -106,7 +162,10 @@ export const BIOMES: BiomeDef[] = [
     // теневой склон. Выше поднимать нельзя — уходит золотой час.
     sunDir: new THREE.Vector3(0.5, 0.34, 0.8).normalize(),
     sunIntensity: 2.3,
+    skyHalo: 1,
     hemiIntensity: 0.8,
+    ambient: c(0xb9c6e8),
+    ambientIntensity: 0.32,
     // туман тянется до дальнего плана: земля рисуется на ~960 м, и
     // обрывать её плотной мглой на 175 м больше незачем
     // fogFar обязан быть МЕНЬШЕ радиуса дальнего плана (~1440 м), иначе
@@ -132,7 +191,10 @@ export const BIOMES: BiomeDef[] = [
     hemiGround: c(0xb8bcc6),
     sunDir: new THREE.Vector3(0.55, 0.3, 0.78).normalize(),
     sunIntensity: 1.5,
+    skyHalo: 1,
     hemiIntensity: 0.8,
+    ambient: c(0xb9c6e8),
+    ambientIntensity: 0.32,
     fogNear: 240,
     fogFar: 3000,
   },
@@ -143,16 +205,17 @@ export class BiomeManager {
     private fog: THREE.Fog,
     private sun: THREE.DirectionalLight,
     private hemi: THREE.HemisphereLight,
-    private snowMat: THREE.MeshLambertMaterial,
-    private pineMat: THREE.MeshLambertMaterial,
+    private ambient: THREE.AmbientLight,
+    private snowMat: THREE.MeshLambertNodeMaterial,
+    private pineMat: THREE.MeshLambertNodeMaterial,
     /** дальний план — та же земля, красится тем же тоном, что и снег */
-    private farMat: THREE.MeshLambertMaterial,
+    private farMat: THREE.MeshLambertNodeMaterial,
     /** кулисы задника */
-    private backdropMat: THREE.ShaderMaterial,
+    private backdropMat: ShaderLike,
     /** цепь пиков */
-    private peakMat: THREE.ShaderMaterial,
+    private peakMat: ShaderLike,
     /** то, что летит в воздухе */
-    private airMat: THREE.PointsMaterial
+    private airMat: THREE.PointsNodeMaterial
   ) {}
 
   update(z: number): void {
@@ -166,10 +229,15 @@ export class BiomeManager {
     PALETTE.skyZenith.lerpColors(A.skyZenith, B.skyZenith, k);
     PALETTE.skyHorizon.lerpColors(A.skyHorizon, B.skyHorizon, k);
     PALETTE.sun.lerpColors(A.sun, B.sun, k);
+    PALETTE.skyHalo = lerp(A.skyHalo, B.skyHalo);
+    PALETTE.peakSnow = lerp(A.peakSnow ?? 1, B.peakSnow ?? 1);
+    PALETTE.skyDim = lerp(A.skyDim ?? 1, B.skyDim ?? 1);
     SUN_DIR.lerpVectors(A.sunDir, B.sunDir, k).normalize();
 
     this.sun.color.copy(PALETTE.sun);
     this.sun.intensity = lerp(A.sunIntensity, B.sunIntensity);
+    this.ambient.color.lerpColors(A.ambient, B.ambient, k);
+    this.ambient.intensity = lerp(A.ambientIntensity, B.ambientIntensity);
     this.hemi.color.lerpColors(A.hemiSky, B.hemiSky, k);
     this.hemi.groundColor.lerpColors(A.hemiGround, B.hemiGround, k);
     this.hemi.intensity = lerp(A.hemiIntensity, B.hemiIntensity);
@@ -188,8 +256,13 @@ export class BiomeManager {
     bu.uTint.value.lerpColors(A.distTint, B.distTint, k);
     bu.uHaze.value.copy(this.fog.color);
     bu.uSnow.value = lerp(A.backdropSnow ?? 1, B.backdropSnow ?? 1);
-    bu.uRock.value.lerpColors(A.distTint, B.distTint, k);
+    // ★ ПОРОДА КУЛИС — НЕ ТОН ДАЛИ. Здесь стоял distTint, то есть камень под
+    // снятым снегом каждый кадр перекрашивался почти белым — и на горизонте
+    // вулкана висела бледная «заснеженная» гряда, сколько ни выключай снег.
+    bu.uRock.value.lerpColors(A.backdropRock ?? PALETTE.backdropRock, B.backdropRock ?? PALETTE.backdropRock, k);
     this.peakMat.uniforms.uTint.value.lerpColors(A.distTint, B.distTint, k);
+    // дымка цепи сходится к текущему туману, как и у кулис
+    this.peakMat.uniforms.uHaze.value.copy(this.fog.color);
     this.airMat.color.lerpColors(A.airColor, B.airColor, k);
     this.airMat.opacity = lerp(A.airOpacity, B.airOpacity);
   }
