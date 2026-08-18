@@ -534,6 +534,9 @@ export function surfaceKindAt(u: number, v: number): number {
   // ★ ЗАМЁРЗШЕЕ ОЗЕРО — ВСЕГДА ЛЁД (полярная ночь); дно открытой воды — наст
   const lk = lakeAt(u, v);
   if (lk && lk.w > 0.5) return lk.water ? SURF_PACKED : SURF_ICE;
+  // ★ В ПАРОВОМ ГОРОДЕ ЛЬДА НЕТ: мостовая и отвалы — ровный наст/булыжник, ехать
+  // между фасадами и без скользкой полосы есть чем заняться
+  if (cityWeight(v) > 0.5) return SURF_PACKED;
   // земля вытаивает редкими небольшими пятнами и только вне трассы
   const du = u + noise2(u * 0.02 + 5.5, v * 0.02 + 1.9) * 12;
   const dv = v + noise2(u * 0.02 - 9.1, v * 0.02 + 6.4) * 12;
