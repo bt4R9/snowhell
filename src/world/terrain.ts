@@ -374,7 +374,7 @@ function terrainBase(x: number, z: number): number {
   h += mesaLift(x, z) * (1 - piste.t * 0.85) * calm;
   // коридор чуть утоплен относительно целины: читается как прорезанная
   // ратраком трасса и мягко удерживает райдера на линии
-  h -= 1.1 * piste.t;
+  h -= 1.1 * piste.t * (1 - cw); // в городе трасса — улица, без жёлоба
   h += piste.bank * piste.t;
   h += kickerHeight(x, z);
   // ★ ЧАШИ ЛАВЫ ВЫРЕЗАЮТСЯ ПОСЛЕДНИМИ И ПОВЕРХ ВСЕГО. Дно ниже зеркала, вал
@@ -466,7 +466,9 @@ setCityObstacles((cx, cz) => {
   if (cityWeight(oz) < 0.01) return out;
   for (const b of cityNear(oz)) {
     if (Math.round(b.u / CHUNK) !== cx || Math.round(b.z / CHUNK) !== cz) continue;
-    out.push({ x: b.u, z: b.z, scale: 1, r: b.hw, kind: 'house', rot: 0, zMul: b.hl / b.hw, topY: b.h + 3 });
+    // ★ коробка в координатах долины: столкновение считает сам игрок (kind 'city'),
+    // на любой высоте ниже крыши; x здесь — u (переводится в мир общим циклом)
+    out.push({ x: b.u, z: b.z, scale: 1, r: Math.max(b.hw, b.hl), kind: 'city', cu: b.u, cz: b.z, hw: b.hw, hl: b.hl, padY: buildingPad(b), bodyH: b.h + (b.roof === 'mansard' ? 2.2 : b.roof === 'dome' ? Math.min(b.hw, b.hl) * 0.75 : b.roof === 'spire' ? b.hw * 3 : 1.0) });
   }
   return out;
 });
@@ -1527,11 +1529,16 @@ export function terrainColorAt(
     gr += (0.36 - gr) * rust * 0.6; gg += (0.17 - gg) * rust * 0.6; gb += (0.08 - gb) * rust * 0.6;
     const sn = (() => { const t = Math.max(0, Math.min(1, (noise2(u * 0.02 + 1.7, z * 0.02 - 5.5) * 0.5 + 0.5 - 0.55) / 0.2)); return t * t * (3 - 2 * t) * (1 - steep); })();
     gr += (0.42 - gr) * sn; gg += (0.42 - gg) * sn; gb += (0.44 - gb) * sn;
-    if (pt > 0) {
-      // плиты: стык каждые 6 м поперёк
-      const seam = Math.max(0, 1 - Math.abs(((z / 6) % 1 + 1) % 1 - 0.5) * 2 - 0.85) / 0.15;
-      const pr = 0.16 + seam * 0.06, pg = 0.155 + seam * 0.06, pb = 0.15 + seam * 0.06;
-      gr += (pr - gr) * pt; gg += (pg - gg) * pt; gb += (pb - gb) * pt;
+    // ★ МОСТОВАЯ: булыжник (мелкая клетка) с бордюром по краю — улица, а не земля
+    const rw = Math.max(0, Math.min(1, (STREET_HALF - Math.abs(u - pisteCenterX(z))) / 3));
+    if (rw > 0) {
+      const cob = noise2(u * 0.9 + 4.4, z * 0.9 - 2.2) * 0.5 + 0.5;
+      const cobK = 0.86 + cob * 0.28;
+      const curb = rw < 0.5 ? 1 : 0;
+      let pr = 0.19 * cobK, pg = 0.185 * cobK, pb = 0.18 * cobK;
+      if (curb) { pr = 0.34; pg = 0.32; pb = 0.30; }
+      const k = rw < 0.5 ? rw * 2 : 1;
+      gr += (pr - gr) * k; gg += (pg - gg) * k; gb += (pb - gb) * k;
     }
     cr += (gr - cr) * cw; cg += (gg - cg) * cw; cb += (gb - cb) * cw;
   }
@@ -1542,7 +1549,7 @@ export function terrainColorAt(
 
 import { damage } from '../fx/damage';
 import { bandProfile } from './slice';
-import { cityPadAt, cityNear, buildingPad, cityRoofAt, CK, Building } from './city';
+import { cityPadAt, cityNear, buildingPad, cityRoofAt, CK, Building, STREET_HALF } from './city';
 import { SHIPS } from './airships';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2158,7 +2165,10 @@ export class Terrain {
     ctrlB[i * 4] = roadW;
     ctrlB[i * 4 + 1] = volcanoWeight(v);
     ctrlB[i * 4 + 2] = cityWeight(v);
-    ctrlB[i * 4 + 3] = 0;
+    // ★ мостовая парового города: ±STREET_HALF от оси, край 3 м
+    ctrlB[i * 4 + 3] = ctrlB[i * 4 + 2] > 0.01
+      ? Math.max(0, Math.min(1, (STREET_HALF - Math.abs(u - pisteCenterX(v))) / 3))
+      : 0;
   }
 
   /** развернуть сетку и раскрасить её на GPU; возвращает готовую геометрию */
@@ -2388,6 +2398,70 @@ export class Terrain {
       for (const b of cityNear(oz)) {
         if (!(b.u >= bMinX && b.u < bMaxX && b.z >= bMinZ && b.z < bMaxZ)) continue;
         this.buildCityBuilding(b, chunk, wx0, oz);
+      }
+      // ★ УЛИЧНАЯ МЕХАНИКА: трубы вдоль бордюров с вентилями, паровые решётки в
+      // мостовой (пар — через stacks), фонари-столбы. Стимпанк — это когда трубы
+      // и пар везде, а не только на крышах.
+      if (cityWeight(oz) > 0.5) {
+        const zA = oz - CHUNK / 2, zB = oz + CHUNK / 2;
+        const list = this.stacks.get(chunk) ?? [];
+        for (const side of [-1, 1]) {
+          const uP = pisteCenterX(oz) + side * (STREET_HALF - 1.2);
+          if (uP < ox - CHUNK / 2 || uP >= ox + CHUNK / 2) continue;
+          const xa = toWorldX(pisteCenterX(zA) + side * (STREET_HALF - 1.2), zA);
+          const xb = toWorldX(pisteCenterX(zB) + side * (STREET_HALF - 1.2), zB);
+          const ya = terrainHeight(xa, zA) + 0.5, yb = terrainHeight(xb, zB) + 0.5;
+          const len = Math.hypot(xb - xa, yb - ya, zB - zA);
+          const pipe = new THREE.Mesh(this.cityCyl, this.pipeMat);
+          pipe.position.set((xa + xb) / 2 - wx0, (ya + yb) / 2, (zA + zB) / 2 - oz);
+          pipe.scale.set(0.45, len, 0.45);
+          pipe.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(xb - xa, yb - ya, zB - zA).normalize());
+          chunk.add(pipe);
+          // вентиль-колесо и стойки
+          if (hash01(oz * 3, side * 7) > 0.4) {
+            const vz = zA + 8 + hash01(oz, side) * 30;
+            const vx = toWorldX(pisteCenterX(vz) + side * (STREET_HALF - 1.2), vz);
+            const vy = terrainHeight(vx, vz) + 0.5;
+            const wheel = new THREE.Mesh(this.cityCyl, this.brassMat);
+            wheel.position.set(vx - wx0, vy + 1.1, vz - oz);
+            wheel.rotation.z = Math.PI / 2;
+            wheel.scale.set(0.9, 0.18, 0.9);
+            chunk.add(wheel);
+            const stem = new THREE.Mesh(this.cityCyl, this.trimMat);
+            stem.position.set(vx - wx0, vy + 0.6, vz - oz);
+            stem.scale.set(0.16, 1.2, 0.16);
+            chunk.add(stem);
+          }
+          // газовый фонарь
+          if (hash01(oz * 5, side * 11) > 0.3) {
+            const lz = zA + 4 + hash01(oz * 7, side) * 38;
+            const lx = toWorldX(pisteCenterX(lz) + side * (STREET_HALF - 3), lz);
+            const ly = terrainHeight(lx, lz);
+            const pole = new THREE.Mesh(this.lampPoleGeo, this.trimMat);
+            pole.position.set(lx - wx0, ly + 1.55, lz - oz);
+            pole.scale.set(1.2, 1.5, 1.2);
+            chunk.add(pole);
+            const glow = new THREE.Mesh(this.lampGlowGeo, this.lampGlowMat);
+            glow.position.set(lx - wx0, ly + 4.4, lz - oz);
+            glow.scale.setScalar(1.3);
+            chunk.add(glow);
+          }
+        }
+        // паровые решётки в мостовой: 0–2 на чанк
+        const nV = Math.floor(hash01(oz * 13, 5) * 2.99);
+        for (let i = 0; i < nV; i++) {
+          const vz = zA + hash01(oz * 17 + i, 3) * CHUNK;
+          const vu = pisteCenterX(vz) + (hash01(oz * 19 + i, 7) - 0.5) * 2 * (STREET_HALF - 6);
+          if (vu < ox - CHUNK / 2 || vu >= ox + CHUNK / 2) continue;
+          const vx = toWorldX(vu, vz);
+          const vy = terrainHeight(vx, vz);
+          const grate = new THREE.Mesh(this.cityBox, this.trimMat);
+          grate.position.set(vx - wx0, vy + 0.05, vz - oz);
+          grate.scale.set(1.6, 0.1, 1.6);
+          chunk.add(grate);
+          list.push({ x: vx, y: vy + 0.2, z: vz, r: 0.6 });
+        }
+        if (list.length) this.stacks.set(chunk, list);
       }
     }
 
@@ -2737,7 +2811,7 @@ export class Terrain {
     // коридор — понятие горнолыжного курорта; на действующем вулкане его
     // некому размечать. Там ту же роль играет борт лавового канала: линия
     // читается по форме, а не по расставленным палкам.
-    if (volcanoWeight(oz) < 0.5) {
+    if (volcanoWeight(oz) < 0.5 && cityWeight(oz) < 0.5) {
       const step = 9;
       const zStart = Math.ceil((oz - CHUNK / 2) / step) * step;
       for (let mz = zStart; mz < oz + CHUNK / 2; mz += step) {

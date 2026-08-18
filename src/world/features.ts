@@ -110,7 +110,7 @@ export interface Obstacle {
   z: number;
   r: number;      // радиус коллизии
   scale: number;
-  kind: 'tree' | 'rock' | 'crag' | 'house' | 'lamp' | 'arch';
+  kind: 'tree' | 'rock' | 'crag' | 'house' | 'lamp' | 'arch' | 'city';
   rot?: number;   // поворот (для домов)
   variant?: number; // порода дерева 0..3
   hMul?: number;    // вытянутость по высоте
@@ -123,6 +123,8 @@ export interface Obstacle {
    * метров на единицу её высоты — по ним доска находит СВОЙ слой силуэта */
   baseY?: number;
   hUnit?: number;
+  /** ★ здание города: коробка в координатах долины (u, z, полуглубина hw, полудлина hl), пол площадки padY, высота корпуса bodyH */
+  cu?: number; cz?: number; hw?: number; hl?: number; padY?: number; bodyH?: number;
 }
 
 // --- Биомы: зоны по дистанции с плавным перетеканием ---

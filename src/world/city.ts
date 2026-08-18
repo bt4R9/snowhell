@@ -1,5 +1,5 @@
 import { hash2 } from './noise';
-import { pisteCenterX, PISTE_HALF_W, cityWeight, toValleyU, terrainSample } from './features';
+import { pisteCenterX, cityWeight, toValleyU, terrainSample } from './features';
 
 // ★ ПАРОВОЙ ГОРОД — УЛИЦА, А НЕ ДЕРЕВНЯ. Деревня — это дома вразброс вдоль
 // дороги; город — это СПЛОШНЫЕ ФАСАДЫ по обе стороны улицы. Здесь трасса и есть
@@ -36,7 +36,15 @@ export interface Building {
   chimneys: number;
   balconies: boolean;
   padY: number;   // высота площадки (мир); NaN — ещё не считана
+  /** ★ ЗАЕЗД НА КРЫШУ С ГОРЫ: перед зданием оставлен переулок RAMP_L, и земля в
+   * нём поднимается до уровня крыши — на крышу выезжаешь как на продолжение
+   * склона (как на вкопанный дом в деревне); дальше крыши идут лестницей вниз */
+  roofAccess: boolean;
+  rampY0: number; // высота начала пандуса; NaN — не считана
 }
+export const RAMP_L = 22;
+/** ★ полуширина улицы (мостовая от фасада до фасада ~60 м) — шире лыжного коридора */
+export const STREET_HALF = 30;
 
 const SEG = 240;          // сегмент генерации вдоль z
 const cache = new Map<number, Building[]>();
@@ -86,8 +94,10 @@ export function citySegment(s: number): Building[] {
           const roof: Building['roof'] =
             kind === CK.FACTORY ? 'saw' : kind === CK.DOMEHALL ? 'dome' : kind === CK.CLOCKTOWER ? 'spire'
             : kind === CK.WAREHOUSE ? 'flat' : hash2(S + 4, 13) < 0.5 ? 'mansard' : 'flat';
+          const roofAccess = row === 0 && (roof === 'flat' || roof === 'mansard') && hash2(S + 10, 37) < 0.35;
+          if (roofAccess) z += RAMP_L; // переулок под пандус
           // ряд 1 стоит за рядом 0: отступ по глубине первого ряда (усреднённо 8) + переулок
-          const off = PISTE_HALF_W + 3 + (row === 0 ? hw : 8 * 2 + 6 + hw);
+          const off = STREET_HALF + 1.5 + (row === 0 ? hw : 8 * 2 + 6 + hw);
           const zc = z + hl;
           out.push({
             id: nextId++,
@@ -99,6 +109,8 @@ export function citySegment(s: number): Building[] {
             chimneys: kind === CK.FACTORY ? 2 + Math.floor(hash2(S + 6, 19) * 2) : hash2(S + 6, 19) < 0.6 ? 1 : 0,
             balconies: kind === CK.TENEMENT && hash2(S + 7, 23) < 0.6,
             padY: NaN,
+            roofAccess,
+            rampY0: NaN,
           });
           // стык или переулок
           z += hl * 2 + (hash2(S + 8, 29) < 0.2 ? 6 + hash2(S + 9, 31) * 6 : 0.6);
@@ -132,10 +144,31 @@ export function buildingPad(b: Building): number {
   return b.padY;
 }
 
+function rampStart(b: Building): number {
+  if (!Number.isNaN(b.rampY0)) return b.rampY0;
+  padOff = true;
+  b.rampY0 = terrainSample(b.u, b.z - b.hl - RAMP_L);
+  padOff = false;
+  return b.rampY0;
+}
+
+/** высота пандуса на крышу в точке (или null): от земли в начале переулка до крыши */
+export function cityRampAt(u: number, z: number, b: Building): number | null {
+  if (!b.roofAccess) return null;
+  if (Math.abs(u - b.u) > b.hw + 0.5) return null;
+  const zs = b.z - b.hl - RAMP_L;
+  if (z < zs || z > b.z - b.hl) return null;
+  const t = (z - zs) / RAMP_L;
+  const k = t * t * (3 - 2 * t);
+  const y0 = rampStart(b);
+  const y1 = buildingPad(b) + b.h + (b.roof === 'mansard' ? 2.2 : 0);
+  return y0 + (y1 - y0) * k;
+}
+
 /**
  * Площадка города в точке рельефа: вес 0..1 и высота. Здание выравнивает землю
  * под собой и на 4 м вокруг; между соседними площадками — уступ (подпорная
- * стенка), его рисует сам рельеф.
+ * стенка), его рисует сам рельеф. Пандусы на крыши — тоже рельеф.
  */
 export function cityPadAt(u: number, z: number): { w: number; y: number } | null {
   if (padOff) return null;
@@ -143,6 +176,14 @@ export function cityPadAt(u: number, z: number): { w: number; y: number } | null
   let bestW = 0;
   let bestY = 0;
   for (const b of list) {
+    const ry = cityRampAt(u, z, b);
+    if (ry !== null) {
+      // край пандуса поперёк — 1.5 м спада
+      const du = Math.abs(u - b.u) - b.hw + 0.5;
+      const w = du <= 0 ? 1 : 1 - du / 1.5;
+      if (w > bestW) { bestW = w; bestY = ry; }
+      continue;
+    }
     const du = Math.abs(u - b.u) - b.hw;
     const dz = Math.abs(z - b.z) - b.hl;
     if (du > 4 || dz > 4) continue;

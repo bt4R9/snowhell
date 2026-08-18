@@ -214,6 +214,7 @@ export class ChunkShader {
       const roadW = cb.x;
       const vw = cb.y;
       const cw = cb.z;
+      const rw = cb.w;
 
       // === terrainColorAt (ближняя версия) ===
       const snow: N = uSnow;
@@ -371,11 +372,18 @@ export class ChunkShader {
         gr.addAssign(float(0.42).sub(gr).mul(sn));
         gg.addAssign(float(0.42).sub(gg).mul(sn));
         gb.addAssign(float(0.44).sub(gb).mul(sn));
-        If(pt.greaterThan(0.0), () => {
-          const seam = max(0.0, abs(fract(z.div(6.0)).sub(0.5)).mul(2.0).oneMinus().sub(0.85)).div(0.15);
-          gr.addAssign(float(0.16).add(seam.mul(0.06)).sub(gr).mul(pt));
-          gg.addAssign(float(0.155).add(seam.mul(0.06)).sub(gg).mul(pt));
-          gb.addAssign(float(0.15).add(seam.mul(0.06)).sub(gb).mul(pt));
+        // мостовая: булыжник + бордюр (rw из ctrl)
+        If(rw.greaterThan(0.0), () => {
+          const cob = noise2(u.mul(0.9).add(4.4), z.mul(0.9).sub(2.2)).mul(0.5).add(0.5);
+          const cobK = cob.mul(0.28).add(0.86);
+          const curb = select(rw.lessThan(0.5), float(1.0), float(0.0));
+          const pr = mix(float(0.19).mul(cobK), float(0.34), curb);
+          const pg = mix(float(0.185).mul(cobK), float(0.32), curb);
+          const pb = mix(float(0.18).mul(cobK), float(0.30), curb);
+          const k = select(rw.lessThan(0.5), rw.mul(2.0), float(1.0));
+          gr.addAssign(pr.sub(gr).mul(k));
+          gg.addAssign(pg.sub(gg).mul(k));
+          gb.addAssign(pb.sub(gb).mul(k));
         });
         cr.addAssign(gr.sub(cr).mul(cw));
         cg.addAssign(gg.sub(cg).mul(cw));

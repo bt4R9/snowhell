@@ -1150,6 +1150,61 @@ export class Player {
 
     // --- столкновения с препятствиями (деревья, камни) ---
     if (this.hitCooldown > 0) this.hitCooldown = Math.max(0, this.hitCooldown - dt);
+    // ★ ЗДАНИЯ ГОРОДА — КОРОБКИ, И БЬЮТ НА ЛЮБОЙ ВЫСОТЕ. Проверка ниже
+    // работает только у земли (< 1.4 м) и радиусами — для фасада в пятнадцать
+    // метров это дыра: в полёте сквозь стену. Здесь честная коробка в
+    // координатах долины: выталкиваем через ближайшую грань, скорость
+    // отражаем вдоль стены; выше крыши — пролетаем (или едем по ней).
+    if (this.tumbleT <= 0) {
+      const pu = toValleyU(this.pos.x, this.pos.z);
+      const pcx = Math.round(pu / CHUNK);
+      const pcz = Math.round(this.pos.z / CHUNK);
+      cityHit: for (let ddx = -1; ddx <= 1; ddx++) {
+        for (let ddz = -1; ddz <= 1; ddz++) {
+          for (const o of obstaclesInChunk(pcx + ddx, pcz + ddz)) {
+            if (o.kind !== 'city' || o.cu === undefined) continue;
+            const hw = o.hw! + 0.45, hl = o.hl! + 0.45;
+            const du = pu - o.cu, dz = this.pos.z - o.cz!;
+            if (Math.abs(du) > hw || Math.abs(dz) > hl) continue;
+            const top = o.padY! + o.bodyH!;
+            if (this.pos.y > top - 0.3 || this.onRoof) continue;
+            // ближайшая грань
+            const pu1 = hw - Math.abs(du);
+            const pz1 = hl - Math.abs(dz);
+            let nx = 0, nz = 0;
+            if (pu1 < pz1) {
+              const su = du >= 0 ? 1 : -1;
+              const nu = o.cu + su * hw;
+              const wx = toWorldX(nu, this.pos.z);
+              nx = Math.sign(wx - this.pos.x) || su;
+              this.pos.x = wx;
+            } else {
+              nz = dz >= 0 ? 1 : -1;
+              this.pos.z = o.cz! + nz * hl;
+            }
+            const into = this.velH.x * nx + this.velH.z * nz;
+            if (into < 0) {
+              this.velH.x -= into * nx;
+              this.velH.z -= into * nz;
+              const headOn = -into > this.speed * 0.6 && this.speed > HIKE_SPEED;
+              if (this.hitCooldown <= 0) {
+                this.hitCooldown = HIT_COOLDOWN;
+                if (headOn) {
+                  this.velH.multiplyScalar(0.25);
+                  this.tumbleT = TUMBLE_TIME;
+                  this.crashed = true;
+                  this.trickYaw = 0; this.trickFlip = 0; this.spinVel = 0; this.flipVel = 0; this.airTime = 0;
+                } else {
+                  this.velH.multiplyScalar(0.9);
+                  this.grazed = true;
+                }
+              }
+            }
+            break cityHit;
+          }
+        }
+      }
+    }
     if (this.tumbleT <= 0 && this.pos.y - groundY < 1.4) {
       const pcx = Math.round(toValleyU(this.pos.x, this.pos.z) / CHUNK);
       const pcz = Math.round(this.pos.z / CHUNK);
@@ -1164,6 +1219,7 @@ export class Player {
             // В НАПРАВЛЕНИИ игрока по радиальному профилю её геометрии.
             // на крыше стены дома уже под нами — иначе игрока вытолкнет с неё
             if (o.kind === 'house' && this.onRoof) continue;
+            if (o.kind === 'city') continue; // здания города — коробкой, выше
             // ★ НАД НИЗКИМ КАМНЕМ ПРОЛЕТАЕМ. У валуна известна высота
             // верхушки: если доска выше неё, столкновению взяться неоткуда —
             // раньше мелкий камень бил как полноростовой столб.
