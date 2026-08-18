@@ -98,8 +98,11 @@ export const demoDebug = {
    * километре, и доезжать до неё каждый раз — это шесть минут. 0 — обычный
    * старт со снежной карты.
    * Меняется из консоли: `__startAt(13000)`, обычный старт — `__startAt(0)`.
+   *
+   * ★ ВРЕМЕННО: старт сразу в паровом городе, пока его обкатываем.
+   * ВЕРНУТЬ НА 0 перед тем, как показывать игру со старта.
    */
-  startZ: 0,
+  startZ: 15200,
 };
 
 /** плавная S-кривая: камера не должна трогаться и вставать рывком */
@@ -189,7 +192,11 @@ export class Demo {
           if (demoDebug.startZ > 0) {
             this.wantWarp = demoDebug.startZ;
             this.weatherZ = demoDebug.startZ;
-            step(Stage.Volcano);
+            // за башней — сразу свободная езда (город), башня считается разбитой
+            if (demoDebug.startZ > VOLCANO_TO + 900) {
+              step(Stage.Night);
+              this.t = 10;
+            } else step(Stage.Volcano);
             return null;
           }
           step(Stage.Snow);

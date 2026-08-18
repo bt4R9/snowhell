@@ -213,6 +213,7 @@ export class ChunkShader {
       const sk = ca.w;
       const roadW = cb.x;
       const vw = cb.y;
+      const cw = cb.z;
 
       // === terrainColorAt (ближняя версия) ===
       const snow: N = uSnow;
@@ -353,6 +354,32 @@ export class ChunkShader {
         cr.addAssign(tr.sub(cr).mul(k));
         cg.addAssign(tg.sub(cg).mul(k));
         cbl.addAssign(tb.sub(cbl).mul(k));
+      });
+
+      // ★ ПАРОВОЙ ГОРОД: склон — отвалы и шлак (см. terrain.ts, те же формулы)
+      If(cw.greaterThan(0.01), () => {
+        const soot = noise2(u.mul(0.06).add(9.1), z.mul(0.008).sub(3.3)).mul(0.5).add(0.5);
+        const rust = max(0.0, noise2(u.mul(0.03).sub(4.4), z.mul(0.03).add(7.7)).sub(0.45)).div(0.55);
+        const k = soot.mul(0.9).oneMinus().mul(0.45).add(0.55);
+        const gr = float(0.20).mul(k).toVar();
+        const gg = float(0.19).mul(k).toVar();
+        const gb = float(0.18).mul(k).toVar();
+        gr.addAssign(float(0.36).sub(gr).mul(rust).mul(0.6));
+        gg.addAssign(float(0.17).sub(gg).mul(rust).mul(0.6));
+        gb.addAssign(float(0.08).sub(gb).mul(rust).mul(0.6));
+        const sn = sstep(0.55, 0.75, noise2(u.mul(0.02).add(1.7), z.mul(0.02).sub(5.5)).mul(0.5).add(0.5)).mul(steep.oneMinus());
+        gr.addAssign(float(0.42).sub(gr).mul(sn));
+        gg.addAssign(float(0.42).sub(gg).mul(sn));
+        gb.addAssign(float(0.44).sub(gb).mul(sn));
+        If(pt.greaterThan(0.0), () => {
+          const seam = max(0.0, abs(fract(z.div(6.0)).sub(0.5)).mul(2.0).oneMinus().sub(0.85)).div(0.15);
+          gr.addAssign(float(0.16).add(seam.mul(0.06)).sub(gr).mul(pt));
+          gg.addAssign(float(0.155).add(seam.mul(0.06)).sub(gg).mul(pt));
+          gb.addAssign(float(0.15).add(seam.mul(0.06)).sub(gb).mul(pt));
+        });
+        cr.addAssign(gr.sub(cr).mul(cw));
+        cg.addAssign(gg.sub(cg).mul(cw));
+        cbl.addAssign(gb.sub(cbl).mul(cw));
       });
 
       // === хвост stage 3: дорога деревни и остывшая корка у озёр ===

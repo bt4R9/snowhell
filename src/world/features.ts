@@ -986,6 +986,8 @@ export const HK = {
   /** ★ ПАРОВОЙ ГОРОД: цех с трубами и водонапорная башня */
   FACTORY: 6,
   TOWER: 7,
+  /** латунный купол-котёл на цилиндре — примета города по референсам */
+  DOME: 8,
 } as const;
 
 export interface VillageHouse {
@@ -1216,9 +1218,10 @@ export function villageInCell(vcx: number, vcz: number): Village | null {
       // склады, водонапорные башни — никаких шале и часовен
       const inCity = cityWeight(pz) > 0.5;
       if (inCity) {
-        if (roll > 0.9) kind = HK.TOWER;
-        else if (roll > 0.72) kind = HK.SHOP;
-        else if (roll > 0.5) kind = HK.TALL;
+        if (roll > 0.92) kind = HK.TOWER;
+        else if (roll > 0.8) kind = HK.DOME;
+        else if (roll > 0.66) kind = HK.SHOP;
+        else if (roll > 0.48) kind = HK.TALL;
         else if (roll > 0.38) kind = HK.BARN;
         else kind = HK.FACTORY;
       } else if (hi === hotelAt) kind = HK.HOTEL;
@@ -1234,16 +1237,16 @@ export function villageInCell(vcx: number, vcz: number): Village | null {
         wMul * (kind === HK.HOTEL ? 2.1 : kind === HK.SHOP ? 1.5
           : kind === HK.BARN ? 1.2 : kind === HK.TALL ? 0.8
           : kind === HK.CHAPEL ? 0.75 : kind === HK.FACTORY ? 2.6
-          : kind === HK.TOWER ? 0.7 : 1);
+          : kind === HK.TOWER ? 0.7 : kind === HK.DOME ? 1.5 : 1);
       const deep =
         dMul * (kind === HK.HOTEL ? 1.35 : kind === HK.BARN ? 1.15
           : kind === HK.CHAPEL ? 1.3 : kind === HK.SHOP ? 1.05
-          : kind === HK.FACTORY ? 1.7 : kind === HK.TOWER ? 0.9 : 1);
+          : kind === HK.FACTORY ? 1.7 : kind === HK.TOWER ? 0.9 : kind === HK.DOME ? 1.5 : 1);
       const bodyH =
         2.4 * hMul * (kind === HK.HOTEL ? 1.75 : kind === HK.TALL ? (inCity ? 1.6 : 1.12)
           : kind === HK.BARN ? 0.75 : kind === HK.SHOP ? 0.85
           : kind === HK.CHAPEL ? 1.2 : kind === HK.FACTORY ? 1.5
-          : kind === HK.TOWER ? 3.2 : 1);
+          : kind === HK.TOWER ? 3.2 : kind === HK.DOME ? 2.0 : 1);
       const roofPitch =
         (kind === HK.BARN ? 0.5 : kind === HK.CHAPEL ? 1.5
           : kind === HK.HOTEL ? 0.7 : kind === HK.FACTORY ? 0.3
@@ -1280,7 +1283,7 @@ export function villageInCell(vcx: number, vcz: number): Village | null {
         // ровно один раз; дом, по крыше которого едешь, — это уже линия.
         // Отель и часовня остаются стоять как стояли: у них своя роль в силуэте
         // деревни, и врезать их значит потерять её.
-        sunk: kind !== HK.HOTEL && kind !== HK.CHAPEL && kind !== HK.FACTORY && kind !== HK.TOWER &&
+        sunk: kind !== HK.HOTEL && kind !== HK.CHAPEL && kind !== HK.FACTORY && kind !== HK.TOWER && kind !== HK.DOME &&
           hash2(S + 211 + hi * 5, 43) > 0.55,
       });
     }

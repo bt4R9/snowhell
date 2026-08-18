@@ -28,6 +28,8 @@ export class Airships {
   private hull: THREE.InstancedMesh;
   private gondola: THREE.InstancedMesh;
   private fin: THREE.InstancedMesh;
+  private prop: THREE.InstancedMesh;
+  private blade: THREE.InstancedMesh;
   private tmpM = new THREE.Matrix4();
   private tmpQ = new THREE.Quaternion();
   private tmpV = new THREE.Vector3();
@@ -46,7 +48,12 @@ export class Airships {
     const finGeo = new THREE.BoxGeometry(1, 1, 1);
     const finMat = lambert({ color: 0x6e5a48, flatShading: true });
     this.fin = new THREE.InstancedMesh(finGeo, finMat, SHIPS * 2);
-    for (const m of [this.hull, this.gondola, this.fin]) {
+    // ★ ПРОПЕЛЛЕРЫ в кольцах по бортам (по референсам) — вращаются
+    const ringGeo = new THREE.TorusGeometry(1, 0.08, 6, 12);
+    this.prop = new THREE.InstancedMesh(ringGeo, lambert({ color: 0x9a7a3a, flatShading: true }), SHIPS * 2);
+    const bladeGeo = new THREE.BoxGeometry(1.8, 0.16, 0.05);
+    this.blade = new THREE.InstancedMesh(bladeGeo, lambert({ color: 0x3a3230, flatShading: true }), SHIPS * 2);
+    for (const m of [this.hull, this.gondola, this.fin, this.prop, this.blade]) {
       m.frustumCulled = false;
       m.count = 0;
       this.group.add(m);
@@ -119,6 +126,21 @@ export class Airships {
       this.fin.setMatrixAt(i * 2, this.tmpM);
       this.tmpM.compose(this.tmpV.set(s.x, s.y, s.z + tail), this.tmpQ, this.tmpS.set(R * 2.2, R * 0.12, L * 0.16));
       this.fin.setMatrixAt(i * 2 + 1, this.tmpM);
+      // пропеллеры по бортам гондолы, лопасти крутятся
+      for (let side = 0; side < 2; side++) {
+        const sx = side === 0 ? -1 : 1;
+        const pr = R * 0.45;
+        const ex = s.x + sx * R * 1.15, ey = s.y - R * 0.6, ez = s.z + Math.cos(s.yaw) * L * -0.05;
+        // кольцо в плоскости XY (ось — вдоль хода)
+        this.tmpE.set(0, s.yaw, 0);
+        this.tmpQ.setFromEuler(this.tmpE);
+        this.tmpM.compose(this.tmpV.set(ex, ey, ez), this.tmpQ, this.tmpS.set(pr, pr, pr));
+        this.prop.setMatrixAt(i * 2 + side, this.tmpM);
+        this.tmpE.set(0, s.yaw, time * 9 + s.phase + side);
+        this.tmpQ.setFromEuler(this.tmpE);
+        this.tmpM.compose(this.tmpV.set(ex, ey, ez), this.tmpQ, this.tmpS.set(pr, pr, pr));
+        this.blade.setMatrixAt(i * 2 + side, this.tmpM);
+      }
       // тень: эллипс под кораблём (солнце почти в зените — тень под брюхом)
       this.shadowData[i * 4] = s.x + 12;
       this.shadowData[i * 4 + 1] = s.z + 8;
@@ -128,6 +150,10 @@ export class Airships {
     this.hull.count = SHIPS;
     this.gondola.count = SHIPS;
     this.fin.count = SHIPS * 2;
+    this.prop.count = SHIPS * 2;
+    this.blade.count = SHIPS * 2;
+    this.prop.instanceMatrix.needsUpdate = true;
+    this.blade.instanceMatrix.needsUpdate = true;
     this.hull.instanceMatrix.needsUpdate = true;
     this.gondola.instanceMatrix.needsUpdate = true;
     this.fin.instanceMatrix.needsUpdate = true;

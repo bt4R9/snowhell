@@ -1484,6 +1484,27 @@ export function terrainColorAt(
     cg += (tg - cg) * k;
     cb += (tb - cb) * k;
   }
+  // ★ ПАРОВОЙ ГОРОД: СКЛОН — НЕ СНЕГ. Отвалы и шлак: тёмно-серая порода с
+  // полосами сажи вдоль линии падения и ржавыми подтёками; грязный снег
+  // остаётся пятнами на пологом; трасса — чугунные плиты с поперечными
+  // стыками. Те же формулы в chunkshade.ts (GPU).
+  const cw = cityWeight(z);
+  if (cw > 0.01) {
+    const soot = noise2(u * 0.06 + 9.1, z * 0.008 - 3.3) * 0.5 + 0.5;
+    const rust = Math.max(0, noise2(u * 0.03 - 4.4, z * 0.03 + 7.7) - 0.45) / 0.55;
+    const k = 0.55 + 0.45 * (1 - soot * 0.9);
+    let gr = 0.20 * k, gg = 0.19 * k, gb = 0.18 * k;
+    gr += (0.36 - gr) * rust * 0.6; gg += (0.17 - gg) * rust * 0.6; gb += (0.08 - gb) * rust * 0.6;
+    const sn = (() => { const t = Math.max(0, Math.min(1, (noise2(u * 0.02 + 1.7, z * 0.02 - 5.5) * 0.5 + 0.5 - 0.55) / 0.2)); return t * t * (3 - 2 * t) * (1 - steep); })();
+    gr += (0.42 - gr) * sn; gg += (0.42 - gg) * sn; gb += (0.44 - gb) * sn;
+    if (pt > 0) {
+      // плиты: стык каждые 6 м поперёк
+      const seam = Math.max(0, 1 - Math.abs(((z / 6) % 1 + 1) % 1 - 0.5) * 2 - 0.85) / 0.15;
+      const pr = 0.16 + seam * 0.06, pg = 0.155 + seam * 0.06, pb = 0.15 + seam * 0.06;
+      gr += (pr - gr) * pt; gg += (pg - gg) * pt; gb += (pb - gb) * pt;
+    }
+    cr += (gr - cr) * cw; cg += (gg - cg) * cw; cb += (gb - cb) * cw;
+  }
   out.r = cr; out.g = cg; out.b = cb;
   out.glow = glow;
   out.hot = glowHz;
@@ -1962,6 +1983,8 @@ export class Terrain {
   private tankGeo = new THREE.CylinderGeometry(1.0, 1.0, 1.0, 10);
   private tankMat = lambert({ color: 0x5c4634, flatShading: true });
   private legGeo = new THREE.BoxGeometry(0.16, 1.0, 0.16);
+  private domeGeo = new THREE.SphereGeometry(1, 12, 6, 0, Math.PI * 2, 0, Math.PI / 2);
+  private brassMat = lambert({ color: 0x9a7a3a, flatShading: true });
   private coneGeo = new THREE.ConeGeometry(1.15, 0.7, 10);
   /** ★ трубы цехов, из которых идёт пар: мировые координаты верха, по чанкам */
   private stacks = new Map<THREE.Group, Array<{ x: number; y: number; z: number; r: number }>>();
@@ -2088,7 +2111,7 @@ export class Terrain {
     }
     ctrlB[i * 4] = roadW;
     ctrlB[i * 4 + 1] = volcanoWeight(v);
-    ctrlB[i * 4 + 2] = 0;
+    ctrlB[i * 4 + 2] = cityWeight(v);
     ctrlB[i * 4 + 3] = 0;
   }
 
@@ -2354,8 +2377,9 @@ export class Terrain {
         }
         const isFactory = kind === HK.FACTORY;
         const isTower = kind === HK.TOWER;
+        const isDome = kind === HK.DOME;
         const bodyMat = isFactory ? this.brickMat : this.houseMats[h.style];
-        if (!isTower) {
+        if (!isTower && !isDome) {
           const body = new THREE.Mesh(this.houseGeo, bodyMat);
           body.position.y = (bodyH - skirt) / 2;
           body.scale.set(wide, (bodyH + skirt) / 2.4, deep);
@@ -2367,7 +2391,30 @@ export class Terrain {
         const roofPitch = h.roofPitch;
         const roofW = wide * 1.16;
         const roofD = deep * 1.16;
-        if (!isTower) {
+        if (isDome) {
+          // ★ ЛАТУННЫЙ КУПОЛ: кирпичный барабан, латунная полусфера, шпиль,
+          // пояс окон — по референсам это самый узнаваемый силуэт города
+          const drum = new THREE.Mesh(this.tankGeo, this.brickMat);
+          drum.position.y = bodyH * 0.35;
+          drum.scale.set(2.2 * wide, bodyH * 0.7, 2.2 * deep);
+          house.add(drum);
+          const dome = new THREE.Mesh(this.domeGeo, this.brassMat);
+          dome.position.y = bodyH * 0.7;
+          dome.scale.set(2.3 * wide, bodyH * 0.55, 2.3 * deep);
+          house.add(dome);
+          const spire = new THREE.Mesh(this.stackGeo, this.brassMat);
+          spire.position.y = bodyH * 0.7 + bodyH * 0.55 + 0.6;
+          spire.scale.set(0.5, 1.4, 0.5);
+          house.add(spire);
+          for (let c = 0; c < 8; c++) {
+            const a = (c / 8) * Math.PI * 2;
+            const win = new THREE.Mesh(this.windowGeo, this.windowMat);
+            win.position.set(Math.cos(a) * 2.22 * wide, bodyH * 0.45, Math.sin(a) * 2.22 * deep);
+            win.rotation.y = -a + Math.PI / 2;
+            house.add(win);
+          }
+        }
+        if (!isTower && !isDome) {
           const roof = new THREE.Mesh(this.roofGeo, isFactory ? this.ironRoofMat : this.roofMats[h.style]);
           roof.position.y = bodyH;
           roof.scale.set(roofW, roofPitch, roofD);
@@ -2432,7 +2479,7 @@ export class Terrain {
           house.add(cone);
         }
 
-        if (h.chimney && !isFactory && !isTower) {
+        if (h.chimney && !isFactory && !isTower && !isDome) {
           const ch = new THREE.Mesh(this.chimneyGeo, this.houseMats[(h.style + 1) % 3]);
           ch.position.set(
             (hash01(h.z, h.x) - 0.5) * 2.4 * wide,
@@ -2504,7 +2551,7 @@ export class Terrain {
         }
 
         // дверь на фасаде
-        if (!isTower) {
+        if (!isTower && !isDome) {
           const door = new THREE.Mesh(this.doorGeo, this.doorMat);
           door.position.set(-1.4 * wide, 0.68, 1.81 * deep + 0.03);
           house.add(door);
@@ -2512,7 +2559,7 @@ export class Terrain {
 
         // окна: два на фасаде (к дороге), одно сзади
         const wz = 1.81 * deep;
-        const winList: Array<[number, number, number]> = isTower || isFactory ? [] : [
+        const winList: Array<[number, number, number]> = isTower || isFactory || isDome ? [] : [
           [0.35 * wide, wz + 0.02, 0],
           [1.4 * wide, wz + 0.02, 0],
           [0.5 * wide, -wz - 0.02, Math.PI],

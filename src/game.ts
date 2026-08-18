@@ -28,6 +28,7 @@ import { Boulders } from './world/boulders';
 import { Water } from './world/water';
 import { Airships } from './world/airships';
 import { Carts } from './world/carts';
+import { Gantries } from './world/gantries';
 import { FarField } from './world/farfield';
 import { Hud } from './ui/hud';
 import { Sound } from './audio/sound';
@@ -75,6 +76,7 @@ export class Game {
   private water!: Water;
   private airships!: Airships;
   private carts!: Carts;
+  private gantries!: Gantries;
   private volcanoes = new Volcanoes();
   private fireballs = new Fireballs();
   private worldTime = 0;
@@ -131,6 +133,8 @@ export class Game {
     this.scene.add(this.airships.group);
     this.carts = new Carts();
     this.scene.add(this.carts.group);
+    this.gantries = new Gantries(terrainHeight);
+    this.scene.add(this.gantries.group);
     this.player.waterSplash = (x, z, k) => this.water.splash(x, z, k);
     this.boulders.onTrail = (ax, az, bx, bz, r, depth) => damage.paintCut(ax, az, bx, bz, r, depth);
     this.lava.onBoulder = (x, y, z) => {
@@ -689,6 +693,7 @@ export class Game {
     this.terrain.setShips(this.airships.shadowData);
     // ★ ВАГОНЕТКИ: ходят по рельсам города; задела — сбила с ног
     this.carts.update(player.pos.x, player.pos.z, dt);
+    this.gantries.update(player.pos.z, dt);
     {
       const c = this.carts.nearest(player.pos.x, player.pos.y, player.pos.z, 1.9);
       if (c) {
