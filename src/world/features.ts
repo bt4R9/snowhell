@@ -757,6 +757,105 @@ export function gullyInside(u: number, v: number): number {
   return best * WARMUP.hazard(v);
 }
 
+// --- ★ ДОЛИНЫ-УЩЕЛЬЯ ВДОЛЬ СПУСКА ---------------------------------------
+// Правила генератора (по просьбе): (1) НИКАКИХ V-образных ущелий — у каждого
+// плоское дно и мягкие борта (U-профиль); (2) ущелье идёт ВДОЛЬ линии спуска,
+// отклоняясь не больше чем на ~30°: виляние ограничено по производной;
+// (3) ущелья иногда ВЕТВЯТСЯ — рукав отходит в сторону не круче 35° и живёт до
+// конца. Часть ущелий берёт трассу на дно (каньон), часть идёт рядом.
+const VAL_PERIOD = 900;
+
+interface Valley {
+  z0: number; len: number;
+  /** боковое смещение оси от трассы (0 — трасса на дне) */
+  off: number;
+  onPiste: boolean;
+  floor: number;   // полуширина плоского дна
+  wall: number;    // ширина борта (от края дна до склона)
+  depth: number;
+  wA: number; fA: number; pA: number;   // виляние: два синуса, ограниченные по уклону
+  wB: number; fB: number; pB: number;
+  forkT: number;   // −1 — без развилки
+  forkOff: number; // куда уходит рукав (со знаком)
+}
+const valleyCache = new Map<number, Valley | null>();
+
+export function valleyAt(k: number): Valley | null {
+  const hit = valleyCache.get(k);
+  if (hit !== undefined) return hit;
+  let res: Valley | null = null;
+  if (k >= 1 && hash2(k * 521 + 3, 131) < 0.62) {
+    const onPiste = hash2(k * 523 + 7, 137) < 0.4;
+    const side = hash2(k * 527 + 1, 139) < 0.5 ? -1 : 1;
+    const floor = onPiste ? 45 + hash2(k * 529, 149) * 25 : 16 + hash2(k * 529, 149) * 22;
+    const wall = 30 + hash2(k * 533, 151) * 30;
+    // ★ УКЛОН ВИЛЯНИЯ ≤ ~30°: |dA·fA| + |wB·fB| ≤ 0.55
+    const wA = 30 + hash2(k * 541, 157) * 30;
+    const fA = 0.004 + hash2(k * 547, 163) * 0.004;      // wA·fA ≤ 0.48
+    const wB = 8 + hash2(k * 557, 167) * 10;
+    const fB = 0.012 + hash2(k * 563, 173) * 0.008;      // wB·fB ≤ 0.36
+    const fork = hash2(k * 569 + 5, 179) < 0.45;
+    res = {
+      z0: k * VAL_PERIOD + hash2(k * 571, 181) * 200,
+      len: 700 + hash2(k * 577, 191) * 700,
+      off: onPiste ? 0 : side * (PISTE_HALF_W + floor + wall + 12 + hash2(k * 587, 193) * 110),
+      onPiste, floor, wall,
+      depth: onPiste ? 8 + hash2(k * 593, 197) * 8 : 10 + hash2(k * 593, 197) * 12,
+      wA, fA, pA: hash2(k * 599, 199) * 6.283, wB, fB, pB: hash2(k * 601, 211) * 6.283,
+      forkT: fork ? 0.25 + hash2(k * 607, 223) * 0.25 : -1,
+      // рукав уходит наружу от трассы (у каньона — в случайную сторону)
+      forkOff: (onPiste ? (hash2(k * 613, 227) < 0.5 ? -1 : 1) : side) * (90 + hash2(k * 617, 229) * 90),
+    };
+  }
+  valleyCache.set(k, res);
+  if (valleyCache.size > 256) valleyCache.clear();
+  return res;
+}
+
+function valleyCenter(v: Valley, z: number): number {
+  const w = v.wA * Math.sin(z * v.fA + v.pA) + v.wB * Math.sin(z * v.fB + v.pB);
+  // канон: у бокового ущелья борт не заходит на трассу
+  const minOff = v.onPiste ? 0 : PISTE_HALF_W + v.floor + v.wall + 6;
+  let d = v.off + w;
+  if (!v.onPiste && Math.abs(d) < minOff) d = Math.sign(v.off) * minOff;
+  return pisteCenterX(z) + d;
+}
+
+/** U-профиль поперёк: 1 на дне, 0 за бортом (без излома на дне и на кромке) */
+function valleyProfile(ax: number, floor: number, wall: number): number {
+  if (ax <= floor) return 1;
+  if (ax >= floor + wall) return 0;
+  const t = (ax - floor) / wall;
+  return 1 - t * t * (3 - 2 * t);
+}
+
+/** глубина ущелий в точке (отрицательная — вырезаем) */
+export function valleyDepth(u: number, z: number): number {
+  let d = 0;
+  const idx = Math.floor(z / VAL_PERIOD);
+  for (let k = idx - 2; k <= idx; k++) {
+    const v = valleyAt(k);
+    if (!v) continue;
+    const t = (z - v.z0) / v.len;
+    if (t < 0 || t > 1) continue;
+    // вход и выкат плавные — в ущелье вкатываешься, а не падаешь
+    const e = Math.min(1, Math.min(t, 1 - t) / 0.18);
+    const env = e * e * (3 - 2 * e);
+    const c = valleyCenter(v, z);
+    let p = valleyProfile(Math.abs(u - c), v.floor, v.wall);
+    if (v.forkT >= 0 && t > v.forkT) {
+      // рукав расходится за 0.35 длины: при forkOff ≤ 180 и len ≥ 700 уклон
+      // расхождения ≤ 0.73 (~36°) — не круче правила
+      const s = Math.min(1, (t - v.forkT) / 0.35);
+      const sp = s * s * (3 - 2 * s) * v.forkOff;
+      p = Math.max(p, valleyProfile(Math.abs(u - (c + sp)), v.floor * 0.75, v.wall));
+    }
+    if (p <= 0) continue;
+    d -= v.depth * env * p * WARMUP.shape(z);
+  }
+  return d;
+}
+
 // --- Обрывы и месы (живут здесь, чтобы деревни могли проверять рельеф) ---
 
 const CLIFF_SZ = 260; // шаг рядов обрывов по z
