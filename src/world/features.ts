@@ -356,6 +356,7 @@ export interface Lake {
   water: boolean;
 }
 const LAKE_STEP = 520;
+const LAKES_ON = false;
 const lakeCache = new Map<number, Lake | null>();
 let lakeOff = false;
 
@@ -364,7 +365,9 @@ export function lakeAtSite(k: number): Lake | null {
   if (hit !== undefined) return hit;
   let res: Lake | null = null;
   const z = k * LAKE_STEP + 260 + (hash2(k * 17 + 3, 61) - 0.5) * 160;
-  if (nightWeight(z) > 0.7 && hash2(k * 31 + 5, 67) < 0.7 && sampleHeight) {
+  // ★ ОЗЁРА ВЫКЛЮЧЕНЫ (2026-08-18: «не в тему») — код и физика воды остаются
+  // на будущее (водосброс стимпанка), генератор их не ставит
+  if (LAKES_ON && nightWeight(z) > 0.7 && hash2(k * 31 + 5, 67) < 0.7 && sampleHeight) {
     const u = pisteCenterX(z) + (hash2(k * 13 + 1, 71) - 0.5) * 70;
     const ru = 60 + hash2(k * 7 + 2, 73) * 70;
     const rz = ru * (1.3 + hash2(k * 11 + 4, 79) * 0.9);
@@ -2154,6 +2157,8 @@ export function railInCell(rcx: number, rcz: number): Rail | null {
   // другого мира: они читаются горнолыжной инфраструктурой, которой на
   // действующем вулкане взяться неоткуда.
   if (volcanoWeight(sz) > 0.15) return miss();
+  // и в полярной ночи их тоже нет — там пустой быстрый склон
+  if (nightWeight(sz) > 0.15) return miss();
   if (hash2(rcz * 23 + 4, 9) < 1 - 0.82 * wr) return miss();
   if (nearSpawn(sx, sz)) return miss();
 
