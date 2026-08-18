@@ -23,6 +23,9 @@ import {
   RAIL_HEIGHT,
   Rail,
   Village,
+  Obstacle,
+  setCityRoof,
+  setCityObstacles,
   villageAt,
   roadClosest,
   cliffDrop,
@@ -107,8 +110,12 @@ function descentSlopeAt(v: number): number {
   // Множитель входит ПОД интеграл, поэтому высота остаётся честной первообразной
   // уклона и градиент для физики совпадает с картинкой.
   const R = recipe();
+  // ★ В ПАРОВОМ ГОРОДЕ СКЛОН ПОЛОЖЕ (×0.6): город на 33° не стоит, да и
+  // улица между фасадами читается на пологом. Множитель под интегралом —
+  // высота остаётся честной первообразной, переход плавный по весу биома.
+  const cityK = 1 - 0.4 * cityWeight(v);
   return (R.slope + R.slopeWave * Math.sin(v * F1 + P1) + S2 * Math.sin(v * F2 + P2)) *
-    Math.sqrt(1 + sl * sl) * WARMUP.slope(v) * volcanoEase(v);
+    Math.sqrt(1 + sl * sl) * WARMUP.slope(v) * volcanoEase(v) * cityK;
 }
 
 function baseDescent(v: number): number {
@@ -214,7 +221,12 @@ function terrainBase(x: number, z: number): number {
   // Трасса: укатанный коридор — мелкие бугры сглажены, обрывы и месы
   // подавлены, на дугах поднят вираж. Вне коридора — дикий склон.
   const piste = pisteAt(x, z);
-  const wild = 1 - piste.t;
+  // ★ ГОРОД СТОИТ НА РОВНОМ: в паровом городе дикий рельеф (чаши, отроги, рябь,
+  // ущелья, обрывы) прижат — «без резких переходов», как просили; остаётся
+  // мягкий склон и уступы под кварталами (city.ts)
+  const cw = cityWeight(z);
+  const calm = 1 - 0.85 * cw;
+  const wild = (1 - piste.t) * calm;
 
   let h = -baseDescent(z);
   // Амплитуда «дикого» рельефа на вкате прижата — но по-разному для формы
@@ -224,8 +236,8 @@ function terrainBase(x: number, z: number): number {
   // а система чаш и отрогов — линия падения гуляет влево-вправо, и спуск
   // получается кривым, как на настоящей горе.
   // По ходу спуска они меняются медленно — иначе гасили бы уклон в ноль
-  h += noise2(x * 0.0011 + 21.4, z * 0.00045 - 5.2) * 95 * shape;
-  h += noise2(x * 0.003 - 8.7, z * 0.0012 + 12.9) * 30 * shape;
+  h += noise2(x * 0.0011 + 21.4, z * 0.00045 - 5.2) * 95 * shape * (1 - 0.6 * cw);
+  h += noise2(x * 0.003 - 8.7, z * 0.0012 + 12.9) * 30 * shape * calm;
   // БОРТА ДОЛИНЫ. Без них гора почти плоская вбок: смотришь вниз по склону —
   // и за локальным перегибом нет ничего, кроме неба, отсюда пустая полоса
   // поперёк кадра. Настоящая долина зажата стенами, они и держат средний
@@ -354,12 +366,12 @@ function terrainBase(x: number, z: number): number {
     h += flatBottom(rockRelief, x, z) * rocky;
   }
   // Скала растёт ИЗ горы: под ней рельеф вспучивается холмом (см. cragLift).
-  h += cragLift(x, z);
-  h += gullyDepth(x, z);
+  h += cragLift(x, z) * calm;
+  h += gullyDepth(x, z) * calm;
   // ★ ДОЛИНЫ-УЩЕЛЬЯ вдоль спуска: U-профиль, отклонение ≤ 30°, иногда с рукавом
-  h += valleyDepth(x, z);
-  h += cliffDrop(x, z) * (1 - gully); // обрывы уже обходят трассу при генерации
-  h += mesaLift(x, z) * (1 - piste.t * 0.85);
+  h += valleyDepth(x, z) * calm;
+  h += cliffDrop(x, z) * (1 - gully) * calm; // обрывы уже обходят трассу при генерации
+  h += mesaLift(x, z) * (1 - piste.t * 0.85) * calm;
   // коридор чуть утоплен относительно целины: читается как прорезанная
   // ратраком трасса и мягко удерживает райдера на линии
   h -= 1.1 * piste.t;
@@ -446,6 +458,18 @@ export function terrainHeight(x: number, z: number): number {
 // Отдаём высоту генератору препятствий: ему нужна крутизна, чтобы не сажать
 // лес на скальные стены, а импортировать terrain.ts оттуда нельзя — цикл.
 setTerrainSampler((u, z) => terrainAtValley(u, z));
+setCityRoof(cityRoofAt);
+// здания города — препятствия своего чанка (координаты долины, как у домов)
+setCityObstacles((cx, cz) => {
+  const out: Obstacle[] = [];
+  const oz = cz * CHUNK;
+  if (cityWeight(oz) < 0.01) return out;
+  for (const b of cityNear(oz)) {
+    if (Math.round(b.u / CHUNK) !== cx || Math.round(b.z / CHUNK) !== cz) continue;
+    out.push({ x: b.u, z: b.z, scale: 1, r: b.hw, kind: 'house', rot: 0, zMul: b.hl / b.hw, topY: b.h + 3 });
+  }
+  return out;
+});
 // ★ ОДНА ВЫСОТА ПЛОЩАДКИ НА ВСЕХ. По крышам ездят, поэтому физика обязана
 // мерить ровно ту отметку, на которой дом нарисован. У вкопанного дома она уже
 // НЕ равна рельефу под ним, и вывести её из земли нельзя — отдаём напрямую.
@@ -571,7 +595,13 @@ setArchLeg(
 
 export function terrainAtValley(u: number, z: number): number {
   const x = u;
-  const base = terrainBase(x, z);
+  let base = terrainBase(x, z);
+  // ★ ПЛОЩАДКИ ГОРОДА: каждое здание стоит на ровном, между площадками —
+  // уступы-террасы (см. city.ts)
+  if (cityWeight(z) > 0.01) {
+    const cp = cityPadAt(x, z);
+    if (cp) base += (cp.y - base) * cp.w;
+  }
   const v = villageAt(x, z);
   if (!v) return base;
   const hs = villageHeights(v);
@@ -1512,6 +1542,7 @@ export function terrainColorAt(
 
 import { damage } from '../fx/damage';
 import { bandProfile } from './slice';
+import { cityPadAt, cityNear, buildingPad, cityRoofAt, CK, Building } from './city';
 import { SHIPS } from './airships';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1983,6 +2014,7 @@ export class Terrain {
   private tankGeo = new THREE.CylinderGeometry(1.0, 1.0, 1.0, 10);
   private tankMat = lambert({ color: 0x5c4634, flatShading: true });
   private legGeo = new THREE.BoxGeometry(0.16, 1.0, 0.16);
+  private pipeMat = lambert({ color: 0x5a5652, flatShading: true });
   private domeGeo = new THREE.SphereGeometry(1, 12, 6, 0, Math.PI * 2, 0, Math.PI / 2);
   private brassMat = lambert({ color: 0x9a7a3a, flatShading: true });
   private coneGeo = new THREE.ConeGeometry(1.15, 0.7, 10);
@@ -1991,6 +2023,18 @@ export class Terrain {
   private steelMat = lambert({ color: 0x8c8f96, flatShading: true });
   private lampPoleGeo = new THREE.CylinderGeometry(0.06, 0.09, 3.1, 5);
   private lampGlowGeo = new THREE.SphereGeometry(0.24, 8, 6);
+
+  private cityWinGeo = new THREE.PlaneGeometry(1, 1);
+  private cityWinMat = basic({ color: 0xe8c890 });
+  private facadeMats = [0x9a6e5c, 0xc0b4a0, 0x9a948e, 0xa88670].map((c) => lambert({ color: c, flatShading: true }));
+  private trimMat = lambert({ color: 0x625a54, flatShading: true });
+  private slateMat = lambert({ color: 0x5a6680, flatShading: true });
+  private copperMat = lambert({ color: 0x5f8a6a, flatShading: true }); // патина
+  private clockMat = basic({ color: 0xf0e0b0 });
+  private cityBox = new THREE.BoxGeometry(1, 1, 1);
+  private cityCyl = new THREE.CylinderGeometry(1, 1, 1, 10);
+  private cityCone = new THREE.ConeGeometry(1, 1, 8);
+  private cityDisk = new THREE.CircleGeometry(1, 16);
 
   private sharedGeos = new Set<THREE.BufferGeometry>([
     ...this.pineGeos,
@@ -2011,6 +2055,8 @@ export class Terrain {
     this.lampGlowGeo,
     this.poleGeo,
     this.poleTopGeo,
+    this.stackGeo, this.tankGeo, this.legGeo, this.coneGeo, this.domeGeo, this.chimneyGeo,
+    this.cityWinGeo, this.cityBox, this.cityCyl, this.cityCone, this.cityDisk,
   ]);
   private firstBuild = true;
   private cragFieldAdded = (this.group.add(this.cragField), true);
@@ -2333,6 +2379,17 @@ export class Terrain {
     // собственной высоте до трёхсот — ориентир такого размера возникал прямо
     // перед носом. В список препятствий скала по-прежнему попадает через свой
     // чанк: физике дальний радиус не нужен, ей нужен ТОТ ЖЕ чанк.
+
+    // ★ ПАРОВОЙ ГОРОД: улица из зданий (city.ts) — каждое строится в чанке
+    // своего центра
+    if (cityWeight(oz) > 0.01) {
+      const bMinX = ox - CHUNK / 2, bMaxX = ox + CHUNK / 2;
+      const bMinZ = oz - CHUNK / 2, bMaxZ = oz + CHUNK / 2;
+      for (const b of cityNear(oz)) {
+        if (!(b.u >= bMinX && b.u < bMaxX && b.z >= bMinZ && b.z < bMaxZ)) continue;
+        this.buildCityBuilding(b, chunk, wx0, oz);
+      }
+    }
 
     // деревня: дома вдоль дороги (варианты окраски и размеров) и фонари
     const village = villageAt(ox, oz);
@@ -2842,6 +2899,187 @@ export class Terrain {
     holder.position.set(wx, gy, c.z);
     this.cragField.add(holder);
     return holder;
+  }
+
+  // ★ ЗДАНИЯ ПАРОВОГО ГОРОДА: детализированные, разнотипные, с крышами, по
+  // которым можно ехать. Корпус уходит вниз на 6 м под площадку (скрывает
+  // уступ террасы), фасад к улице несёт карнизы, окна сеткой, балконы, ворота;
+  // крыша по типу: плоская с парапетом, мансарда, шед, купол, шпиль с часами.
+
+  private buildCityBuilding(b: Building, chunk: THREE.Group, wx0: number, oz: number): void {
+    const g = new THREE.Group();
+    const pad = buildingPad(b);
+    const W = b.hw * 2, L = b.hl * 2, H = b.h;
+    const face = this.facadeMats[(b.style + b.kind) % this.facadeMats.length];
+    const box = (mat: THREE.Material, x: number, y: number, z: number, sx: number, sy: number, sz: number): THREE.Mesh => {
+      const m = new THREE.Mesh(this.cityBox, mat);
+      m.position.set(x, y, z);
+      m.scale.set(sx, sy, sz);
+      g.add(m);
+      return m;
+    };
+    const skirt = 8;
+    if (b.kind === CK.GASHOLDER) {
+      // каркас из стоек и колец, внутри — бак
+      const R = Math.min(b.hw, b.hl) * 0.9;
+      for (let i = 0; i < 8; i++) {
+        const a = (i / 8) * Math.PI * 2;
+        box(this.trimMat, Math.cos(a) * R, H / 2 - skirt / 2, Math.sin(a) * R, 0.35, H + skirt, 0.35);
+      }
+      for (let r = 1; r <= 3; r++) {
+        const ring = new THREE.Mesh(this.cityCyl, this.trimMat);
+        ring.position.y = (H / 3) * r;
+        ring.scale.set(R + 0.3, 0.25, R + 0.3);
+        g.add(ring);
+      }
+      const tank = new THREE.Mesh(this.cityCyl, this.brickMat);
+      tank.position.y = H * 0.35 - skirt / 2;
+      tank.scale.set(R * 0.9, H * 0.7 + skirt, R * 0.9);
+      g.add(tank);
+    } else if (b.kind === CK.DOMEHALL) {
+      const R = Math.min(b.hw, b.hl);
+      const drum = new THREE.Mesh(this.cityCyl, face);
+      drum.position.y = H / 2 - skirt / 2;
+      drum.scale.set(R, H + skirt, R);
+      g.add(drum);
+      const dome = new THREE.Mesh(this.domeGeo, this.brassMat);
+      dome.position.y = H;
+      dome.scale.set(R * 1.05, R * 0.75, R * 1.05);
+      g.add(dome);
+      const spire = new THREE.Mesh(this.cityCone, this.brassMat);
+      spire.position.y = H + R * 0.75 + 1.5;
+      spire.scale.set(0.8, 3, 0.8);
+      g.add(spire);
+      // карниз и пояс окон
+      const cor = new THREE.Mesh(this.cityCyl, this.trimMat);
+      cor.position.y = H - 0.3;
+      cor.scale.set(R + 0.4, 0.5, R + 0.4);
+      g.add(cor);
+    } else {
+      // корпус (с юбкой вниз)
+      box(face, 0, H / 2 - skirt / 2, 0, W, H + skirt, L);
+      // карнизы по этажам и венчающий — на уличном фасаде и торцах
+      const fh = H / b.floors;
+      for (let f = 1; f <= b.floors; f++) {
+        const y = f * fh - 0.15;
+        const cor = box(this.trimMat, b.side * (b.hw + 0.18), y, 0, 0.35, 0.3, L + 0.4);
+        void cor;
+      }
+      box(this.trimMat, 0, H + 0.1, 0, W + 0.5, 0.35, L + 0.5);
+      // балконы
+      if (b.balconies) {
+        for (let f = 1; f < b.floors; f++) {
+          box(this.trimMat, b.side * (b.hw + 0.7), f * fh + 0.1, 0, 1.4, 0.15, L * 0.6);
+          box(this.trimMat, b.side * (b.hw + 1.35), f * fh + 0.6, 0, 0.08, 0.9, L * 0.6);
+        }
+      }
+      // ворота / дверь
+      const doorH = b.kind === CK.FACTORY || b.kind === CK.WAREHOUSE ? fh * 0.8 : 2.4;
+      const doorW = b.kind === CK.FACTORY || b.kind === CK.WAREHOUSE ? 4 : 1.4;
+      const door = new THREE.Mesh(this.cityWinGeo, this.doorMat);
+      door.position.set(b.side * (b.hw + 0.03), doorH / 2, -b.hl * 0.3);
+      door.rotation.y = b.side > 0 ? Math.PI / 2 : -Math.PI / 2;
+      door.scale.set(doorW, doorH, 1);
+      g.add(door);
+      // крыша
+      if (b.roof === 'flat') {
+        for (const [dx, dz, sx, sz] of [[0, b.hl, W, 0.4], [0, -b.hl, W, 0.4], [b.hw, 0, 0.4, L], [-b.hw, 0, 0.4, L]]) {
+          box(this.trimMat, dx, H + 0.6, dz, sx, 1.0, sz);
+        }
+        if (b.kind === CK.WAREHOUSE) {
+          // кран-укосина на крыше
+          box(this.trimMat, 0, H + 3, 0, 0.5, 6, 0.5);
+          box(this.trimMat, b.side * 3, H + 6, 0, 7, 0.4, 0.4);
+        }
+      } else if (b.roof === 'mansard') {
+        box(this.slateMat, 0, H + 1.1, 0, W - 1.2, 2.2, L - 1.2);
+        box(this.trimMat, 0, H + 2.3, 0, W - 2.4, 0.3, L - 2.4);
+        // мансардные окна
+        for (let i = -1; i <= 1; i++) {
+          const dw = new THREE.Mesh(this.cityWinGeo, this.cityWinMat);
+          dw.position.set(b.side * (b.hw - 0.55), H + 1.1, i * L * 0.3);
+          dw.rotation.y = b.side > 0 ? Math.PI / 2 : -Math.PI / 2;
+          dw.scale.set(0.9, 1.1, 1);
+          g.add(dw);
+        }
+      } else if (b.roof === 'saw') {
+        const n = Math.max(2, Math.round(L / 6));
+        for (let i = 0; i < n; i++) {
+          const zc = -b.hl + (i + 0.5) * (L / n);
+          const wedge = new THREE.Mesh(this.roofGeo, this.ironRoofMat);
+          wedge.position.set(0, H, zc);
+          wedge.rotation.y = Math.PI / 2;
+          wedge.scale.set((L / n) / 4.6 * 1.05, 0.9, W / 3.6);
+          g.add(wedge);
+        }
+      } else if (b.roof === 'spire') {
+        const cone = new THREE.Mesh(this.cityCone, this.copperMat);
+        cone.position.y = H + W * 0.9;
+        cone.scale.set(W * 0.75, W * 1.8, W * 0.75);
+        g.add(cone);
+        for (const sd of [-1, 1]) {
+          const ring = new THREE.Mesh(this.cityDisk, this.brassMat);
+          ring.position.set(sd * (b.hw + 0.05), H - W * 0.5, 0);
+          ring.rotation.y = sd > 0 ? Math.PI / 2 : -Math.PI / 2;
+          ring.scale.setScalar(W * 0.42);
+          g.add(ring);
+          const dial = new THREE.Mesh(this.cityDisk, this.clockMat);
+          dial.position.set(sd * (b.hw + 0.1), H - W * 0.5, 0);
+          dial.rotation.y = ring.rotation.y;
+          dial.scale.setScalar(W * 0.34);
+          g.add(dial);
+        }
+      }
+      // трубы
+      const list = this.stacks.get(chunk) ?? [];
+      for (let c = 0; c < b.chimneys; c++) {
+        const tall = b.kind === CK.FACTORY;
+        const ch = tall ? H * 0.9 + 6 : 2.2;
+        const cx = (hash01(b.id + c, 3) - 0.5) * (W - 3);
+        const cz = (hash01(b.id * 3, c + 7) - 0.5) * (L - 3);
+        const st = new THREE.Mesh(tall ? this.stackGeo : this.chimneyGeo, tall ? this.stackMat : this.trimMat);
+        st.position.set(cx, H + ch / 2, cz);
+        st.scale.set(tall ? 2.2 : 1.6, ch, tall ? 2.2 : 1.6);
+        g.add(st);
+        if (tall) list.push({ x: toWorldX(b.u, b.z) + cx, y: pad + H + ch, z: b.z + cz, r: 1.0 });
+      }
+      if (b.kind === CK.FACTORY) this.stacks.set(chunk, list);
+      // ★ ОКНА — инстансами: сетка по уличному фасаду и торцам
+      const cols = Math.max(1, Math.floor(L / 2.6));
+      const rows = b.floors;
+      const total = cols * rows + rows * 2;
+      const wins = new THREE.InstancedMesh(this.cityWinGeo, this.cityWinMat, total);
+      const M = new THREE.Matrix4();
+      const Q = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, b.side > 0 ? Math.PI / 2 : -Math.PI / 2, 0));
+      const S = new THREE.Vector3(1.0, b.kind === CK.FACTORY ? 3.0 : 1.5, 1);
+      let n = 0;
+      for (let f = 0; f < rows; f++) {
+        const y = f * fh + fh * 0.55;
+        for (let c = 0; c < cols; c++) {
+          const zc = -b.hl + (c + 0.5) * (L / cols);
+          M.compose(new THREE.Vector3(b.side * (b.hw + 0.02), y, zc), Q, S);
+          wins.setMatrixAt(n++, M);
+        }
+        // по одному окну на торцах
+        for (const ez of [-1, 1]) {
+          const Q2 = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, ez > 0 ? 0 : Math.PI, 0));
+          M.compose(new THREE.Vector3(b.side * b.hw * 0.3, y, ez * (b.hl + 0.02)), Q2, S);
+          wins.setMatrixAt(n++, M);
+        }
+      }
+      wins.count = n;
+      wins.instanceMatrix.needsUpdate = true;
+      g.add(wins);
+      // вертикальная труба по фасаду цеха
+      if (b.kind === CK.FACTORY) {
+        const pipe = new THREE.Mesh(this.cityCyl, this.pipeMat);
+        pipe.position.set(b.side * (b.hw + 0.5), H / 2, b.hl * 0.55);
+        pipe.scale.set(0.35, H + 1, 0.35);
+        g.add(pipe);
+      }
+    }
+    g.position.set(toWorldX(b.u, b.z) - wx0, pad - 0.15, b.z - oz);
+    chunk.add(g);
   }
 
   /** трубы цехов в радиусе r от точки — для пара */

@@ -245,7 +245,7 @@ export const BIOME_CONTENT: BiomeContent[] = [
     trees: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
     snowOnTrees: false,
     forest: 0,
-    villages: 1.8,
+    villages: 0,   // город строит свой генератор (city.ts), деревни здесь не нужны
     surfaces: ['SOOT', 'SLUSH', 'ICE', 'COBBLE'],
     rough: 0.9,
     drag: 1.04,
@@ -1035,6 +1035,16 @@ export function houseRoof(h: VillageHouse): {
  * геометрия крыши, см. buildRoofGeometry.
  */
 let villagePads: ((v: Village, i: number) => number) | null = null;
+/** ★ крыши города (city.ts) — впрыском, чтобы не замыкать импорт */
+let cityRoof: ((worldX: number, z: number) => { y: number; eave: number; ridge: number } | null) | null = null;
+export function setCityRoof(fn: typeof cityRoof): void {
+  cityRoof = fn;
+}
+/** ★ здания города как препятствия — впрыском (city.ts) */
+let cityObstacles: ((cx: number, cz: number) => Obstacle[]) | null = null;
+export function setCityObstacles(fn: typeof cityObstacles): void {
+  cityObstacles = fn;
+}
 
 /** Высоты площадок домов приходят из terrain.ts (см. villageHeights) */
 export function setVillagePads(fn: (v: Village, i: number) => number): void {
@@ -1047,7 +1057,7 @@ export function villageRoofAt(
 ): { y: number; eave: number; ridge: number } | null {
   const u = toValleyU(worldX, z);
   const v = villageAt(u, z);
-  if (!v) return null;
+  if (!v) return cityRoof ? cityRoof(worldX, z) : null;
   let best: { y: number; eave: number; ridge: number } | null = null;
   for (let hi = 0; hi < v.houses.length; hi++) {
     const h = v.houses[hi];
@@ -1394,6 +1404,10 @@ export function roadClosest(
 let sampleHeight: ((u: number, z: number) => number) | null = null;
 export function setTerrainSampler(fn: (u: number, z: number) => number): void {
   sampleHeight = fn;
+}
+/** высота рельефа (координаты долины) — для генераторов, живущих вне terrain.ts */
+export function terrainSample(u: number, z: number): number {
+  return sampleHeight ? sampleHeight(u, z) : 0;
 }
 
 // --- ПОРОДЫ ДЕРЕВЬЕВ ---
@@ -2126,6 +2140,7 @@ export function obstaclesInChunk(cx: number, cz: number): Obstacle[] {
   // Ставим их ВОЗЛЕ линии спуска, но не на самой оси: коридор ±19 м, скала
   // радиусом до 5 м у его края заставляет свернуть, а не упирается в тебя.
   // всё генерилось в координатах долины — наружу отдаём мировые
+  if (cityObstacles) for (const o of cityObstacles(cx, cz)) list.push(o);
   for (const o of list) o.x = toWorldX(o.x, o.z);
 
   chunkCache.set(key, list);
