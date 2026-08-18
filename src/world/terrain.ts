@@ -60,6 +60,7 @@ import {
   toValleyU,
   railsInChunkWorld,
   surfaceKindAt,
+  lakeAt,
   setTerrainSampler,
   setVillagePads,
   SURF_PACKED,
@@ -361,6 +362,10 @@ function terrainBase(x: number, z: number): number {
   // выше — это явная форма, а не добавка к шуму: внутри чаши рельеф именно
   // такой, каким его видит меш расплава и физика (см. pools.ts).
   if (vwBowl > 0.001) h += poolCarve(x, z, h);
+  // ★ ЗАМЁРЗШИЕ ОЗЁРА ПОЛЯРНОЙ НОЧИ: зеркало выглажено до уровня, берег за
+  // ним поднимается к рельефу — тоже явная форма поверх всего
+  const lk = lakeAt(x, z);
+  if (lk) h += (lk.L - h) * lk.w;
   return h;
 }
 
@@ -1466,7 +1471,8 @@ export function terrainColorAt(
     const tr = PISTE_TINT.r + (0.15 - PISTE_TINT.r) * vw;
     const tg = PISTE_TINT.g + (0.14 - PISTE_TINT.g) * vw;
     const tb = PISTE_TINT.b + (0.135 - PISTE_TINT.b) * vw;
-    const k = pt * (0.75 - vw * 0.1);
+    // на льду (замёрзшие озёра) жёлоб не читается — лёд есть лёд
+    const k = pt * (0.75 - vw * 0.1) * (sk === SURF_ICE ? 0.15 : 1);
     cr += (tr - cr) * k;
     cg += (tg - cg) * k;
     cb += (tb - cb) * k;

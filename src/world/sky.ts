@@ -1,10 +1,11 @@
 import * as THREE from 'three/webgpu';
 import {
   Fn, If, uniform, vec2, vec3, vec4, positionLocal, normalize, clamp, mix, pow, max, dot,
-  smoothstep,
+  smoothstep, floor, fract, sin, float, atan,
 } from 'three/tsl';
 import { PALETTE, SUN_DIR } from './palette';
-import { fbm2 } from '../core/tslnoise';
+import { fbm2, hash2, vnoise2 } from '../core/tslnoise';
+void floor; void fract; void float;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type N = any;
@@ -23,6 +24,8 @@ export function createSky(): Sky {
   const uSunDir = uniform(SUN_DIR);
   const uFog = uniform(PALETTE.fog);
   const uTime = uniform(0);
+  const uAurora = uniform(0);
+  const uStars = uniform(0);
 
   const mat = new THREE.MeshBasicNodeMaterial({
     side: THREE.BackSide,
@@ -62,6 +65,9 @@ export function createSky(): Sky {
       // самого горизонта, иначе их просто не видно.
       const band = smoothstep(0.012, 0.06, dir.y).mul(smoothstep(0.5, 1.0, dir.y).mul(0.4).oneMinus());
       cov.mulAssign(band);
+      // ★ ПОЛЯРНОЙ НОЧЬЮ НЕБО ЯСНОЕ: облака редеют — иначе они закрывают звёзды
+      // и сияние, а подсвеченный луной слой читается серым дневным небом
+      cov.mulAssign(uAurora.mul(0.8).oneMinus());
 
       // Свет: кромка, обращённая к солнцу, горит, тело клочка остаётся
       // холодным. Разницу берём из того же шума со сдвигом к солнцу — дёшево
@@ -76,7 +82,37 @@ export function createSky(): Sky {
         uSunColor,
         lit.mul(pow(s, 1.5).mul(0.55).add(0.35)).mul(mix(0.35, 1.0, uHalo))
       );
-      col.assign(mix(col, cloud, cov.mul(0.92)));
+      col.assign(mix(col, cloud.mul(uAurora.mul(0.6).oneMinus()), cov.mul(0.92)));
+    });
+
+    // ★ ПОЛЯРНАЯ НОЧЬ: ЗВЁЗДЫ И СЕВЕРНОЕ СИЯНИЕ. Оба слоя весят по биому:
+    // днём их нет вовсе. Звёзды — редкие ячейки хэша по направлению, мерцают;
+    // сияние — занавес на условной высоте (та же проекция, что у облаков),
+    // складки бегут по шуму, снизу зелёный, сверху уходит в фиолетовый.
+    If(uStars.greaterThan(0.001).and(dir.y.greaterThan(0.02)), () => {
+      const cell = dir.xz.div(dir.y.add(0.35)).mul(70.0);
+      const h = hash2(cell);
+      const h2 = hash2(cell.add(vec2(17.0, 91.0)));
+      const star = smoothstep(0.9965, 1.0, h);
+      const twinkle = sin(uTime.mul(h2.mul(4.0).add(1.5)).add(h2.mul(50.0))).mul(0.35).add(0.65);
+      const fade = smoothstep(0.02, 0.2, dir.y);
+      col.addAssign(vec3(0.9, 0.95, 1.1).mul(star).mul(twinkle).mul(fade).mul(uStars).mul(0.9));
+    });
+    If(uAurora.greaterThan(0.001).and(dir.y.greaterThan(0.04)), () => {
+      // занавес — в координатах азимут × высота: складки идут поперёк
+      // азимута, медленно плывут и колышутся; так он висит по всему куполу,
+      // а не только у горизонта
+      const az = atan(dir.x, dir.z).mul(2.2);
+      const wave = vnoise2(vec2(az.mul(0.7).add(uTime.mul(0.02)), dir.y.mul(0.8).add(uTime.mul(0.006)))).mul(1.8);
+      const ripple = vnoise2(vec2(az.mul(3.2).sub(uTime.mul(0.05)), dir.y.mul(1.4).add(wave)));
+      const band = smoothstep(0.52, 0.8, ripple.mul(0.6).add(wave.mul(0.35)));
+      // по высоте: снизу резкая кромка, вверх занавес тает
+      const hgt = smoothstep(0.03, 0.12, dir.y).mul(smoothstep(0.9, 0.35, dir.y));
+      const k = band.mul(hgt).mul(uAurora);
+      const green = vec3(0.16, 0.95, 0.42);
+      const violet = vec3(0.55, 0.25, 0.85);
+      const acol = mix(green, violet, smoothstep(0.15, 0.6, dir.y));
+      col.addAssign(acol.mul(k).mul(0.55));
     });
 
     // Ниже горизонта небо — ровно цвет тумана: щели между слоями мира
@@ -105,6 +141,8 @@ export function createSky(): Sky {
       // цвета в юниформах общие по ссылке, а число надо переносить руками
       uHalo.value = PALETTE.skyHalo;
       uDim.value = PALETTE.skyDim;
+      uAurora.value = PALETTE.aurora;
+      uStars.value = PALETTE.stars;
     },
   };
 }

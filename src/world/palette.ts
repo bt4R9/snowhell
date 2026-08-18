@@ -32,6 +32,9 @@ export const PALETTE = {
   skyDim: 1,
   /** порода дальних кулис (под снегом) */
   backdropRock: new THREE.Color(0x4a4657),
+  /** ★ ПОЛЯРНАЯ НОЧЬ: сила северного сияния и звёзд в куполе (0 — нет) */
+  aurora: 0,
+  stars: 0,
 };
 
 export const SUN_DIR = new THREE.Vector3(0.35, 0.14, 0.85).normalize();

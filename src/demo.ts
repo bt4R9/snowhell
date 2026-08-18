@@ -24,6 +24,8 @@ export const enum Stage {
    */
   Approach,
   Doom,
+  /** ★ ПОСЛЕ БАШНИ СПУСК ПРОДОЛЖАЕТСЯ: полярная ночь — выдох, свободная езда */
+  Night,
   Win,
 }
 
@@ -142,7 +144,8 @@ export class Demo {
     return (
       this.stage === Stage.Snow ||
       this.stage === Stage.Volcano ||
-      this.stage === Stage.Approach
+      this.stage === Stage.Approach ||
+      this.stage === Stage.Night
     );
   }
 
@@ -285,9 +288,18 @@ export class Demo {
             ? { title: '', lines: [...DOOM_LINE, ...GO_ON], dim: 0.3 }
             : null;
         }
-        if (this.t > this.saidT + DOOM_T) step(Stage.Win);
+        if (this.t > this.saidT + DOOM_T) step(Stage.Night);
         return null;
       }
+
+      case Stage.Night:
+        // ★ ОКО РАЗБИТО — ЕДЕМ ДАЛЬШЕ. Короткий титр и тишина: впереди ночь,
+        // замёрзшие озёра и сияние; никаких вставок, только склон.
+        this.towerRise = -1;
+        this.camToTower = 0;
+        return this.t < 6
+          ? { title: '', lines: ['THE EYE IS BROKEN.', ' ', 'THE MOUNTAIN IS QUIET NOW.'], dim: 0.12 }
+          : null;
 
       default:
         return {

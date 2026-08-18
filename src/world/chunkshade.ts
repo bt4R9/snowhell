@@ -349,7 +349,7 @@ export class ChunkShader {
         const tr = float(PISTE_TINT.r).add(vw.mul(0.15 - PISTE_TINT.r));
         const tg = float(PISTE_TINT.g).add(vw.mul(0.14 - PISTE_TINT.g));
         const tb = float(PISTE_TINT.b).add(vw.mul(0.135 - PISTE_TINT.b));
-        const k = pt.mul(vw.mul(-0.1).add(0.75));
+        const k = pt.mul(vw.mul(-0.1).add(0.75)).mul(select(sk.equal(float(SURF_ICE)), float(0.15), float(1.0)));
         cr.addAssign(tr.sub(cr).mul(k));
         cg.addAssign(tg.sub(cg).mul(k));
         cbl.addAssign(tb.sub(cbl).mul(k));

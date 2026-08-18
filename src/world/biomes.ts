@@ -49,9 +49,13 @@ export interface BiomeDef {
   peakSnow?: number;
   /** порода дальних кулис */
   backdropRock?: THREE.Color;
+  /** северное сияние и звёзды в куполе (полярная ночь) */
+  aurora?: number;
+  stars?: number;
 }
 
 const c = (hex: number) => new THREE.Color(hex);
+const AUR = new THREE.Color();
 
 // Пока один биом: ночь и день слиты, деревни встречаются по всему спуску.
 // Следующие биомы (город, киберпанк, река с водопадом) добавляются сюда же —
@@ -198,6 +202,38 @@ export const BIOMES: BiomeDef[] = [
     fogNear: 240,
     fogFar: 3000,
   },
+  {
+    // ★ ПОЛЯРНАЯ НОЧЬ. Выдох после вулкана: чёрно-синее небо со звёздами и
+    // северным сиянием, луна вместо солнца, замёрзшие озёра, тишина. Свет —
+    // холодный и слабый, но снег читается: полусфера голубая, сияние
+    // подмешивает зелёный сверху (см. BiomeManager.update).
+    name: 'polar-night',
+    skyZenith: c(0x070a16),
+    skyHorizon: c(0x1c2a48),
+    sun: c(0xbfd0ff),           // луна
+    fog: c(0x1a2238),
+    snowTint: c(0x98a8c8),
+    distTint: c(0x7484a4),
+    airColor: c(0xdfe8ff),
+    airOpacity: 0.5,
+    pine: c(0x8fa2c8),          // иней на лапах
+    hemiSky: c(0x5a6fa8),
+    hemiGround: c(0x2a3350),
+    sunDir: new THREE.Vector3(-0.35, 0.55, 0.6).normalize(),
+    sunIntensity: 0.38,
+    skyHalo: 0.16,
+    skyDim: 0.9,
+    hemiIntensity: 0.65,
+    ambient: c(0x3a4a78),
+    ambientIntensity: 0.24,
+    fogNear: 260,
+    fogFar: 3400,
+    backdropSnow: 1,
+    peakSnow: 1,
+    backdropRock: c(0x2c3448),
+    aurora: 1,
+    stars: 1,
+  },
 ];
 
 export class BiomeManager {
@@ -232,6 +268,8 @@ export class BiomeManager {
     PALETTE.skyHalo = lerp(A.skyHalo, B.skyHalo);
     PALETTE.peakSnow = lerp(A.peakSnow ?? 1, B.peakSnow ?? 1);
     PALETTE.skyDim = lerp(A.skyDim ?? 1, B.skyDim ?? 1);
+    PALETTE.aurora = lerp(A.aurora ?? 0, B.aurora ?? 0);
+    PALETTE.stars = lerp(A.stars ?? 0, B.stars ?? 0);
     SUN_DIR.lerpVectors(A.sunDir, B.sunDir, k).normalize();
 
     this.sun.color.copy(PALETTE.sun);
@@ -239,6 +277,14 @@ export class BiomeManager {
     this.ambient.color.lerpColors(A.ambient, B.ambient, k);
     this.ambient.intensity = lerp(A.ambientIntensity, B.ambientIntensity);
     this.hemi.color.lerpColors(A.hemiSky, B.hemiSky, k);
+    // ★ СИЯНИЕ ПОДСВЕЧИВАЕТ СНЕГ СВЕРХУ: медленный зелёный пульс в небесной
+    // составляющей полусферы — иначе занавес в небе, а земля его не знает
+    if (PALETTE.aurora > 0.001) {
+      const tt = performance.now() * 0.001;
+      const pulse = 0.55 + 0.45 * Math.sin(tt * 0.35) * Math.sin(tt * 0.11 + 1.3);
+      AUR.setRGB(0.42, 0.9, 0.62);
+      this.hemi.color.lerp(AUR, PALETTE.aurora * 0.22 * pulse);
+    }
     this.hemi.groundColor.lerpColors(A.hemiGround, B.hemiGround, k);
     this.hemi.intensity = lerp(A.hemiIntensity, B.hemiIntensity);
 

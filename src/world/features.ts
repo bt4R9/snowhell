@@ -143,7 +143,10 @@ export const BIOME_BLEND = 600;
 // друг от друга оба конца. Между ними встаёт голая высокогорная зона выше
 // границы леса — камень, фирн, ни деревьев, ни жилья. Она родня обоим: в неё
 // естественно уходит альпийский лес и из неё естественно рождается вулкан.
-export const N_BIOMES = 3;
+// ★ ЧЕТВЁРТЫЙ БИОМ — ПОЛЯРНАЯ НОЧЬ (индекс 3): выдох после вулкана. Замёрзшие
+// озёра, редкие заиндевевшие ели, северное сияние — красиво и спокойно, без
+// врагов; играется чистым скольжением.
+export const N_BIOMES = 4;
 
 /**
  * Содержимое биома: чем он населён. Веса пород — те же индексы, что в
@@ -235,6 +238,19 @@ export const BIOME_CONTENT: BiomeContent[] = [
     grip: 0.9,
     accel: 0.97,
   },
+  {
+    // ПОЛЯРНАЯ НОЧЬ: редкие ели в инее, никакого сухостоя; хутора с фонарями —
+    // единственные тёплые точки. Наст гладкий и быстрый — биом про скольжение.
+    trees: [1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+    snowOnTrees: true,
+    forest: 0.4,
+    villages: 0.5,
+    surfaces: ['CRUST', 'POWDER', 'ICE', 'ROCK'],
+    rough: 0.75,
+    drag: 0.92,
+    grip: 0.96,
+    accel: 1.03,
+  },
 ];
 
 /** Содержимое преобладающего биома — для имён и флагов, которые не смешать */
@@ -313,6 +329,91 @@ export function volcanoWeight(z: number): number {
   return biomeWeightAt(z, 0);
 }
 
+/** вес полярной ночи в точке: 0 — день, 1 — ночь с сиянием */
+export function nightWeight(z: number): number {
+  return biomeWeightAt(z, 3);
+}
+
+// --- ЗАМЁРЗШИЕ ОЗЁРА (полярная ночь) ---------------------------------------
+// ★ ОЗЕРО — ЭТО ПЛОСКОСТЬ В СКЛОНЕ. Раз в LAKE_STEP по спуску, в ночном биоме,
+// на трассе или чуть сбоку лежит эллипс льда: рельеф выглажен до уровня L,
+// покрытие — лёд (см. surfaceKindAt), деревья на нём не растут. Игрок
+// выкатывается на зеркало и скользит — это и есть «медитативность» биома.
+export interface Lake {
+  u: number; z: number;   // центр (координаты долины)
+  ru: number; rz: number; // полуоси
+  L: number;              // уровень льда в центре
+  /** ★ ЛЁД — НАКЛОННАЯ ПЛОСКОСТЬ: уклон вдоль и поперёк долины снят с рельефа
+   * по краям озера, иначе на склоне у верхнего берега вырастал обрыв, а у
+   * нижнего — стена. Зеркало гладкое, но лежит по среднему уклону. */
+  gz: number;
+  gu: number;
+  ph: number[];           // фазы гармоник берега
+  amp: number[];
+}
+const LAKE_STEP = 520;
+const lakeCache = new Map<number, Lake | null>();
+let lakeOff = false;
+
+export function lakeAtSite(k: number): Lake | null {
+  const hit = lakeCache.get(k);
+  if (hit !== undefined) return hit;
+  let res: Lake | null = null;
+  const z = k * LAKE_STEP + 260 + (hash2(k * 17 + 3, 61) - 0.5) * 160;
+  if (nightWeight(z) > 0.7 && hash2(k * 31 + 5, 67) < 0.7 && sampleHeight) {
+    const u = pisteCenterX(z) + (hash2(k * 13 + 1, 71) - 0.5) * 70;
+    const ru = 60 + hash2(k * 7 + 2, 73) * 70;
+    const rz = ru * (1.3 + hash2(k * 11 + 4, 79) * 0.9);
+    // уровень — по естественной земле в центре, чуть ниже: берег виден
+    lakeOff = true;
+    const L = sampleHeight(u, z) - 1.2;
+    const gz = (sampleHeight(u, z + rz) - sampleHeight(u, z - rz)) / (2 * rz);
+    const gu = (sampleHeight(u + ru, z) - sampleHeight(u - ru, z)) / (2 * ru);
+    lakeOff = false;
+    const ph: number[] = [];
+    const amp: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      ph.push(hash2(k * 23 + i, 83) * Math.PI * 2);
+      amp.push((0.08 / (i + 1)) * (0.5 + hash2(k * 29 + i, 89)));
+    }
+    res = { u, z, ru, rz, L, gz, gu, ph, amp };
+  }
+  lakeCache.set(k, res);
+  if (lakeCache.size > 256) lakeCache.clear();
+  return res;
+}
+
+/** нормированное расстояние до берега (1 — берег) и само озеро */
+function lakeDn(l: Lake, u: number, z: number): number {
+  const du = (u - l.u) / l.ru;
+  const dz = (z - l.z) / l.rz;
+  const d = Math.hypot(du, dz);
+  const th = Math.atan2(dz, du);
+  let k = 1;
+  for (let i = 0; i < 4; i++) k += l.amp[i] * Math.cos((i + 1) * th + l.ph[i]);
+  return d / k;
+}
+
+/**
+ * Озеро в точке: вес 0..1 (1 — на льду, спад к берегу) и уровень.
+ * Ищем в двух соседних площадках — эллипсы могут заходить за шаг.
+ */
+export function lakeAt(u: number, z: number): { w: number; L: number } | null {
+  if (lakeOff) return null;
+  const k0 = Math.floor(z / LAKE_STEP);
+  for (let k = k0 - 1; k <= k0 + 1; k++) {
+    const l = lakeAtSite(k);
+    if (!l) continue;
+    if (Math.abs(z - l.z) > l.rz * 1.3 || Math.abs(u - l.u) > l.ru * 1.3) continue;
+    const dn = lakeDn(l, u, z);
+    if (dn >= 1.18) continue;
+    // внутри — плоско; берег: за 18% радиуса рельеф возвращается
+    const w = dn < 1 ? 1 : 1 - (dn - 1) / 0.18;
+    return { w: w * w * (3 - 2 * w), L: l.L + l.gz * (z - l.z) + l.gu * (u - l.u) };
+  }
+  return null;
+}
+
 
 /**
  * ★ ПОРЯДОК СПУСКА ЗАДАЁТСЯ ЗДЕСЬ, А НЕ ПОРЯДКОМ В МАССИВАХ. Спуск обязан
@@ -322,7 +423,8 @@ export function volcanoWeight(z: number): number {
  * значило бы чинить это во всех местах разом; вместо этого переставляем
  * ПОСЛЕДОВАТЕЛЬНОСТЬ: снег → вулкан → высокогорье → снова снег.
  */
-const BIOME_ORDER = [1, 0, 2];
+// снег → вулкан → полярная ночь (выдох) → высокогорье → снова снег
+const BIOME_ORDER = [1, 0, 3, 2];
 
 export function biomeInfoAt(z: number): { a: number; b: number; t: number } {
   const i = Math.floor(z / BIOME_LEN);
@@ -411,6 +513,9 @@ export function surfField(u: number, v: number): number {
 }
 
 export function surfaceKindAt(u: number, v: number): number {
+  // ★ ЗАМЁРЗШЕЕ ОЗЕРО — ВСЕГДА ЛЁД (полярная ночь)
+  const lk = lakeAt(u, v);
+  if (lk && lk.w > 0.5) return SURF_ICE;
   // земля вытаивает редкими небольшими пятнами и только вне трассы
   const du = u + noise2(u * 0.02 + 5.5, v * 0.02 + 1.9) * 12;
   const dv = v + noise2(u * 0.02 - 9.1, v * 0.02 + 6.4) * 12;
