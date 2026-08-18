@@ -1490,6 +1490,7 @@ export function terrainColorAt(
 
 import { damage } from '../fx/damage';
 import { bandProfile } from './slice';
+import { SHIPS } from './airships';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type N = any;
@@ -1550,6 +1551,13 @@ export class Terrain {
     for (let i = 0; i < GLOWS; i++) {
       u[i].set(arr[i * 4], arr[i * 4 + 1], Math.max(1, arr[i * 4 + 2]), arr[i * 4 + 3]);
     }
+  }
+
+  /** тени дирижаблей: [x, z, длина, сила] × SHIPS */
+  setShips(arr: Float32Array): void {
+    if (!this.matUniforms) return;
+    const u = this.matUniforms.uShips.array as THREE.Vector4[];
+    for (let i = 0; i < SHIPS; i++) u[i].set(arr[i * 4], arr[i * 4 + 1], Math.max(1, arr[i * 4 + 2]), arr[i * 4 + 3]);
   }
 
   /** вес полярной ночи у игрока — включает блёстки на снегу */
@@ -1621,8 +1629,10 @@ export class Terrain {
     const uMark = uniformArray(Array.from({ length: WAVES }, () => new THREE.Vector4(0, 0, 0, 0)));
     // ★ ПОЛЯРНАЯ НОЧЬ: снег искрится под луной (блёстки-звёздочки, мерцают)
     const uNight = uniform(0);
+    // ★ ТЕНИ ДИРИЖАБЛЕЙ: эллипсы (x, z, длина, сила), вытянутые вдоль долины
+    const uShips = uniformArray(Array.from({ length: SHIPS }, () => new THREE.Vector4(0, 0, 1, 0)));
     // DEV: 0 — обычный вывод, 1..6 — визуализация слагаемых трещин (cr, hot, heat, plate, rift, craze)
-    this.matUniforms = { uGlowCol, uHazCol, uTime, uSpot, uSpotCol, uSpotDir, uGlow, uWave, uMark, uNight };
+    this.matUniforms = { uGlowCol, uHazCol, uTime, uSpot, uSpotCol, uSpotDir, uGlow, uWave, uMark, uNight, uShips };
 
     const aGlow: N = attribute('aGlow', 'float');
     const aHazard: N = attribute('aHazard', 'float');
@@ -1835,6 +1845,18 @@ export class Terrain {
         const wall = smoothstep(0.55, 0.05, abs(nrm.y));
         col.addAssign(diffuseColor.rgb.mul(wall).mul(0.3));
       }
+      // ★ ТЕНИ ДИРИЖАБЛЕЙ на склоне: мягкий эллипс, вытянутый вдоль долины
+      Loop({ start: 0, end: SHIPS, type: 'int', condition: '<' }, ({ i }: { i: N }) => {
+        const sh: N = uShips.element(i);
+        If(sh.w.greaterThan(0.001), () => {
+          const dx = w.x.sub(sh.x).div(sh.z.mul(0.2));
+          const dz = w.y.sub(sh.y).div(sh.z.mul(0.55));
+          const e = dx.mul(dx).add(dz.mul(dz));
+          const k = smoothstep(1.0, 0.55, e).mul(sh.w);
+          col.mulAssign(k.oneMinus());
+        });
+      });
+
       // ★ БЛЁСТКИ НА СНЕГУ ПОЛЯРНОЙ НОЧЬЮ: редкие ячейки вспыхивают и гаснут —
       // без них ночной снег читался ровной серой заливкой
       If(uNight.greaterThan(0.01), () => {

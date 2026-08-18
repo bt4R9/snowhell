@@ -203,36 +203,35 @@ export const BIOMES: BiomeDef[] = [
     fogFar: 3000,
   },
   {
-    // ★ ПОЛЯРНАЯ НОЧЬ. Выдох после вулкана: чёрно-синее небо со звёздами и
-    // северным сиянием, луна вместо солнца, замёрзшие озёра, тишина. Свет —
-    // холодный и слабый, но снег читается: полусфера голубая, сияние
-    // подмешивает зелёный сверху (см. BiomeManager.update).
-    name: 'polar-night',
-    skyZenith: c(0x070a16),
-    skyHorizon: c(0x1c2a48),
-    sun: c(0xbfd0ff),           // луна
-    fog: c(0x1a2238),
-    snowTint: c(0x98a8c8),
-    distTint: c(0x7484a4),
-    airColor: c(0xdfe8ff),
-    airOpacity: 0.5,
-    pine: c(0x8fa2c8),          // иней на лапах
-    hemiSky: c(0x5a6fa8),
-    hemiGround: c(0x2a3350),
-    sunDir: new THREE.Vector3(-0.35, 0.55, 0.6).normalize(),
-    sunIntensity: 0.38,
-    skyHalo: 0.16,
-    skyDim: 0.9,
-    hemiIntensity: 0.65,
-    ambient: c(0x3a4a78),
-    ambientIntensity: 0.24,
-    fogNear: 260,
-    fogFar: 3400,
-    backdropSnow: 1,
-    peakSnow: 1,
-    backdropRock: c(0x2c3448),
-    aurora: 1,
-    stars: 1,
+    // ★ ПАРОВОЙ ГОРОД (стимпанк). Долина в смоге: небо сепия, солнце —
+    // бледное пятно, снег серый от сажи, медь и ржавчина на цехах, белый пар.
+    // Дирижабли в небе кладут тени на склон (см. world/airships.ts).
+    name: 'steam-city',
+    skyZenith: c(0x4e4844),
+    skyHorizon: c(0x9c8a76),
+    sun: c(0xf0d0a0),
+    fog: c(0x7a7470),
+    snowTint: c(0x8f9094),
+    distTint: c(0x6e6a68),
+    airColor: c(0x4a443e),   // хлопья сажи
+    airOpacity: 0.55,
+    pine: c(0x5a544e),
+    hemiSky: c(0x8e8680),
+    hemiGround: c(0x504a46),
+    sunDir: new THREE.Vector3(0.45, 0.32, 0.8).normalize(),
+    sunIntensity: 1.1,
+    skyHalo: 0.55,
+    skyDim: 0.85,
+    hemiIntensity: 0.85,
+    ambient: c(0x7c746c),
+    ambientIntensity: 0.3,
+    fogNear: 200,
+    fogFar: 2600,
+    backdropSnow: 0.5,
+    peakSnow: 0.5,
+    backdropRock: c(0x3a322c),
+    aurora: 0,
+    stars: 0,
   },
 ];
 

@@ -298,7 +298,7 @@ export class Demo {
         this.towerRise = -1;
         this.camToTower = 0;
         return this.t < 6
-          ? { title: '', lines: ['THE EYE IS BROKEN.', ' ', 'THE MOUNTAIN IS QUIET NOW.'], dim: 0.12 }
+          ? { title: '', lines: ['THE EYE IS BROKEN.', ' ', 'SMOKE AHEAD. THE FURNACE CITY.'], dim: 0.12 }
           : null;
 
       default:
