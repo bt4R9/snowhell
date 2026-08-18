@@ -1709,6 +1709,23 @@ export class Player {
    * ★ ГОРЯЩАЯ ГЛЫБА. Катящаяся бьёт (кувырок, отброс, ожог), лежащая — просто
    * камень: выталкивает и чуть тормозит, но обжигает, пока горячая.
    */
+  /** ★ ВАГОНЕТКА: сбивает с рейла/с ног без ожога */
+  knock(dx: number, dz: number, push: number): boolean {
+    if (this.tumbleT > 0 || this.meltT > 0 || this.hitCooldown > 0) return false;
+    this.hitCooldown = HIT_COOLDOWN;
+    this.grinding = false;
+    this.grindRail = null;
+    this.velH.multiplyScalar(0.35);
+    this.velH.x += dx * 7 * push;
+    this.velH.z += dz * 7 * push;
+    this.vy = Math.max(this.vy, 3 + push * 3);
+    this.grounded = false;
+    this.tumbleT = TUMBLE_TIME;
+    this.crashed = true;
+    this.trickYaw = 0; this.trickFlip = 0; this.spinVel = 0; this.flipVel = 0; this.airTime = 0;
+    return true;
+  }
+
   boulderHit(push: number, dx: number, dz: number, heat: number): boolean {
     if (this.tumbleT > 0 || this.meltT > 0) return false;
     // выталкиваем всегда — сквозь камень не проехать

@@ -2176,8 +2176,9 @@ export function railInCell(rcx: number, rcz: number): Rail | null {
   // действующем вулкане взяться неоткуда.
   if (volcanoWeight(sz) > 0.15) return miss();
   // и в полярной ночи их тоже нет — там пустой быстрый склон
-  if (nightWeight(sz) > 0.15) return miss();
-  if (hash2(rcz * 23 + 4, 9) < 1 - 0.82 * wr) return miss();
+  // ★ В ПАРОВОМ ГОРОДЕ РЕЙЛЫ — УЗКОКОЛЕЙКА, и её много: почти каждая клетка
+  const city = cityWeight(sz) > 0.5;
+  if (hash2(rcz * 23 + 4, 9) < (city ? 0.12 : 1 - 0.82 * wr)) return miss();
   if (nearSpawn(sx, sz)) return miss();
 
   // РЕЙЛ ИДЁТ ПАРАЛЛЕЛЬНО ТРАССЕ, а не по собственному компасу. Раньше линия

@@ -62,6 +62,7 @@ import {
   railsInChunkWorld,
   surfaceKindAt,
   lakeAt,
+  cityWeight,
   setTerrainSampler,
   setVillagePads,
   SURF_PACKED,
@@ -1964,6 +1965,7 @@ export class Terrain {
   private coneGeo = new THREE.ConeGeometry(1.15, 0.7, 10);
   /** ★ трубы цехов, из которых идёт пар: мировые координаты верха, по чанкам */
   private stacks = new Map<THREE.Group, Array<{ x: number; y: number; z: number; r: number }>>();
+  private steelMat = lambert({ color: 0x8c8f96, flatShading: true });
   private lampPoleGeo = new THREE.CylinderGeometry(0.06, 0.09, 3.1, 5);
   private lampGlowGeo = new THREE.SphereGeometry(0.24, 8, 6);
 
@@ -2571,16 +2573,33 @@ export class Terrain {
           (a.z + b.z) / 2 - oz
         );
 
-        const bar = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.18, fullLen), this.railMat);
-        bar.position.copy(mid).addScaledVector(railUp, -0.09);
-        bar.quaternion.setFromRotationMatrix(m);
-        chunk.add(bar);
+        const cityRail = cityWeight(mz) > 0.5;
+        if (cityRail) {
+          // ★ УЗКОКОЛЕЙКА: две стальные нитки на шпалах — по ней ходят
+          // вагонетки (world/carts.ts) и по ней же грайндит райдер
+          for (const side of [-0.42, 0.42]) {
+            const rl = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.14, fullLen), this.steelMat);
+            rl.position.copy(mid).addScaledVector(railUp, -0.06).addScaledVector(right, side);
+            rl.quaternion.setFromRotationMatrix(m);
+            chunk.add(rl);
+          }
+          // шпалы — одной лентой (отдельные шпалы = сотни мешей на рейл)
+          const bed = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.1, fullLen), this.woodMat);
+          bed.position.copy(mid).addScaledVector(railUp, -0.18);
+          bed.quaternion.setFromRotationMatrix(m);
+          chunk.add(bed);
+        } else {
+          const bar = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.18, fullLen), this.railMat);
+          bar.position.copy(mid).addScaledVector(railUp, -0.09);
+          bar.quaternion.setFromRotationMatrix(m);
+          chunk.add(bar);
 
-        // яркая кромка сверху — чтобы рейл читался даже при заходе в лоб
-        const strip = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.06, fullLen), this.flagMat);
-        strip.position.copy(mid).addScaledVector(railUp, 0.03);
-        strip.quaternion.setFromRotationMatrix(m);
-        chunk.add(strip);
+          // яркая кромка сверху — чтобы рейл читался даже при заходе в лоб
+          const strip = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.06, fullLen), this.flagMat);
+          strip.position.copy(mid).addScaledVector(railUp, 0.03);
+          strip.quaternion.setFromRotationMatrix(m);
+          chunk.add(strip);
+        }
 
         if (r.ledge) {
           // парапет: сплошная каменная лента под линией скольжения,
