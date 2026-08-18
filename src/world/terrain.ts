@@ -113,7 +113,8 @@ function descentSlopeAt(v: number): number {
   // ★ В ПАРОВОМ ГОРОДЕ СКЛОН ПОЛОЖЕ (×0.6): город на 33° не стоит, да и
   // улица между фасадами читается на пологом. Множитель под интегралом —
   // высота остаётся честной первообразной, переход плавный по весу биома.
-  const cityK = 1 - 0.4 * cityWeight(v);
+  // ×0.45: в городе скорость ниже — есть время читать развилки и улицы
+  const cityK = 1 - 0.55 * cityWeight(v);
   return (R.slope + R.slopeWave * Math.sin(v * F1 + P1) + S2 * Math.sin(v * F2 + P2)) *
     Math.sqrt(1 + sl * sl) * WARMUP.slope(v) * volcanoEase(v) * cityK;
 }
