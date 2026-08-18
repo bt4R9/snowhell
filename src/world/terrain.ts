@@ -1952,6 +1952,18 @@ export class Terrain {
   private shopWinGeo = new THREE.PlaneGeometry(2.4, 1.1);
   private belfryGeo = new THREE.BoxGeometry(0.9, 1.1, 0.9);
   private spireGeo = new THREE.ConeGeometry(0.75, 1.6, 4);
+  // ★ ПАРОВОЙ ГОРОД: кирпич цехов, железо крыш, топки в окнах, трубы, бак башни
+  private brickMat = lambert({ color: 0x6a4a3e, flatShading: true });
+  private ironRoofMat = lambert({ color: 0x4a4b52, flatShading: true, side: THREE.DoubleSide });
+  private furnaceWinMat = basic({ color: 0xffa040 });
+  private stackGeo = new THREE.CylinderGeometry(0.42, 0.55, 1.0, 6);
+  private stackMat = lambert({ color: 0x3e3230, flatShading: true });
+  private tankGeo = new THREE.CylinderGeometry(1.0, 1.0, 1.0, 10);
+  private tankMat = lambert({ color: 0x5c4634, flatShading: true });
+  private legGeo = new THREE.BoxGeometry(0.16, 1.0, 0.16);
+  private coneGeo = new THREE.ConeGeometry(1.15, 0.7, 10);
+  /** ★ трубы цехов, из которых идёт пар: мировые координаты верха, по чанкам */
+  private stacks = new Map<THREE.Group, Array<{ x: number; y: number; z: number; r: number }>>();
   private lampPoleGeo = new THREE.CylinderGeometry(0.06, 0.09, 3.1, 5);
   private lampGlowGeo = new THREE.SphereGeometry(0.24, 8, 6);
 
@@ -2338,29 +2350,87 @@ export class Terrain {
           }
           skirt = Math.min(skirt, 14);
         }
-        const body = new THREE.Mesh(this.houseGeo, this.houseMats[h.style]);
-        body.position.y = (bodyH - skirt) / 2;
-        body.scale.set(wide, (bodyH + skirt) / 2.4, deep);
-        house.add(body);
+        const isFactory = kind === HK.FACTORY;
+        const isTower = kind === HK.TOWER;
+        const bodyMat = isFactory ? this.brickMat : this.houseMats[h.style];
+        if (!isTower) {
+          const body = new THREE.Mesh(this.houseGeo, bodyMat);
+          body.position.y = (bodyH - skirt) / 2;
+          body.scale.set(wide, (bodyH + skirt) / 2.4, deep);
+          house.add(body);
+        }
 
         // Крыша со СВЕСОМ: у альпийского дома она заметно шире корпуса, и
         // именно свес делает силуэт узнаваемым.
         const roofPitch = h.roofPitch;
         const roofW = wide * 1.16;
         const roofD = deep * 1.16;
-        const roof = new THREE.Mesh(this.roofGeo, this.roofMats[h.style]);
-        roof.position.y = bodyH;
-        roof.scale.set(roofW, roofPitch, roofD);
-        house.add(roof);
-        // Снежная шапка ПОВТОРЯЕТ скат и лежит поверх него. Ошибка первой
-        // версии: шапке дали 0.62 от высоты ската — она оказалась ВНУТРИ
-        // крыши и не была видна вовсе.
-        const cap = new THREE.Mesh(this.snowCapGeo, this.roofSnowMat);
-        cap.position.y = bodyH + 0.13;
-        cap.scale.set(roofW * 1.05, roofPitch * 1.01, roofD * 1.04);
-        house.add(cap);
+        if (!isTower) {
+          const roof = new THREE.Mesh(this.roofGeo, isFactory ? this.ironRoofMat : this.roofMats[h.style]);
+          roof.position.y = bodyH;
+          roof.scale.set(roofW, roofPitch, roofD);
+          house.add(roof);
+          // Снежная шапка ПОВТОРЯЕТ скат и лежит поверх него. Ошибка первой
+          // версии: шапке дали 0.62 от высоты ската — она оказалась ВНУТРИ
+          // крыши и не была видна вовсе. У цеха снег на железе серый от сажи.
+          const cap = new THREE.Mesh(this.snowCapGeo, this.roofSnowMat);
+          cap.position.y = bodyH + 0.13;
+          cap.scale.set(roofW * 1.05, roofPitch * 1.01, roofD * 1.04);
+          house.add(cap);
+        }
 
-        if (h.chimney) {
+        if (isFactory) {
+          // ★ ЦЕХ: две-три высокие трубы (пар из них — см. stacks), ряд высоких
+          // окон, за которыми топки
+          const nSt = 2 + (hash01(h.x, h.z * 2) > 0.5 ? 1 : 0);
+          const stH = bodyH * (2.2 + hash01(h.z, h.x) * 1.4);
+          const list = this.stacks.get(chunk) ?? [];
+          for (let si = 0; si < nSt; si++) {
+            const sx = (si / Math.max(1, nSt - 1) - 0.5) * 3.2 * wide;
+            const sz = (hash01(h.x + si, h.z) - 0.5) * 1.6 * deep;
+            const st = new THREE.Mesh(this.stackGeo, this.stackMat);
+            st.position.set(sx, bodyH + stH / 2, sz);
+            st.scale.set(1.6, stH, 1.6);
+            house.add(st);
+            // верх трубы — в мир (дом повёрнут и масштабирован)
+            const c = Math.cos(h.rot), sn = Math.sin(h.rot);
+            const wxs = toWorldX(h.x, h.z) + (sx * c + sz * sn) * h.scale;
+            const wzs = h.z + (-sx * sn + sz * c) * h.scale;
+            list.push({ x: wxs, y: gy + (bodyH + stH) * h.scale, z: wzs, r: 0.7 * h.scale });
+          }
+          this.stacks.set(chunk, list);
+          for (let c = -2; c <= 2; c++) {
+            const win = new THREE.Mesh(this.windowGeo, this.furnaceWinMat);
+            win.position.set(c * 0.8 * wide, bodyH * 0.55, 1.81 * deep + 0.02);
+            win.scale.set(0.9, 1.6, 1);
+            house.add(win);
+            const win2 = new THREE.Mesh(this.windowGeo, this.furnaceWinMat);
+            win2.position.set(c * 0.8 * wide, bodyH * 0.55, -1.81 * deep - 0.02);
+            win2.rotation.y = Math.PI;
+            win2.scale.set(0.9, 1.6, 1);
+            house.add(win2);
+          }
+        }
+        if (isTower) {
+          // ★ ВОДОНАПОРНАЯ БАШНЯ: четыре ноги, бак, конус
+          const legH = bodyH * 0.62;
+          for (const [lx, lz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+            const leg = new THREE.Mesh(this.legGeo, this.stackMat);
+            leg.position.set(lx * 1.3 * wide, legH / 2, lz * 1.3 * deep);
+            leg.scale.set(1, legH, 1);
+            house.add(leg);
+          }
+          const tank = new THREE.Mesh(this.tankGeo, this.tankMat);
+          tank.position.set(0, legH + bodyH * 0.19, 0);
+          tank.scale.set(1.9 * wide, bodyH * 0.38, 1.9 * deep);
+          house.add(tank);
+          const cone = new THREE.Mesh(this.coneGeo, this.ironRoofMat);
+          cone.position.set(0, legH + bodyH * 0.38 + 0.3, 0);
+          cone.scale.set(1.9 * wide, 1, 1.9 * deep);
+          house.add(cone);
+        }
+
+        if (h.chimney && !isFactory && !isTower) {
           const ch = new THREE.Mesh(this.chimneyGeo, this.houseMats[(h.style + 1) % 3]);
           ch.position.set(
             (hash01(h.z, h.x) - 0.5) * 2.4 * wide,
@@ -2432,17 +2502,20 @@ export class Terrain {
         }
 
         // дверь на фасаде
-        const door = new THREE.Mesh(this.doorGeo, this.doorMat);
-        door.position.set(-1.4 * wide, 0.68, 1.81 * deep + 0.03);
-        house.add(door);
+        if (!isTower) {
+          const door = new THREE.Mesh(this.doorGeo, this.doorMat);
+          door.position.set(-1.4 * wide, 0.68, 1.81 * deep + 0.03);
+          house.add(door);
+        }
 
         // окна: два на фасаде (к дороге), одно сзади
         const wz = 1.81 * deep;
-        for (const [wxr, wzr, ry] of [
+        const winList: Array<[number, number, number]> = isTower || isFactory ? [] : [
           [0.35 * wide, wz + 0.02, 0],
           [1.4 * wide, wz + 0.02, 0],
           [0.5 * wide, -wz - 0.02, Math.PI],
-        ] as Array<[number, number, number]>) {
+        ];
+        for (const [wxr, wzr, ry] of winList) {
           const win = new THREE.Mesh(this.windowGeo, this.windowMat);
           win.position.set(wxr, bodyH * 0.55, wzr);
           win.rotation.y = ry;
@@ -2705,7 +2778,18 @@ export class Terrain {
     return holder;
   }
 
+  /** трубы цехов в радиусе r от точки — для пара */
+  stacksNear(px: number, pz: number, r: number, out: Array<{ x: number; y: number; z: number; r: number }>): void {
+    out.length = 0;
+    for (const list of this.stacks.values()) {
+      for (const s of list) {
+        if (Math.abs(s.x - px) < r && Math.abs(s.z - pz) < r) out.push(s);
+      }
+    }
+  }
+
   private disposeChunk(chunk: THREE.Group): void {
+    this.stacks.delete(chunk);
     this.group.remove(chunk);
     chunk.traverse((obj) => {
       if (obj instanceof THREE.Mesh && !this.sharedGeos.has(obj.geometry)) {

@@ -19,16 +19,17 @@ export class WaveDust {
   private count = 0;
   private cloud: SpriteCloud;
 
-  constructor() {
+  /** @param color цвет клубов; @param alpha прозрачность ядра */
+  constructor(color: [number, number, number] = [0.42, 0.34, 0.31], alpha = 0.5, private grow = 2.2, private gravity = -2.5) {
     this.cloud = spriteCloud({
       count: 0, pos: this.pos, size: this.size,
       k: 120, minPx: 1, maxPx: 90,
       materialColor: true,
       blending: THREE.NormalBlending,
       depthWrite: false,
-      alpha: (r2) => smoothstep(1.0, 0.0, r2).mul(0.5),
+      alpha: (r2) => smoothstep(1.0, 0.0, r2).mul(alpha),
     });
-    this.cloud.material.color.setRGB(0.42, 0.34, 0.31);
+    this.cloud.material.color.setRGB(color[0], color[1], color[2]);
     this.cloud.material.opacity = 1;
     this.sprite = this.cloud.sprite;
     void float;
@@ -60,12 +61,12 @@ export class WaveDust {
       // клуб замедляется и растёт
       const k = 1 - Math.min(0.5, dt * 1.6);
       this.vel[i * 3] *= k;
-      this.vel[i * 3 + 1] = this.vel[i * 3 + 1] * k - 2.5 * dt;
+      this.vel[i * 3 + 1] = this.vel[i * 3 + 1] * k + this.gravity * dt;
       this.vel[i * 3 + 2] *= k;
       this.pos[i * 3] += this.vel[i * 3] * dt;
       this.pos[i * 3 + 1] += this.vel[i * 3 + 1] * dt;
       this.pos[i * 3 + 2] += this.vel[i * 3 + 2] * dt;
-      this.size[i] += dt * 2.2;
+      this.size[i] += dt * this.grow;
     }
     this.sprite.count = this.count;
     this.sprite.visible = this.count > 0;

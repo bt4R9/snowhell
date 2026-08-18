@@ -104,6 +104,10 @@ export class Game {
   private waveBuf = new Float32Array(WAVES * 4);
   private markBuf = new Float32Array(WAVES * 4);
   private waveDust = new WaveDust();
+  /** ★ пар из труб цехов парового города */
+  private steam = new WaveDust([0.8, 0.78, 0.76], 0.42, 1.2, 0.4);
+  private stackList: Array<{ x: number; y: number; z: number; r: number }> = [];
+  private steamAcc = 0;
 
   /** рендерер создаётся снаружи (core/gpu.ts): его инициализация асинхронная */
   constructor(renderer: THREE.WebGPURenderer) {
@@ -172,6 +176,7 @@ export class Game {
     this.scene.add(this.player.rig.root);
     this.scene.add(this.spray.points);
     this.scene.add(this.waveDust.sprite);
+    this.scene.add(this.steam.sprite);
     this.scene.add(this.treeFire.points);
     this.scene.add(this.eye.group);
     this.scene.add(this.eye.light);
@@ -663,6 +668,20 @@ export class Game {
     this.water.update(player.pos.z, this.worldTime);
     this.terrain.setNight(PALETTE.stars);
     this.airships.update(player.pos.x, player.pos.z, terrainHeight, dt, this.worldTime);
+    // ★ ПАР ИЗ ТРУБ: клубы белого пара, ветер сносит вниз по долине
+    this.steamAcc += dt;
+    if (this.steamAcc >= 0.08) {
+      this.steamAcc = 0;
+      this.terrain.stacksNear(player.pos.x, player.pos.z, 320, this.stackList);
+      for (const st of this.stackList) {
+        this.steam.puff(
+          st.x + (Math.random() - 0.5) * st.r, st.y, st.z + (Math.random() - 0.5) * st.r,
+          (Math.random() - 0.5) * 1.5, 3.5 + Math.random() * 2, 1.5 + Math.random() * 1.5,
+          3.5 + Math.random() * 2, 0.7 + st.r * 0.9
+        );
+      }
+    }
+    this.steam.update(dt);
     this.terrain.setShips(this.airships.shadowData);
     this.spray.update(dt);
     this.treeFire.update(player.pos.x, player.pos.z, dt);

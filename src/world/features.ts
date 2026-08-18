@@ -244,8 +244,8 @@ export const BIOME_CONTENT: BiomeContent[] = [
     // нет — их место занимает город (свой генератор). Снег серый от сажи.
     trees: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
     snowOnTrees: false,
-    forest: 0.05,
-    villages: 0,
+    forest: 0,
+    villages: 1.8,
     surfaces: ['SOOT', 'SLUSH', 'ICE', 'COBBLE'],
     rough: 0.9,
     drag: 1.04,
@@ -983,6 +983,9 @@ export const HK = {
   HOTEL: 3,
   SHOP: 4,
   CHAPEL: 5,
+  /** ★ ПАРОВОЙ ГОРОД: цех с трубами и водонапорная башня */
+  FACTORY: 6,
+  TOWER: 7,
 } as const;
 
 export interface VillageHouse {
@@ -1209,7 +1212,16 @@ export function villageInCell(vcx: number, vcz: number): Village | null {
       // одинаковых коробок читается складом, сколько её ни крась.
       let kind: number = HK.CHALET;
       const roll = hash2(S + 71 + hi, 83);
-      if (hi === hotelAt) kind = HK.HOTEL;
+      // ★ В ПАРОВОМ ГОРОДЕ ДРУГОЙ НАБОР: цеха с трубами, доходные дома,
+      // склады, водонапорные башни — никаких шале и часовен
+      const inCity = cityWeight(pz) > 0.5;
+      if (inCity) {
+        if (roll > 0.9) kind = HK.TOWER;
+        else if (roll > 0.72) kind = HK.SHOP;
+        else if (roll > 0.5) kind = HK.TALL;
+        else if (roll > 0.38) kind = HK.BARN;
+        else kind = HK.FACTORY;
+      } else if (hi === hotelAt) kind = HK.HOTEL;
       else if (hi === chapelAt) kind = HK.CHAPEL;
       else if (roll > 0.82) kind = HK.SHOP;
       else if (roll > 0.55) kind = HK.TALL;
@@ -1221,17 +1233,21 @@ export function villageInCell(vcx: number, vcz: number): Village | null {
       const wide =
         wMul * (kind === HK.HOTEL ? 2.1 : kind === HK.SHOP ? 1.5
           : kind === HK.BARN ? 1.2 : kind === HK.TALL ? 0.8
-          : kind === HK.CHAPEL ? 0.75 : 1);
+          : kind === HK.CHAPEL ? 0.75 : kind === HK.FACTORY ? 2.6
+          : kind === HK.TOWER ? 0.7 : 1);
       const deep =
         dMul * (kind === HK.HOTEL ? 1.35 : kind === HK.BARN ? 1.15
-          : kind === HK.CHAPEL ? 1.3 : kind === HK.SHOP ? 1.05 : 1);
+          : kind === HK.CHAPEL ? 1.3 : kind === HK.SHOP ? 1.05
+          : kind === HK.FACTORY ? 1.7 : kind === HK.TOWER ? 0.9 : 1);
       const bodyH =
-        2.4 * hMul * (kind === HK.HOTEL ? 1.75 : kind === HK.TALL ? 1.12
+        2.4 * hMul * (kind === HK.HOTEL ? 1.75 : kind === HK.TALL ? (inCity ? 1.6 : 1.12)
           : kind === HK.BARN ? 0.75 : kind === HK.SHOP ? 0.85
-          : kind === HK.CHAPEL ? 1.2 : 1);
+          : kind === HK.CHAPEL ? 1.2 : kind === HK.FACTORY ? 1.5
+          : kind === HK.TOWER ? 3.2 : 1);
       const roofPitch =
         (kind === HK.BARN ? 0.5 : kind === HK.CHAPEL ? 1.5
-          : kind === HK.HOTEL ? 0.7 : 0.8) + hash2(S + 89 + hi, 7) * 0.4;
+          : kind === HK.HOTEL ? 0.7 : kind === HK.FACTORY ? 0.3
+          : kind === HK.TOWER ? 0.7 : 0.8) + hash2(S + 89 + hi, 7) * 0.4;
       const scale = 0.85 + hash2(S + 47 + hi, 19) * 0.4;
       // площадка выравнивается ПОД ГАБАРИТ: под отелем 5.5 м оставляли угол
       // здания висеть в воздухе
@@ -1258,13 +1274,13 @@ export function villageInCell(vcx: number, vcz: number): Village | null {
         style: Math.floor(hash2(S + 61 + hi, 37) * 2.99),
         kind,
         hMul,
-        chimney: hash2(S + 83 + hi, 17) > 0.35 && kind !== HK.CHAPEL,
+        chimney: (hash2(S + 83 + hi, 17) > 0.35 && kind !== HK.CHAPEL) || kind === HK.FACTORY,
         padR,
         // ★ ПОЧТИ ПОЛОВИНА ДОМОВ ВРЕЗАНА В СКЛОН. Дом-препятствие интересен
         // ровно один раз; дом, по крыше которого едешь, — это уже линия.
         // Отель и часовня остаются стоять как стояли: у них своя роль в силуэте
         // деревни, и врезать их значит потерять её.
-        sunk: kind !== HK.HOTEL && kind !== HK.CHAPEL &&
+        sunk: kind !== HK.HOTEL && kind !== HK.CHAPEL && kind !== HK.FACTORY && kind !== HK.TOWER &&
           hash2(S + 211 + hi * 5, 43) > 0.55,
       });
     }
