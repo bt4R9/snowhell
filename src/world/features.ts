@@ -243,13 +243,14 @@ export const BIOME_CONTENT: BiomeContent[] = [
     // единственные тёплые точки. Наст гладкий и быстрый — биом про скольжение.
     trees: [1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
     snowOnTrees: true,
-    forest: 0.4,
-    villages: 0.5,
+    // ★ БИОМ ПРО СКОРОСТЬ: препятствий мало, склон гладкий и быстрый
+    forest: 0.14,
+    villages: 0.25,
     surfaces: ['CRUST', 'POWDER', 'ICE', 'ROCK'],
-    rough: 0.75,
-    drag: 0.92,
-    grip: 0.96,
-    accel: 1.03,
+    rough: 0.6,
+    drag: 0.84,
+    grip: 0.98,
+    accel: 1.06,
   },
 ];
 
@@ -350,6 +351,9 @@ export interface Lake {
   gu: number;
   ph: number[];           // фазы гармоник берега
   amp: number[];
+  /** ★ ОТКРЫТАЯ ВОДА: не лёд, а озеро — по нему можно проехать только на
+   * скорости (доска глиссирует и теряет ход), без хода — тонешь */
+  water: boolean;
 }
 const LAKE_STEP = 520;
 const lakeCache = new Map<number, Lake | null>();
@@ -376,7 +380,9 @@ export function lakeAtSite(k: number): Lake | null {
       ph.push(hash2(k * 23 + i, 83) * Math.PI * 2);
       amp.push((0.08 / (i + 1)) * (0.5 + hash2(k * 29 + i, 89)));
     }
-    res = { u, z, ru, rz, L, gz, gu, ph, amp };
+    // половина озёр открытая: чередуем через одно с редким сбоем
+    const water = ((k & 1) === 0) !== (hash2(k * 41 + 9, 97) < 0.2);
+    res = { u, z, ru, rz, L, gz, gu, ph, amp, water };
   }
   lakeCache.set(k, res);
   if (lakeCache.size > 256) lakeCache.clear();
@@ -395,10 +401,12 @@ function lakeDn(l: Lake, u: number, z: number): number {
 }
 
 /**
- * Озеро в точке: вес 0..1 (1 — на льду, спад к берегу) и уровень.
+ * Озеро в точке: вес 0..1 (1 — на озере, спад к берегу), уровень зеркала,
+ * высота дна (у льда = зеркало; у воды — чаша до 4 м под зеркалом) и вода ли.
  * Ищем в двух соседних площадках — эллипсы могут заходить за шаг.
  */
-export function lakeAt(u: number, z: number): { w: number; L: number } | null {
+export interface LakeHit { w: number; L: number; bed: number; water: boolean; lake: Lake }
+export function lakeAt(u: number, z: number): LakeHit | null {
   if (lakeOff) return null;
   const k0 = Math.floor(z / LAKE_STEP);
   for (let k = k0 - 1; k <= k0 + 1; k++) {
@@ -409,7 +417,10 @@ export function lakeAt(u: number, z: number): { w: number; L: number } | null {
     if (dn >= 1.18) continue;
     // внутри — плоско; берег: за 18% радиуса рельеф возвращается
     const w = dn < 1 ? 1 : 1 - (dn - 1) / 0.18;
-    return { w: w * w * (3 - 2 * w), L: l.L + l.gz * (z - l.z) + l.gu * (u - l.u) };
+    const L = l.L + l.gz * (z - l.z) + l.gu * (u - l.u);
+    // дно открытой воды — пологая чаша: у берега мелко, к середине 4 м
+    const bowl = l.water ? 4 * Math.max(0, 1 - dn * dn) : 0;
+    return { w: w * w * (3 - 2 * w), L, bed: L - bowl, water: l.water, lake: l };
   }
   return null;
 }
@@ -513,9 +524,9 @@ export function surfField(u: number, v: number): number {
 }
 
 export function surfaceKindAt(u: number, v: number): number {
-  // ★ ЗАМЁРЗШЕЕ ОЗЕРО — ВСЕГДА ЛЁД (полярная ночь)
+  // ★ ЗАМЁРЗШЕЕ ОЗЕРО — ВСЕГДА ЛЁД (полярная ночь); дно открытой воды — наст
   const lk = lakeAt(u, v);
-  if (lk && lk.w > 0.5) return SURF_ICE;
+  if (lk && lk.w > 0.5) return lk.water ? SURF_PACKED : SURF_ICE;
   // земля вытаивает редкими небольшими пятнами и только вне трассы
   const du = u + noise2(u * 0.02 + 5.5, v * 0.02 + 1.9) * 12;
   const dv = v + noise2(u * 0.02 - 9.1, v * 0.02 + 6.4) * 12;
@@ -1477,7 +1488,7 @@ export function cragInRow(k: number): Crag | null {
   if (hit !== undefined) return hit;
   const cz = k * CRAG_ROW;
   let res: Crag | null = null;
-  if (recipe().hasCrags && hash2(cz * 733 + 3, 11) > 0.29) {
+  if (recipe().hasCrags && hash2(cz * 733 + 3, 11) > 0.29 && nightWeight(cz * CHUNK) < 0.5) {
     const gz = cz * CHUNK + (hash2(cz * 17 + 5, 9) - 0.5) * CHUNK * 0.8;
     const side = hash2(cz * 29, 31) > 0.5 ? 1 : -1;
     // Разброс размера ВДВОЕ поверх прежнего диапазона: от «как было» до вдвое
@@ -1622,7 +1633,7 @@ export function archInRow(k: number): Arch | null {
   if (hit !== undefined) return hit;
   const cz = k * ARCH_ROW;
   let res: Arch | null = null;
-  if (recipe().hasArches && hash2(cz * 911 + 7, 23) > 0.45) {
+  if (recipe().hasArches && hash2(cz * 911 + 7, 23) > 0.45 && nightWeight(cz * CHUNK) < 0.5) {
     const gz = cz * CHUNK + (hash2(cz * 19 + 11, 29) - 0.5) * CHUNK * 0.7;
     const variant = Math.floor(hash2(cz * 59, 61) * 2.99);
     let span = 190 + Math.pow(hash2(cz * 37, 41), 1.3) * 140;

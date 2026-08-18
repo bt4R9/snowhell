@@ -283,7 +283,7 @@ export class BiomeManager {
       const tt = performance.now() * 0.001;
       const pulse = 0.55 + 0.45 * Math.sin(tt * 0.35) * Math.sin(tt * 0.11 + 1.3);
       AUR.setRGB(0.42, 0.9, 0.62);
-      this.hemi.color.lerp(AUR, PALETTE.aurora * 0.22 * pulse);
+      this.hemi.color.lerp(AUR, PALETTE.aurora * 0.12 * pulse);
     }
     this.hemi.groundColor.lerpColors(A.hemiGround, B.hemiGround, k);
     this.hemi.intensity = lerp(A.hemiIntensity, B.hemiIntensity);

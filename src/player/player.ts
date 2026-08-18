@@ -10,6 +10,7 @@ import {
   CHUNK,
   obstaclesInChunk,
   cragRadiusToward,
+  lakeAt,
   rockRadiusToward,
   archLegRadius,
   houseRadiusToward,
@@ -46,8 +47,14 @@ import {
  * чашу здесь, доска поедет по старому уровню и повиснет над дном ямы.
  * Формула одна и та же (см. craters.ts), поэтому картинка и физика совпадают.
  */
+/** ★ вода держит доску только на ходу: флаг ставится в начале шага по скорости */
+let waterSupport = false;
 function surfaceY(x: number, z: number): number {
-  return terrainHeight(x, z) - groundDip(x, z);
+  const h = terrainHeight(x, z) - groundDip(x, z);
+  if (!waterSupport) return h;
+  const lk = lakeAt(toValleyU(x, z), z);
+  if (lk && lk.water && lk.w > 0.5) return Math.max(h, lk.L);
+  return h;
 }
 
 // Аркадная кинематика: никакого физдвижка, только то, что приятно ощущается.
@@ -287,6 +294,9 @@ const HEAT_COOL = 15;   // секунд полного остывания
 // на 20 м/с давало 0.75 шкалы, второе убивало. Пересечение должно стоить
 // ~0.4: два — предел, три — смерть. Ехать ВДОЛЬ борозды по-прежнему нельзя.
 const LASER_HEAT = HEAT_UP * 1.15;
+/** ★ ВОДА: ниже этой скорости (м/с) доска не глиссирует и тонет; потеря хода на воде, доля/с */
+const WATER_SKIM = 11;
+const WATER_DRAG = 0.42;
 const ROOF_CATCH = 0.9;
 const RAIL_SNAP_R = 2.2;
 const RAIL_FUNNEL_R = 5.5;  // радиус у въезда
@@ -387,6 +397,11 @@ export class Player {
   /** живая лава — ей сообщаем касания доски (волны по расплаву) */
   private pools: Pools | null = null;
   private splashAcc = 0;
+  /** ★ ОТКРЫТАЯ ВОДА: глиссируем ли сейчас (для брызг и звука) и колбэк колец */
+  onWater = false;
+  waterSplash: ((x: number, z: number, k: number) => void) | null = null;
+  private waterAcc = 0;
+
   setPools(p: Pools): void {
     this.pools = p;
   }
@@ -447,6 +462,8 @@ export class Player {
     // ★ ЛАВА УБИВАЕТ. По ней нельзя ехать — доска и райдер плавятся. Это и
     // делает поток настоящим препятствием, а не декорацией: переправа
     // (рейл-мост) или объезд по берегу.
+    // вода: опора есть только пока едем быстрее WATER_SKIM
+    waterSupport = this.speed > WATER_SKIM && this.meltT <= 0;
     this.justMelted = false;
     if (this.meltT > 0) {
       this.meltT = Math.max(0, this.meltT - dt);
@@ -995,6 +1012,32 @@ export class Player {
         this.lavaLift += Math.max(-step, Math.min(step, diff));
       }
       if (this.lavaLift > 0.02) groundY = Math.max(groundY, rock + this.lavaLift);
+      // ★ ОТКРЫТАЯ ВОДА ДЕРЖИТ ТОЛЬКО НА ХОДУ. Быстрее WATER_SKIM доска
+      // глиссирует по зеркалу — опора на уровне воды, ход понемногу теряется,
+      // из-под канта летят брызги. Медленнее — опоры нет, доска уходит под воду
+      // и через полметра тонет (тот же путь, что расплав: сброс на трассу).
+      this.onWater = false;
+      const lkw = lakeAt(lu, this.pos.z);
+      if (lkw && lkw.water && lkw.w > 0.5) {
+        const L = lkw.L;
+        if (this.speed > WATER_SKIM && this.pos.y < L + 0.6) {
+          groundY = Math.max(groundY, L);
+          this.onWater = true;
+          const k = 1 - Math.min(0.5, dt * WATER_DRAG);
+          this.velH.multiplyScalar(k);
+          this.speed *= k;
+          this.waterAcc += dt * (1.5 + this.speed * 0.2);
+          if (this.waterAcc >= 1) {
+            this.waterAcc = 0;
+            this.waterSplash?.(this.pos.x, this.pos.z, 0.5 + Math.min(0.5, this.speed / 60));
+          }
+        } else if (this.pos.y < L - 0.7) {
+          // утонули
+          this.meltT = MELT_TIME;
+          this.crashed = true;
+          this.waterSplash?.(this.pos.x, this.pos.z, 1.0);
+        }
+      }
     }
     // ★ НА КОРКЕ ФИЗИКА СМОТРИТ НА КОРКУ, А НЕ НА КАМЕНЬ ПОД НЕЙ. Отрыв
     // считается по высотам ВОКРУГ доски, а они брались с породы: под слоем

@@ -365,7 +365,7 @@ function terrainBase(x: number, z: number): number {
   // ★ ЗАМЁРЗШИЕ ОЗЁРА ПОЛЯРНОЙ НОЧИ: зеркало выглажено до уровня, берег за
   // ним поднимается к рельефу — тоже явная форма поверх всего
   const lk = lakeAt(x, z);
-  if (lk) h += (lk.L - h) * lk.w;
+  if (lk) h += (lk.bed - h) * lk.w;
   return h;
 }
 
@@ -1546,6 +1546,11 @@ export class Terrain {
     }
   }
 
+  /** вес полярной ночи у игрока — включает блёстки на снегу */
+  setNight(k: number): void {
+    if (this.matUniforms) this.matUniforms.uNight.value = k;
+  }
+
   /** ударные волны башни: [x, z, радиус, сила] × WAVES */
   setWaves(arr: Float32Array): void {
     if (!this.matUniforms) return;
@@ -1608,8 +1613,10 @@ export class Terrain {
     const uWave = uniformArray(Array.from({ length: WAVES }, () => new THREE.Vector4(0, 0, 0, 0)));
     // метки-кольца перед волной: (x, z, радиус, сила) — сужаются в точку удара
     const uMark = uniformArray(Array.from({ length: WAVES }, () => new THREE.Vector4(0, 0, 0, 0)));
+    // ★ ПОЛЯРНАЯ НОЧЬ: снег искрится под луной (блёстки-звёздочки, мерцают)
+    const uNight = uniform(0);
     // DEV: 0 — обычный вывод, 1..6 — визуализация слагаемых трещин (cr, hot, heat, plate, rift, craze)
-    this.matUniforms = { uGlowCol, uHazCol, uTime, uSpot, uSpotCol, uSpotDir, uGlow, uWave, uMark };
+    this.matUniforms = { uGlowCol, uHazCol, uTime, uSpot, uSpotCol, uSpotDir, uGlow, uWave, uMark, uNight };
 
     const aGlow: N = attribute('aGlow', 'float');
     const aHazard: N = attribute('aHazard', 'float');
@@ -1822,6 +1829,16 @@ export class Terrain {
         const wall = smoothstep(0.55, 0.05, abs(nrm.y));
         col.addAssign(diffuseColor.rgb.mul(wall).mul(0.3));
       }
+      // ★ БЛЁСТКИ НА СНЕГУ ПОЛЯРНОЙ НОЧЬЮ: редкие ячейки вспыхивают и гаснут —
+      // без них ночной снег читался ровной серой заливкой
+      If(uNight.greaterThan(0.01), () => {
+        const cell = floor(w.mul(1.5));
+        const h = thash(cell);
+        const h2 = thash(cell.add(vec2(31.0, 7.0)));
+        const tw = sin(uTime.mul(h2.mul(5.0).add(3.0)).add(h2.mul(60.0))).mul(0.5).add(0.5);
+        const sp = smoothstep(0.991, 1.0, h).mul(tw.mul(tw).mul(tw)).mul(clamp(nrm.y, 0.0, 1.0));
+        col.addAssign(vec3(0.75, 0.85, 1.05).mul(sp).mul(uNight).mul(1.4).mul(vGlow.oneMinus()));
+      });
       return vec4(col, output.a);
     })();
     return m;

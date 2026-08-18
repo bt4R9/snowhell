@@ -25,6 +25,8 @@ import { basic } from './core/mat';
 import { Volcanoes, setLavaTime } from './world/lava';
 import { Pools } from './world/pools';
 import { Boulders } from './world/boulders';
+import { Water } from './world/water';
+import { Crystals } from './world/crystals';
 import { FarField } from './world/farfield';
 import { Hud } from './ui/hud';
 import { Sound } from './audio/sound';
@@ -34,7 +36,7 @@ import { describeTrick, describeLive, scoreTrick, landingBonus } from './tricks'
 function grindScore(duration: number): number {
   return Math.max(50, Math.round((duration * 300) / 10) * 10);
 }
-import { surfaceAt, surfaceName, toValleyU, toWorldX, volcanoWeight, pisteCenterX } from './world/features';
+import { surfaceAt, surfaceName, toValleyU, toWorldX, volcanoWeight, nightWeight, pisteCenterX } from './world/features';
 
 // цвета подписи поверхности в HUD: наст, рыхлый, лёд, земля, рейл
 const SURFACE_LABEL = [0xdfe6f5, 0xffffff, 0x8fc6f0, 0xc2a279, 0xff9a4a];
@@ -69,6 +71,8 @@ export class Game {
   private snowfall: Snowfall;
   private lava!: Pools;
   private boulders!: Boulders;
+  private water!: Water;
+  private crystals!: Crystals;
   private volcanoes = new Volcanoes();
   private fireballs = new Fireballs();
   private worldTime = 0;
@@ -113,6 +117,12 @@ export class Game {
     // ★ горящие глыбы из извержений: физика по рельефу, огненный след
     this.boulders = new Boulders(terrainHeight, terrainNormal);
     this.scene.add(this.boulders.group);
+    // ★ открытая вода полярной ночи
+    this.water = new Water();
+    this.scene.add(this.water.group);
+    this.crystals = new Crystals(terrainHeight);
+    this.scene.add(this.crystals.group);
+    this.player.waterSplash = (x, z, k) => this.water.splash(x, z, k);
     this.boulders.onTrail = (ax, az, bx, bz, r, depth) => damage.paintCut(ax, az, bx, bz, r, depth);
     this.lava.onBoulder = (x, y, z) => {
       // цель — куда игрок едет: позиция через ~3 с плюс разброс
@@ -644,6 +654,14 @@ export class Game {
       this.hud.airTrick('');
     }
 
+    // ★ БРЫЗГИ С ВОДЫ: пока доска глиссирует, из-под канта веером летит вода
+    if (player.onWater) {
+      this.sprayOrigin.copy(player.pos);
+      this.spray.emit(this.sprayOrigin, player.velH, 220 + player.speed * 6, dt);
+    }
+    this.water.update(player.pos.z, this.worldTime);
+    this.terrain.setNight(nightWeight(player.pos.z));
+    this.crystals.update(player.pos.z, dt);
     this.spray.update(dt);
     this.treeFire.update(player.pos.x, player.pos.z, dt);
     this.eye.update(

@@ -102,17 +102,23 @@ export function createSky(): Sky {
       // занавес — в координатах азимут × высота: складки идут поперёк
       // азимута, медленно плывут и колышутся; так он висит по всему куполу,
       // а не только у горизонта
+      // ★ НИЗКО И ЖИВО. Камера смотрит вниз по склону, в кадр попадает узкая
+      // полоса неба над горизонтом — занавес висит именно там (до ~30°) и
+      // ДВИЖЕТСЯ: складки плывут, по ним бегут вертикальные лучи, яркость
+      // дышит волнами вдоль азимута.
       const az = atan(dir.x, dir.z).mul(2.2);
-      const wave = vnoise2(vec2(az.mul(0.7).add(uTime.mul(0.02)), dir.y.mul(0.8).add(uTime.mul(0.006)))).mul(1.8);
-      const ripple = vnoise2(vec2(az.mul(3.2).sub(uTime.mul(0.05)), dir.y.mul(1.4).add(wave)));
-      const band = smoothstep(0.52, 0.8, ripple.mul(0.6).add(wave.mul(0.35)));
-      // по высоте: снизу резкая кромка, вверх занавес тает
-      const hgt = smoothstep(0.03, 0.12, dir.y).mul(smoothstep(0.9, 0.35, dir.y));
+      const wave = vnoise2(vec2(az.mul(0.7).add(uTime.mul(0.06)), dir.y.mul(1.5).add(uTime.mul(0.02)))).mul(1.8);
+      const ripple = vnoise2(vec2(az.mul(3.2).sub(uTime.mul(0.14)), dir.y.mul(2.6).add(wave)));
+      const rays = vnoise2(vec2(az.mul(16.0).add(uTime.mul(0.4)), dir.y.mul(0.6).sub(uTime.mul(0.05)))).mul(0.6).add(0.55);
+      const breathe = sin(uTime.mul(0.45).add(az.mul(1.3))).mul(0.25).add(0.8);
+      const band = smoothstep(0.48, 0.78, ripple.mul(0.6).add(wave.mul(0.35))).mul(rays).mul(breathe);
+      // по высоте: снизу резкая кромка у горизонта, к 30° занавес тает
+      const hgt = smoothstep(-0.01, 0.05, dir.y).mul(smoothstep(0.55, 0.14, dir.y));
       const k = band.mul(hgt).mul(uAurora);
       const green = vec3(0.16, 0.95, 0.42);
-      const violet = vec3(0.55, 0.25, 0.85);
-      const acol = mix(green, violet, smoothstep(0.15, 0.6, dir.y));
-      col.addAssign(acol.mul(k).mul(0.55));
+      const violet = vec3(0.6, 0.28, 0.9);
+      const acol = mix(green, violet, smoothstep(0.08, 0.4, dir.y));
+      col.addAssign(acol.mul(k).mul(0.8));
     });
 
     // Ниже горизонта небо — ровно цвет тумана: щели между слоями мира
