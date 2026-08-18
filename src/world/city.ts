@@ -46,6 +46,83 @@ export const RAMP_L = 22;
 /** ★ полуширина улицы (мостовая от фасада до фасада ~60 м) — шире лыжного коридора */
 export const STREET_HALF = 30;
 
+// --- ★ ГРАФ УЛИЦ: проспект + развилки вокруг кварталов -----------------------
+// Проспект идёт по оси; раз в FORK_STEP он раздваивается вокруг квартала-острова
+// (две улицы уже, между ними здания) и снова сходится. Улица = {смещение центра
+// от оси, полуширина}; здания ставятся вдоль ФРОНТОВ каждой улицы, снаружи
+// города — стена террас (см. cityWallAt), чтобы игрок не выезжал из города.
+const FORK_STEP = 620;
+const FORK_TRANS = 45;      // длина расхождения/схождения
+const BRANCH_HALF = 16;     // полуширина боковой улицы
+const ISLAND_HALF = 15;     // полуширина квартала между ветками
+export interface Street { c: number; half: number }
+interface Fork { z0: number; z1: number; k: number }
+const forkCache = new Map<number, Fork | null>();
+function forkOf(k: number): Fork | null {
+  const hit = forkCache.get(k);
+  if (hit !== undefined) return hit;
+  let f: Fork | null = null;
+  const z0 = k * FORK_STEP + 120 + hash2(k * 71 + 3, 43) * 120;
+  if (cityWeight(z0) > 0.7 && cityWeight(z0 + 420) > 0.7 && hash2(k * 73 + 1, 47) < 0.7) {
+    f = { z0, z1: z0 + 260 + hash2(k * 79 + 5, 53) * 140, k };
+  }
+  forkCache.set(k, f);
+  return f;
+}
+export function forkAt(z: number): Fork | null {
+  const k = Math.floor(z / FORK_STEP);
+  for (let i = k - 1; i <= k; i++) {
+    const f = forkOf(i);
+    if (f && z >= f.z0 - FORK_TRANS && z <= f.z1 + FORK_TRANS) return f;
+  }
+  return null;
+}
+/** улицы в точке z: одна (проспект) или две (ветки развилки) с плавным расхождением */
+export function streetsAt(z: number): Street[] {
+  const f = forkAt(z);
+  if (!f) return [{ c: 0, half: STREET_HALF }];
+  const tIn = Math.max(0, Math.min(1, (z - (f.z0 - FORK_TRANS)) / FORK_TRANS));
+  const tOut = Math.max(0, Math.min(1, ((f.z1 + FORK_TRANS) - z) / FORK_TRANS));
+  const t = Math.min(tIn, tOut);
+  const k = t * t * (3 - 2 * t);
+  const off = (ISLAND_HALF + BRANCH_HALF) * k;
+  const half = STREET_HALF + (BRANCH_HALF - STREET_HALF) * k;
+  return [{ c: -off, half }, { c: off, half }];
+}
+/** внутри ли развилки полностью (для острова): 0..1 */
+export function islandAt(z: number): number {
+  const f = forkAt(z);
+  if (!f) return 0;
+  return z >= f.z0 && z <= f.z1 ? 1 : 0;
+}
+/** мостовая: 0..1 по ближайшей улице (край 3 м) */
+export function roadWeightAt(u: number, z: number): number {
+  const d = u - pisteCenterX(z);
+  let best = 0;
+  for (const st of streetsAt(z)) {
+    const w = Math.max(0, Math.min(1, (st.half - Math.abs(d - st.c)) / 3));
+    if (w > best) best = w;
+  }
+  return best;
+}
+/** внешняя граница города по |u−ось|: за ней стена террас */
+export function cityEdgeAt(z: number): number {
+  const sts = streetsAt(z);
+  let e = 0;
+  for (const st of sts) e = Math.max(e, Math.abs(st.c) + st.half);
+  return e + 1.5 + 2 * 9 + 6 + 2 * 9 + 4; // два ряда зданий (усреднённо) + переулок
+}
+/**
+ * ★ СТЕНА ГОРОДА: за внешним рядом земля круто уходит вверх (подпорная стена
+ * террас) — из города не выехать. Возвращает добавку высоты.
+ */
+export function cityWallAt(u: number, z: number): number {
+  const d = Math.abs(u - pisteCenterX(z)) - cityEdgeAt(z);
+  if (d <= 0) return 0;
+  const t = Math.min(1, d / 8);
+  return t * t * (3 - 2 * t) * 16 + Math.max(0, d - 8) * 0.9;
+}
+
 const SEG = 240;          // сегмент генерации вдоль z
 const cache = new Map<number, Building[]>();
 let padOff = false;
@@ -58,14 +135,25 @@ export function citySegment(s: number): Building[] {
   const out: Building[] = [];
   const z0 = s * SEG;
   if (cityWeight(z0 + SEG * 0.5) > 0.55) {
-    for (const side of [-1, 1]) {
-      for (let row = 0; row < 2; row++) {
+    // фронты: [сторона фасада (куда смотрит), индекс улицы, наружный ли фронт]
+    // наружные фронты проспекта — как раньше (два ряда); у развилки добавляются
+    // внутренние фронты острова (по одному ряду с каждой стороны)
+    // фронт: улица (0 — левая/единственная, −1 — правая/последняя), её край
+    // (edge −1 левый / +1 правый) и наружный ли он. Здание стоит ЗА краем
+    // (по edge), фасадом смотрит на улицу: side = −edge.
+    const fronts: Array<{ edge: number; street: number; outer: boolean }> = [
+      { edge: -1, street: 0, outer: true }, { edge: 1, street: -1, outer: true },
+      { edge: 1, street: 0, outer: false }, { edge: -1, street: -1, outer: false },
+    ];
+    for (const fr of fronts) {
+      const side = -fr.edge; // куда смотрит фасад
+      for (let row = 0; row < (fr.outer ? 2 : 1); row++) {
         // второй ряд не везде: сзади улицы должно быть видно город, а не стену
         if (row === 1 && hash2(s * 17 + side * 5, 41) < 0.35) continue;
         let z = z0 + hash2(s * 31 + side + row * 3, 7) * 10;
         let i = 0;
         while (z < z0 + SEG - 6) {
-          const S = s * 977 + side * 131 + row * 53 + i * 17;
+          const S = s * 977 + side * 131 + row * 53 + i * 17 + (fr.outer ? 0 : 7919);
           const roll = hash2(S, 61);
           let kind: number = CK.TENEMENT;
           if (roll > 0.94) kind = CK.CLOCKTOWER;
@@ -94,15 +182,26 @@ export function citySegment(s: number): Building[] {
           const roof: Building['roof'] =
             kind === CK.FACTORY ? 'saw' : kind === CK.DOMEHALL ? 'dome' : kind === CK.CLOCKTOWER ? 'spire'
             : kind === CK.WAREHOUSE ? 'flat' : hash2(S + 4, 13) < 0.5 ? 'mansard' : 'flat';
-          const roofAccess = row === 0 && (roof === 'flat' || roof === 'mansard') && hash2(S + 10, 37) < 0.35;
+          const roofAccess = fr.outer && row === 0 && (roof === 'flat' || roof === 'mansard') && hash2(S + 10, 37) < 0.35;
           if (roofAccess) z += RAMP_L; // переулок под пандус
-          // ряд 1 стоит за рядом 0: отступ по глубине первого ряда (усреднённо 8) + переулок
-          const off = STREET_HALF + 1.5 + (row === 0 ? hw : 8 * 2 + 6 + hw);
           const zc = z + hl;
+          // ★ фронт улицы в этой точке: у проспекта — его край; у развилки —
+          // край соответствующей ветки. Внутри переходов развилки не строим.
+          const sts = streetsAt(zc);
+          const stsA = streetsAt(z), stsB = streetsAt(z + hl * 2);
+          const inTrans = sts.length !== stsA.length || sts.length !== stsB.length ||
+            (sts.length === 2 && Math.abs(sts[0].c - stsA[0].c) + Math.abs(sts[0].c - stsB[0].c) > 0.5);
+          if (!fr.outer && sts.length < 2) { z += hl * 2; i++; continue; }
+          if (inTrans) { z += hl * 2; i++; continue; }
+          const st = fr.street === 0 ? sts[0] : sts[sts.length - 1];
+          const wallOff = st.c + fr.edge * st.half;
+          // остров узкий: внутренние здания мельче
+          const hwI = fr.outer ? hw : Math.min(hw, ISLAND_HALF - 1);
+          const off = wallOff + fr.edge * (1.5 + (row === 0 ? hwI : 8 * 2 + 6 + hw));
           out.push({
             id: nextId++,
-            u: pisteCenterX(zc) + side * off,
-            z: zc, hw, hl, side, row, h, kind,
+            u: pisteCenterX(zc) + off,
+            z: zc, hw: fr.outer ? hw : Math.min(hw, ISLAND_HALF - 1), hl, side, row, h, kind,
             style: Math.floor(hash2(S + 5, 17) * 2.99),
             floors,
             roof,
@@ -138,7 +237,7 @@ export function buildingPad(b: Building): number {
   padOff = true;
   // ★ по НИЖНЕМУ углу со стороны улицы: фасад не должен висеть в воздухе
   const zLo = b.z + b.hl;
-  const uS = b.u - b.side * b.hw;
+  const uS = b.u + b.side * b.hw;
   b.padY = Math.min(terrainSample(b.u, b.z), terrainSample(uS, zLo)) + 0.4;
   padOff = false;
   return b.padY;

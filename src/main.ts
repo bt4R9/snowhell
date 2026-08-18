@@ -66,6 +66,7 @@ if (import.meta.env.DEV) {
   const lava = await import('./world/lava');
   w.__lava = lava;
   w.__pools = await import('./world/pools');
+  w.__city = await import('./world/city');
   // ★ СВОБОДНАЯ КАМЕРА ДЛЯ ОСМОТРА (стенд лавы): __cam(x,y,z, tx,ty,tz) ставит
   // камеру и целится; __camOff() возвращает слежение. Иначе камера смотрит только
   // туда, куда едет доска, и половину сцены не осмотреть.

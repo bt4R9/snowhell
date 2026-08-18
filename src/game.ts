@@ -685,7 +685,7 @@ export class Game {
         this.steam.puff(
           st.x + (Math.random() - 0.5) * st.r, st.y, st.z + (Math.random() - 0.5) * st.r,
           (Math.random() - 0.5) * 1.5, 3.5 + Math.random() * 2, 1.5 + Math.random() * 1.5,
-          3.5 + Math.random() * 2, 0.7 + st.r * 0.9
+          3.5 + Math.random() * 2, 0.5 + st.r * 0.8
         );
       }
     }

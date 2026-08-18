@@ -373,6 +373,9 @@ function terrainBase(x: number, z: number): number {
   h += valleyDepth(x, z) * calm;
   h += cliffDrop(x, z) * (1 - gully) * calm; // обрывы уже обходят трассу при генерации
   h += mesaLift(x, z) * (1 - piste.t * 0.85) * calm;
+  // ★ СТЕНА ГОРОДА: за внешним рядом зданий земля круто уходит вверх — из
+  // города не выехать (city.ts)
+  if (cw > 0.01) h += cityWallAt(x, z) * cw;
   // коридор чуть утоплен относительно целины: читается как прорезанная
   // ратраком трасса и мягко удерживает райдера на линии
   h -= 1.1 * piste.t * (1 - cw); // в городе трасса — улица, без жёлоба
@@ -1531,7 +1534,7 @@ export function terrainColorAt(
     const sn = (() => { const t = Math.max(0, Math.min(1, (noise2(u * 0.02 + 1.7, z * 0.02 - 5.5) * 0.5 + 0.5 - 0.55) / 0.2)); return t * t * (3 - 2 * t) * (1 - steep); })();
     gr += (0.42 - gr) * sn; gg += (0.42 - gg) * sn; gb += (0.44 - gb) * sn;
     // ★ МОСТОВАЯ: булыжник (мелкая клетка) с бордюром по краю — улица, а не земля
-    const rw = Math.max(0, Math.min(1, (STREET_HALF - Math.abs(u - pisteCenterX(z))) / 3));
+    const rw = roadWeightAt(u, z);
     if (rw > 0) {
       const cob = noise2(u * 0.9 + 4.4, z * 0.9 - 2.2) * 0.5 + 0.5;
       const cobK = 0.86 + cob * 0.28;
@@ -1550,7 +1553,7 @@ export function terrainColorAt(
 
 import { damage } from '../fx/damage';
 import { bandProfile } from './slice';
-import { cityPadAt, cityNear, buildingPad, cityRoofAt, CK, Building, STREET_HALF } from './city';
+import { cityPadAt, cityNear, buildingPad, cityRoofAt, CK, Building, STREET_HALF, roadWeightAt, cityWallAt, streetsAt } from './city';
 import { SHIPS } from './airships';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2167,9 +2170,7 @@ export class Terrain {
     ctrlB[i * 4 + 1] = volcanoWeight(v);
     ctrlB[i * 4 + 2] = cityWeight(v);
     // ★ мостовая парового города: ±STREET_HALF от оси, край 3 м
-    ctrlB[i * 4 + 3] = ctrlB[i * 4 + 2] > 0.01
-      ? Math.max(0, Math.min(1, (STREET_HALF - Math.abs(u - pisteCenterX(v))) / 3))
-      : 0;
+    ctrlB[i * 4 + 3] = ctrlB[i * 4 + 2] > 0.01 ? roadWeightAt(u, v) : 0;
   }
 
   /** развернуть сетку и раскрасить её на GPU; возвращает готовую геометрию */
@@ -2406,11 +2407,13 @@ export class Terrain {
       if (cityWeight(oz) > 0.5) {
         const zA = oz - CHUNK / 2, zB = oz + CHUNK / 2;
         const list = this.stacks.get(chunk) ?? [];
-        for (const side of [-1, 1]) {
-          const uP = pisteCenterX(oz) + side * (STREET_HALF - 1.2);
+        const stsMid = streetsAt(oz);
+        for (const st of stsMid) for (const side of [-1, 1]) {
+          const eOff = st.c + side * (st.half - 1.2);
+          const uP = pisteCenterX(oz) + eOff;
           if (uP < ox - CHUNK / 2 || uP >= ox + CHUNK / 2) continue;
-          const xa = toWorldX(pisteCenterX(zA) + side * (STREET_HALF - 1.2), zA);
-          const xb = toWorldX(pisteCenterX(zB) + side * (STREET_HALF - 1.2), zB);
+          const xa = toWorldX(pisteCenterX(zA) + eOff, zA);
+          const xb = toWorldX(pisteCenterX(zB) + eOff, zB);
           const ya = terrainHeight(xa, zA) + 0.5, yb = terrainHeight(xb, zB) + 0.5;
           const len = Math.hypot(xb - xa, yb - ya, zB - zA);
           const pipe = new THREE.Mesh(this.cityCyl, this.pipeMat);
@@ -2421,7 +2424,7 @@ export class Terrain {
           // вентиль-колесо и стойки
           if (hash01(oz * 3, side * 7) > 0.4) {
             const vz = zA + 8 + hash01(oz, side) * 30;
-            const vx = toWorldX(pisteCenterX(vz) + side * (STREET_HALF - 1.2), vz);
+            const vx = toWorldX(pisteCenterX(vz) + eOff, vz);
             const vy = terrainHeight(vx, vz) + 0.5;
             const wheel = new THREE.Mesh(this.cityCyl, this.brassMat);
             wheel.position.set(vx - wx0, vy + 1.1, vz - oz);
@@ -2436,7 +2439,7 @@ export class Terrain {
           // газовый фонарь
           if (hash01(oz * 5, side * 11) > 0.3) {
             const lz = zA + 4 + hash01(oz * 7, side) * 38;
-            const lx = toWorldX(pisteCenterX(lz) + side * (STREET_HALF - 3), lz);
+            const lx = toWorldX(pisteCenterX(lz) + st.c + side * (st.half - 3), lz);
             const ly = terrainHeight(lx, lz);
             const pole = new THREE.Mesh(this.lampPoleGeo, this.trimMat);
             pole.position.set(lx - wx0, ly + 1.55, lz - oz);
@@ -2452,7 +2455,8 @@ export class Terrain {
         const nV = Math.floor(hash01(oz * 13, 5) * 2.99);
         for (let i = 0; i < nV; i++) {
           const vz = zA + hash01(oz * 17 + i, 3) * CHUNK;
-          const vu = pisteCenterX(vz) + (hash01(oz * 19 + i, 7) - 0.5) * 2 * (STREET_HALF - 6);
+          const stV = stsMid[i % stsMid.length];
+          const vu = pisteCenterX(vz) + stV.c + (hash01(oz * 19 + i, 7) - 0.5) * 2 * (stV.half - 6);
           if (vu < ox - CHUNK / 2 || vu >= ox + CHUNK / 2) continue;
           const vx = toWorldX(vu, vz);
           const vy = terrainHeight(vx, vz);
