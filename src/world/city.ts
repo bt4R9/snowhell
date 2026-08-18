@@ -41,10 +41,12 @@ export interface Building {
    * склона (как на вкопанный дом в деревне); дальше крыши идут лестницей вниз */
   roofAccess: boolean;
   rampY0: number; // высота начала пандуса; NaN — не считана
+  /** ★ поворот вдоль линии улицы (рад): улица изгибается, и фасады идут по ней */
+  yaw: number;
 }
 export const RAMP_L = 22;
 /** ★ полуширина улицы (мостовая от фасада до фасада ~60 м) — шире лыжного коридора */
-export const STREET_HALF = 30;
+export const STREET_HALF = 40;
 
 // --- ★ ГРАФ УЛИЦ: проспект + развилки вокруг кварталов -----------------------
 // Проспект идёт по оси; раз в FORK_STEP он раздваивается вокруг квартала-острова
@@ -53,8 +55,8 @@ export const STREET_HALF = 30;
 // города — стена террас (см. cityWallAt), чтобы игрок не выезжал из города.
 const FORK_STEP = 620;
 const FORK_TRANS = 45;      // длина расхождения/схождения
-const BRANCH_HALF = 16;     // полуширина боковой улицы
-const ISLAND_HALF = 15;     // полуширина квартала между ветками
+const BRANCH_HALF = 22;     // полуширина боковой улицы
+const ISLAND_HALF = 16;     // полуширина квартала между ветками
 export interface Street { c: number; half: number }
 interface Fork { z0: number; z1: number; k: number }
 const forkCache = new Map<number, Fork | null>();
@@ -198,8 +200,12 @@ export function citySegment(s: number): Building[] {
           // остров узкий: внутренние здания мельче
           const hwI = fr.outer ? hw : Math.min(hw, ISLAND_HALF - 1);
           const off = wallOff + fr.edge * (1.5 + (row === 0 ? hwI : 8 * 2 + 6 + hw));
+          // касательная улицы в этой точке (координаты долины): фасад — вдоль неё
+          const cA = pisteCenterX(zc - 6) + st.c, cB = pisteCenterX(zc + 6) + st.c;
+          const yaw = Math.atan2(cB - cA, 12);
           out.push({
             id: nextId++,
+            yaw,
             u: pisteCenterX(zc) + off,
             z: zc, hw: fr.outer ? hw : Math.min(hw, ISLAND_HALF - 1), hl, side, row, h, kind,
             style: Math.floor(hash2(S + 5, 17) * 2.99),
@@ -231,6 +237,13 @@ export function cityNear(z: number): Building[] {
   return a.concat(b, c);
 }
 
+/** локальные координаты точки относительно здания (с учётом поворота yaw) */
+export function localOf(b: Building, u: number, z: number): { lu: number; lz: number } {
+  const du = u - b.u, dz = z - b.z;
+  const c = Math.cos(b.yaw), sn = Math.sin(b.yaw);
+  return { lu: du * c - dz * sn, lz: du * sn + dz * c };
+}
+
 /** высота площадки здания — рельеф в его центре БЕЗ площадок (иначе рекурсия) */
 export function buildingPad(b: Building): number {
   if (!Number.isNaN(b.padY)) return b.padY;
@@ -254,10 +267,11 @@ function rampStart(b: Building): number {
 /** высота пандуса на крышу в точке (или null): от земли в начале переулка до крыши */
 export function cityRampAt(u: number, z: number, b: Building): number | null {
   if (!b.roofAccess) return null;
-  if (Math.abs(u - b.u) > b.hw + 0.5) return null;
-  const zs = b.z - b.hl - RAMP_L;
-  if (z < zs || z > b.z - b.hl) return null;
-  const t = (z - zs) / RAMP_L;
+  const lc = localOf(b, u, z);
+  if (Math.abs(lc.lu) > b.hw + 0.5) return null;
+  const zs = -b.hl - RAMP_L;
+  if (lc.lz < zs || lc.lz > -b.hl) return null;
+  const t = (lc.lz - zs) / RAMP_L;
   const k = t * t * (3 - 2 * t);
   const y0 = rampStart(b);
   const y1 = buildingPad(b) + b.h + (b.roof === 'mansard' ? 2.2 : 0);
@@ -278,13 +292,14 @@ export function cityPadAt(u: number, z: number): { w: number; y: number } | null
     const ry = cityRampAt(u, z, b);
     if (ry !== null) {
       // край пандуса поперёк — 1.5 м спада
-      const du = Math.abs(u - b.u) - b.hw + 0.5;
+      const du = Math.abs(localOf(b, u, z).lu) - b.hw + 0.5;
       const w = du <= 0 ? 1 : 1 - du / 1.5;
       if (w > bestW) { bestW = w; bestY = ry; }
       continue;
     }
-    const du = Math.abs(u - b.u) - b.hw;
-    const dz = Math.abs(z - b.z) - b.hl;
+    const lc = localOf(b, u, z);
+    const du = Math.abs(lc.lu) - b.hw;
+    const dz = Math.abs(lc.lz) - b.hl;
     if (du > 4 || dz > 4) continue;
     const d = Math.max(du, dz);
     const w = d <= 0 ? 1 : 1 - d / 4;
@@ -304,7 +319,13 @@ export function cityRoofAt(worldX: number, z: number): { y: number; eave: number
   const u = toValleyU(worldX, z);
   const list = cityNear(z);
   for (const b of list) {
-    if (Math.abs(u - b.u) > b.hw || Math.abs(z - b.z) > b.hl) continue;
+    const lc = localOf(b, u, z);
+    if (Math.abs(lc.lu) > b.hw || Math.abs(lc.lz) > b.hl) {
+      // пандус на крышу — тоже поверхность, по которой едут (без стен)
+      const ry = cityRampAt(u, z, b);
+      if (ry !== null) return { y: ry, eave: ry - 0.5, ridge: ry };
+      continue;
+    }
     if (b.roof === 'dome' || b.roof === 'spire') continue;
     const pad = buildingPad(b);
     const top = pad + b.h + (b.roof === 'mansard' ? 2.2 : b.roof === 'saw' ? 1.5 : 0);

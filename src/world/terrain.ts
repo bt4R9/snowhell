@@ -472,7 +472,7 @@ setCityObstacles((cx, cz) => {
     if (Math.round(b.u / CHUNK) !== cx || Math.round(b.z / CHUNK) !== cz) continue;
     // ★ коробка в координатах долины: столкновение считает сам игрок (kind 'city'),
     // на любой высоте ниже крыши; x здесь — u (переводится в мир общим циклом)
-    out.push({ x: b.u, z: b.z, scale: 1, r: Math.max(b.hw, b.hl), kind: 'city', cu: b.u, cz: b.z, hw: b.hw, hl: b.hl, padY: buildingPad(b), bodyH: b.h + (b.roof === 'mansard' ? 2.2 : b.roof === 'dome' ? Math.min(b.hw, b.hl) * 0.75 : b.roof === 'spire' ? b.hw * 3 : 1.0) });
+    out.push({ x: b.u, z: b.z, scale: 1, r: Math.max(b.hw, b.hl), kind: 'city', cu: b.u, cz: b.z, hw: b.hw, hl: b.hl, rot: b.yaw, padY: buildingPad(b), bodyH: b.h + (b.roof === 'mansard' ? 2.2 : b.roof === 'dome' ? Math.min(b.hw, b.hl) * 0.75 : b.roof === 'spire' ? b.hw * 3 : 1.0) });
   }
   return out;
 });
@@ -3071,7 +3071,7 @@ export class Terrain {
           box(this.trimMat, b.side * 3, H + 6, 0, 7, 0.4, 0.4);
         }
       } else if (b.roof === 'mansard') {
-        box(this.slateMat, 0, H + 1.1, 0, W - 1.2, 2.2, L - 1.2);
+        box(hash01(b.id, 17) < 0.5 ? this.copperMat : this.slateMat, 0, H + 1.1, 0, W - 1.2, 2.2, L - 1.2);
         box(this.trimMat, 0, H + 2.3, 0, W - 2.4, 0.3, L - 2.4);
         // мансардные окна
         for (let i = -1; i <= 1; i++) {
@@ -3109,8 +3109,75 @@ export class Terrain {
           g.add(dial);
         }
       }
-      // трубы
+      // ★ СТИМПАНК-ДЕТАЛИ ФАСАДА: чугунные пилястры по углам, латунная труба
+      // вдоль фасада с коленами вниз, паровой отвод на втором этаже (парит),
+      // клёпаные пояса на цехах и шестерня на фасаде, вывеска с козырьком.
+      for (const [cx2, cz2] of [[-b.hw, -b.hl], [b.hw, -b.hl], [-b.hw, b.hl], [b.hw, b.hl]]) {
+        box(this.trimMat, cx2, H / 2 - skirt / 2, cz2, 0.55, H + skirt, 0.55);
+      }
+      const pipeY = fh * 1.05;
+      const fp = new THREE.Mesh(this.cityCyl, this.brassMat);
+      fp.position.set(b.side * (b.hw + 0.4), pipeY, 0);
+      fp.rotation.x = Math.PI / 2;
+      fp.scale.set(0.22, L - 1.2, 0.22);
+      g.add(fp);
+      for (const ez of [-1, 1]) {
+        const el = new THREE.Mesh(this.cityCyl, this.brassMat);
+        el.position.set(b.side * (b.hw + 0.4), pipeY / 2 - skirt / 4, ez * (b.hl - 0.6));
+        el.scale.set(0.22, pipeY + skirt / 2, 0.22);
+        g.add(el);
+      }
       const list = this.stacks.get(chunk) ?? [];
+      if (hash01(b.id * 7, 11) < 0.35 && b.floors >= 2) {
+        const vy = fh * 1.7;
+        const vz = (hash01(b.id * 13, 3) - 0.5) * (L - 3);
+        const stub = new THREE.Mesh(this.cityCyl, this.pipeMat);
+        stub.position.set(b.side * (b.hw + 0.5), vy, vz);
+        stub.rotation.z = Math.PI / 2;
+        stub.scale.set(0.3, 1.0, 0.3);
+        g.add(stub);
+        const c = Math.cos(b.yaw), sn = Math.sin(b.yaw);
+        const lu = b.side * (b.hw + 1.0), lz = vz;
+        list.push({ x: toWorldX(b.u + lu * c + lz * sn, b.z), y: pad + vy, z: b.z - lu * sn + lz * c, r: 0.35 });
+      }
+      if (b.kind === CK.FACTORY) {
+        for (let f = 1; f < 3; f++) box(this.trimMat, b.side * (b.hw + 0.12), f * fh * 0.9, 0, 0.2, 0.25, L);
+        const gearR = 2.2;
+        const gd = new THREE.Mesh(this.cityDisk, this.brassMat);
+        gd.position.set(b.side * (b.hw + 0.15), H * 0.62, b.hl * 0.55);
+        gd.rotation.y = b.side > 0 ? Math.PI / 2 : -Math.PI / 2;
+        gd.scale.setScalar(gearR);
+        g.add(gd);
+        const gi = new THREE.Mesh(this.cityDisk, this.trimMat);
+        gi.position.set(b.side * (b.hw + 0.2), H * 0.62, b.hl * 0.55);
+        gi.rotation.y = gd.rotation.y;
+        gi.scale.setScalar(gearR * 0.55);
+        g.add(gi);
+      }
+      if (b.kind === CK.TENEMENT && hash01(b.id * 3, 5) < 0.6) {
+        box(this.trimMat, b.side * (b.hw + 0.3), fh * 0.85, b.hl * 0.2, 0.15, 0.7, 3.2);
+        const aw = box(this.awningMat, b.side * (b.hw + 0.9), fh * 0.72, b.hl * 0.2, 1.6, 0.08, 3.6);
+        aw.rotation.z = b.side * -0.25;
+      }
+      // крыша: бак на ножках, вентилятор, ограждение
+      if (b.roof === 'flat' && hash01(b.id * 5, 7) < 0.55) {
+        for (const [lx, lz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) box(this.trimMat, lx * 1.1 - b.side * 1.5, H + 1.0, lz * 1.1 + 1.5, 0.15, 2.0, 0.15);
+        const tank = new THREE.Mesh(this.cityCyl, this.brassMat);
+        tank.position.set(-b.side * 1.5, H + 3.0, 1.5);
+        tank.scale.set(1.5, 2.0, 1.5);
+        g.add(tank);
+        const cone = new THREE.Mesh(this.cityCone, this.copperMat);
+        cone.position.set(-b.side * 1.5, H + 4.4, 1.5);
+        cone.scale.set(1.7, 0.8, 1.7);
+        g.add(cone);
+      }
+      if (b.roof !== 'saw' && hash01(b.id * 11, 13) < 0.5) {
+        const vent = new THREE.Mesh(this.cityCone, this.copperMat);
+        vent.position.set(b.side * 1.2, H + 0.9, -b.hl * 0.4);
+        vent.scale.set(0.8, 1.6, 0.8);
+        g.add(vent);
+      }
+      // трубы
       for (let c = 0; c < b.chimneys; c++) {
         const tall = b.kind === CK.FACTORY;
         const ch = tall ? H * 0.9 + 6 : 2.2;
@@ -3158,6 +3225,8 @@ export class Terrain {
       }
     }
     g.position.set(toWorldX(b.u, b.z) - wx0, pad - 0.15, b.z - oz);
+    // ★ ФАСАД ВДОЛЬ ЛИНИИ УЛИЦЫ: поворот по мировой касательной улицы
+    g.rotation.y = Math.atan2(toWorldX(b.u, b.z + 6) - toWorldX(b.u, b.z - 6), 12);
     chunk.add(g);
   }
 

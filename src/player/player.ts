@@ -1164,24 +1164,27 @@ export class Player {
           for (const o of obstaclesInChunk(pcx + ddx, pcz + ddz)) {
             if (o.kind !== 'city' || o.cu === undefined) continue;
             const hw = o.hw! + 0.45, hl = o.hl! + 0.45;
-            const du = pu - o.cu, dz = this.pos.z - o.cz!;
+            // в локальных осях здания (повёрнуто вдоль улицы на rot)
+            const yaw = o.rot ?? 0;
+            const cy = Math.cos(yaw), sy = Math.sin(yaw);
+            const du0 = pu - o.cu, dz0 = this.pos.z - o.cz!;
+            const du = du0 * cy - dz0 * sy, dz = du0 * sy + dz0 * cy;
             if (Math.abs(du) > hw || Math.abs(dz) > hl) continue;
             const top = o.padY! + o.bodyH!;
             if (this.pos.y > top - 0.3 || this.onRoof) continue;
-            // ближайшая грань
+            // ближайшая грань → выталкиваем в локальных осях, переводим обратно
             const pu1 = hw - Math.abs(du);
             const pz1 = hl - Math.abs(dz);
-            let nx = 0, nz = 0;
-            if (pu1 < pz1) {
-              const su = du >= 0 ? 1 : -1;
-              const nu = o.cu + su * hw;
-              const wx = toWorldX(nu, this.pos.z);
-              nx = Math.sign(wx - this.pos.x) || su;
-              this.pos.x = wx;
-            } else {
-              nz = dz >= 0 ? 1 : -1;
-              this.pos.z = o.cz! + nz * hl;
-            }
+            let lnu = 0, lnz = 0;
+            let lu2 = du, lz2 = dz;
+            if (pu1 < pz1) { lnu = du >= 0 ? 1 : -1; lu2 = lnu * hw; }
+            else { lnz = dz >= 0 ? 1 : -1; lz2 = lnz * hl; }
+            const nu = lnu * cy + lnz * sy, nzv = -lnu * sy + lnz * cy; // нормаль в долине
+            const newU = o.cu + (lu2 * cy + lz2 * sy);
+            const newZ = o.cz! + (-lu2 * sy + lz2 * cy);
+            this.pos.x = toWorldX(newU, newZ);
+            this.pos.z = newZ;
+            const nx = nu, nz = nzv;
             const into = this.velH.x * nx + this.velH.z * nz;
             if (into < 0) {
               this.velH.x -= into * nx;
