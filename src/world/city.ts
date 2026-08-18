@@ -248,10 +248,12 @@ export function localOf(b: Building, u: number, z: number): { lu: number; lz: nu
 export function buildingPad(b: Building): number {
   if (!Number.isNaN(b.padY)) return b.padY;
   padOff = true;
-  // ★ по НИЖНЕМУ углу со стороны улицы: фасад не должен висеть в воздухе
-  const zLo = b.z + b.hl;
+  // ★ ПЛОЩАДОК ПОД ЗДАНИЯМИ БОЛЬШЕ НЕТ — улица идёт по склону непрерывно, а
+  // здание сидит на ней: цоколь по ВЕРХНЕМУ углу у улицы (у нижнего его
+  // прикрывает юбка корпуса на 8 м вниз). Иначе вокруг каждого дома вырастали
+  // ямы и горбы («странные подъёмы между домами»).
   const uS = b.u + b.side * b.hw;
-  b.padY = Math.min(terrainSample(b.u, b.z), terrainSample(uS, zLo)) + 0.4;
+  b.padY = terrainSample(uS, b.z - b.hl) + 0.2;
   padOff = false;
   return b.padY;
 }
@@ -297,13 +299,7 @@ export function cityPadAt(u: number, z: number): { w: number; y: number } | null
       if (w > bestW) { bestW = w; bestY = ry; }
       continue;
     }
-    const lc = localOf(b, u, z);
-    const du = Math.abs(lc.lu) - b.hw;
-    const dz = Math.abs(lc.lz) - b.hl;
-    if (du > 4 || dz > 4) continue;
-    const d = Math.max(du, dz);
-    const w = d <= 0 ? 1 : 1 - d / 4;
-    if (w > bestW) { bestW = w; bestY = buildingPad(b); }
+    // под самим зданием земля не выравнивается (юбка корпуса всё скроет)
   }
   if (bestW <= 0) return null;
   const k = bestW * bestW * (3 - 2 * bestW);

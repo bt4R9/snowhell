@@ -218,6 +218,8 @@ function roughnessAt(x: number, z: number): number {
 
 // Обрывы и месы генерятся в features.ts (деревни проверяют их при размещении)
 
+/** охрана рекурсии: профиль оси улицы считается без поперечного выравнивания */
+let streetOff = false;
 function terrainBase(x: number, z: number): number {
   // Трасса: укатанный коридор — мелкие бугры сглажены, обрывы и месы
   // подавлены, на дугах поднят вираж. Вне коридора — дикий склон.
@@ -367,20 +369,39 @@ function terrainBase(x: number, z: number): number {
     h += flatBottom(rockRelief, x, z) * rocky;
   }
   // Скала растёт ИЗ горы: под ней рельеф вспучивается холмом (см. cragLift).
-  h += cragLift(x, z) * calm;
-  h += gullyDepth(x, z) * calm;
+  h += cragLift(x, z) * (1 - cw);
+  h += gullyDepth(x, z) * (1 - cw);
   // ★ ДОЛИНЫ-УЩЕЛЬЯ вдоль спуска: U-профиль, отклонение ≤ 30°, иногда с рукавом
-  h += valleyDepth(x, z) * calm;
-  h += cliffDrop(x, z) * (1 - gully) * calm; // обрывы уже обходят трассу при генерации
-  h += mesaLift(x, z) * (1 - piste.t * 0.85) * calm;
+  h += valleyDepth(x, z) * (1 - cw);
+  h += cliffDrop(x, z) * (1 - gully) * (1 - cw); // обрывы уже обходят трассу при генерации
+  h += mesaLift(x, z) * (1 - piste.t * 0.85) * (1 - cw);
   // ★ СТЕНА ГОРОДА: за внешним рядом зданий земля круто уходит вверх — из
   // города не выехать (city.ts)
   if (cw > 0.01) h += cityWallAt(x, z) * cw;
+  // ★ УЛИЦА РОВНАЯ ПОПЕРЁК: от фасада до фасада высота берётся по оси улицы
+  // (её продольный профиль), иначе мостовая лежала виражом и горбами
+  if (cw > 0.01 && !streetOff) {
+    const d = x - pisteCenterX(z);
+    let best = 0, bestH = h;
+    for (const st of streetsAt(z)) {
+      const w = Math.max(0, Math.min(1, (st.half + 1.5 - Math.abs(d - st.c)) / 4));
+      if (w > best) {
+        best = w;
+        streetOff = true;
+        bestH = terrainBase(pisteCenterX(z) + st.c, z);
+        streetOff = false;
+      }
+    }
+    if (best > 0) {
+      const k = best * best * (3 - 2 * best) * cw;
+      h += (bestH - h) * k;
+    }
+  }
   // коридор чуть утоплен относительно целины: читается как прорезанная
   // ратраком трасса и мягко удерживает райдера на линии
   h -= 1.1 * piste.t * (1 - cw); // в городе трасса — улица, без жёлоба
-  h += piste.bank * piste.t;
-  h += kickerHeight(x, z);
+  h += piste.bank * piste.t * (1 - cw); // виражи трассы — не для мостовой
+  h += kickerHeight(x, z) * (1 - cw); // в городе снежных кикеров нет
   // ★ ЧАШИ ЛАВЫ ВЫРЕЗАЮТСЯ ПОСЛЕДНИМИ И ПОВЕРХ ВСЕГО. Дно ниже зеркала, вал
   // выше — это явная форма, а не добавка к шуму: внутри чаши рельеф именно
   // такой, каким его видит меш расплава и физика (см. pools.ts).
@@ -2026,6 +2047,7 @@ export class Terrain {
   private tankMat = lambert({ color: 0x5c4634, flatShading: true });
   private legGeo = new THREE.BoxGeometry(0.16, 1.0, 0.16);
   private pipeMat = lambert({ color: 0x5a5652, flatShading: true });
+  private walkMat = lambert({ color: 0x9c968c, flatShading: true });
   private domeGeo = new THREE.SphereGeometry(1, 12, 6, 0, Math.PI * 2, 0, Math.PI / 2);
   private brassMat = lambert({ color: 0x9a7a3a, flatShading: true });
   private coneGeo = new THREE.ConeGeometry(1.15, 0.7, 10);
@@ -2449,6 +2471,81 @@ export class Terrain {
             glow.position.set(lx - wx0, ly + 4.4, lz - oz);
             glow.scale.setScalar(1.3);
             chunk.add(glow);
+          }
+        }
+        // ★ ЧТОБЫ УЛИЦА ЧИТАЛАСЬ УЛИЦЕЙ: тротуары вдоль фасадов (приподнятая
+        // плита светлого камня от линии домов до бордюра), трамвайные рельсы по
+        // оси, на тротуарах — бочки, ящики, тумбы. Между домом и дорогой
+        // появляется «между».
+        for (const st of stsMid) {
+          const segStep = 12;
+          for (const side of [-1, 1]) {
+            for (let z0s = zA; z0s < zB; z0s += segStep) {
+              const z1s = Math.min(zB, z0s + segStep);
+              const zm = (z0s + z1s) / 2;
+              // тротуар: от линии домов (half+1.5) внутрь на 6.4 м; бордюр — на его кромке
+              const cOff = st.c + side * (st.half - 1.7);
+              const uIn = pisteCenterX(zm) + cOff;
+              if (uIn < ox - CHUNK / 2 || uIn >= ox + CHUNK / 2) continue;
+              const x0 = toWorldX(pisteCenterX(z0s) + cOff, z0s);
+              const x1 = toWorldX(pisteCenterX(z1s) + cOff, z1s);
+              const y0 = terrainHeight(x0, z0s), y1 = terrainHeight(x1, z1s);
+              const dirW = new THREE.Vector3(x1 - x0, y1 - y0, z1s - z0s);
+              const len = dirW.length() + 0.3;
+              const qW = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), dirW.clone().normalize());
+              const walk = new THREE.Mesh(this.cityBox, this.walkMat);
+              walk.position.set((x0 + x1) / 2 - wx0, (y0 + y1) / 2 + 0.12, zm - oz);
+              walk.scale.set(6.4, 0.32, len);
+              walk.quaternion.copy(qW);
+              chunk.add(walk);
+              const kOff = st.c + side * (st.half - 4.9);
+              const xc0 = toWorldX(pisteCenterX(z0s) + kOff, z0s), xc1 = toWorldX(pisteCenterX(z1s) + kOff, z1s);
+              const curb = new THREE.Mesh(this.cityBox, this.trimMat);
+              curb.position.set((xc0 + xc1) / 2 - wx0, (y0 + y1) / 2 + 0.18, zm - oz);
+              curb.scale.set(0.4, 0.42, len);
+              curb.quaternion.copy(qW);
+              chunk.add(curb);
+            }
+            // бочки и ящики на тротуаре
+            const nB = Math.floor(hash01(oz * 23 + side, 9) * 3.99);
+            for (let i = 0; i < nB; i++) {
+              const bz = zA + hash01(oz * 29 + i, side + 5) * CHUNK;
+              const bu = pisteCenterX(bz) + st.c + side * (st.half - 3 - hash01(oz * 31 + i, 3) * 2.5);
+              if (bu < ox - CHUNK / 2 || bu >= ox + CHUNK / 2) continue;
+              const bx = toWorldX(bu, bz), by = terrainHeight(bx, bz) + 0.3;
+              if (hash01(oz * 37 + i, 7) < 0.5) {
+                const bar = new THREE.Mesh(this.cityCyl, this.woodMat);
+                bar.position.set(bx - wx0, by + 0.55, bz - oz);
+                bar.scale.set(0.5, 1.1, 0.5);
+                chunk.add(bar);
+              } else {
+                const cr = new THREE.Mesh(this.cityBox, this.woodMat);
+                cr.position.set(bx - wx0, by + 0.5, bz - oz);
+                cr.scale.set(1.0, 1.0, 1.2);
+                cr.rotation.y = hash01(oz, i) * 1.2;
+                chunk.add(cr);
+              }
+            }
+          }
+          // трамвайные рельсы по оси улицы
+          for (let z0s = zA; z0s < zB; z0s += 16) {
+            const z1s = Math.min(zB, z0s + 16);
+            const zm = (z0s + z1s) / 2;
+            const uC = pisteCenterX(zm) + st.c;
+            if (uC < ox - CHUNK / 2 || uC >= ox + CHUNK / 2) continue;
+            const x0 = toWorldX(pisteCenterX(z0s) + st.c, z0s), x1 = toWorldX(pisteCenterX(z1s) + st.c, z1s);
+            const y0 = terrainHeight(x0, z0s), y1 = terrainHeight(x1, z1s);
+            const dir = new THREE.Vector3(x1 - x0, y1 - y0, z1s - z0s);
+            const len = dir.length() + 0.3;
+            dir.normalize();
+            const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir);
+            for (const rs of [-0.75, 0.75]) {
+              const rl = new THREE.Mesh(this.cityBox, this.steelMat);
+              rl.position.set((x0 + x1) / 2 - wx0 + rs, (y0 + y1) / 2 + 0.06, zm - oz);
+              rl.scale.set(0.12, 0.1, len);
+              rl.quaternion.copy(q);
+              chunk.add(rl);
+            }
           }
         }
         // паровые решётки в мостовой: 0–2 на чанк
