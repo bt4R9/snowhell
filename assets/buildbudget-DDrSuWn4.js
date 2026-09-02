@@ -1,0 +1,1 @@
+let n=0,r=0;const t={city:0,chunk:0,landmark:0,far:0,coarse:0,center:0,other:0};function c(e){n=e,r=0,t.city=0,t.chunk=0,t.landmark=0,t.far=0,t.coarse=0,t.center=0,t.other=0}function i(){return n}function o(e,u="other"){n-=e,r+=e,t[u]=(t[u]??0)+e}function d(){return{spent:r,by:t}}export{c as beginBuildFrame,i as buildBudgetLeft,d as buildBudgetStats,o as spendBuildBudget};
